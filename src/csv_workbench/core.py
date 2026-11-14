@@ -174,7 +174,9 @@ def selection_query(connection, path: Path, selection: Selection) -> tuple[str, 
     return sql, [pattern, *values]
 
 
-def selection_sql(columns: list[str], selection: Selection) -> tuple[str, list[str]]:
+def selection_sql(
+    columns: list[str], selection: Selection, *, source=CSV_SOURCE, row_id=None
+) -> tuple[str, list[str]]:
     projection, where, order = "*", "", ""
     values = []
     if selection != Selection():
@@ -196,9 +198,72 @@ def selection_sql(columns: list[str], selection: Selection) -> tuple[str, list[s
         if selection.sort_column is not None:
             column = identifier(selection.sort_column)
             direction = "DESC" if selection.descending else "ASC"
-            order = f" ORDER BY {column} {direction} NULLS LAST, row_number() OVER ()"
+            tie_breaker = row_id or "row_number() OVER ()"
+            order = f" ORDER BY {column} {direction} NULLS LAST, {tie_breaker}"
 
-    return f"SELECT {projection} FROM {CSV_SOURCE}{where}{order}", values
+    if row_id is not None:
+        projection = f"{row_id}, {projection if projection != '*' else ', '.join(map(quote_identifier, columns))}"
+    return f"SELECT {projection} FROM {source}{where}{order}", values
+
+
+def editable_query(connection, source, selection, edits):
+    pattern = csv_pattern(source)
+    columns = connection.sql(f"SELECT * FROM {CSV_SOURCE}", params=[pattern]).columns
+    name = "__csv_source_row"
+    folded = {column.casefold() for column in columns}
+    while name.casefold() in folded:
+        name += "_"
+    row_id = quote_identifier(name)
+    edited_columns = {col for _, col in edits}
+    scan = f"(SELECT row_number() OVER () - 1 AS {row_id}, * FROM {CSV_SOURCE})"
+    if edits:
+        connection.execute("CREATE TEMP TABLE cell_edits (rid BIGINT, col INTEGER, val VARCHAR)")
+        connection.executemany(
+            "INSERT INTO cell_edits VALUES (?, ?, ?)",
+            [(row, col, value) for (row, col), value in edits.items()],
+        )
+        projection = ", ".join(
+            f"CASE WHEN map_contains(p.cells, {index}) THEN map_extract_value(p.cells, {index}) ELSE s.{quoted} END AS {quoted}"
+            if index in edited_columns
+            else f"s.{quoted}"
+            for index, quoted in enumerate(map(quote_identifier, columns))
+        )
+        scan = (
+            f"(SELECT s.{row_id}, {projection} FROM {scan} s LEFT JOIN "
+            "(SELECT rid, map(list(col), list(val)) AS cells FROM cell_edits GROUP BY rid) p "
+            f"ON s.{row_id} = p.rid)"
+        )
+    sql, values = selection_sql(columns, selection, source=scan, row_id=row_id)
+    if edits and selection.sort_column is None:
+        sql += f" ORDER BY {row_id}"
+    return sql, [pattern, *values]
+
+
+def read_editable_page(path, offset, selection, edits, *, cancel):
+    with utf8_source(path, cancel) as source, cancel.connection() as connection:
+        sql, params = editable_query(connection, source, selection, edits)
+        return page_result(
+            connection.execute(sql + " LIMIT ? OFFSET ?", [*params, PAGE_SIZE + 1, offset])
+        )
+
+
+def prepare_editable_result(path, selection, edits, *, cancel, distinct=None, singletons=False):
+    scratch = TemporaryDirectory(prefix="csv-result-")
+    output = Path(scratch.name) / "result.parquet"
+    try:
+        with utf8_source(path, cancel) as source, cancel.connection() as connection:
+            sql, params = editable_query(connection, source, selection, edits)
+            if distinct is not None:
+                having = " HAVING count(*) = 1" if singletons else ""
+                sql = (
+                    f'SELECT {quote_identifier(distinct)} AS "Value", count(*) AS "Frequency"'
+                    f" FROM ({sql}) GROUP BY 1{having} ORDER BY 1 NULLS LAST"
+                )
+            connection.execute(f"COPY ({sql}) TO ? (FORMAT PARQUET)", [str(output), *params])
+    except BaseException:
+        scratch.cleanup()
+        raise
+    return DiskResult(scratch, output)
 
 
 def read_page(
@@ -265,11 +330,15 @@ def file_revision(path: Path) -> tuple[int, int, int, int, int]:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
-def export_edited_csv(path, destination, edits, revision, *, cancel=None):
+def export_edited_csv(
+    path, destination, edits, revision, selection=Selection(), *, cancel=None, save=False
+):
     cancel = cancel or Cancellation()
     source = path.resolve(strict=True)
     destination = destination.absolute()
-    if destination.resolve() == source or (destination.exists() and destination.samefile(source)):
+    if save:
+        destination = destination.resolve()
+    elif destination.resolve() == source or (destination.exists() and destination.samefile(source)):
         raise ValueError("Choose a destination other than the source CSV.")
 
     def check_source():
@@ -277,25 +346,31 @@ def export_edited_csv(path, destination, edits, revision, *, cancel=None):
             raise ValueError("The source CSV changed. Reopen it before editing.")
 
     check_source()
-    with (
-        TemporaryDirectory(dir=destination.parent) as scratch,
-        utf8_source(source, cancel) as decoded,
-        cancel.connection() as connection,
-    ):
+    with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "edited.csv"
-        cursor = connection.execute(f"SELECT * FROM {CSV_SOURCE}", [csv_pattern(decoded)])
-        count = 0
-        with output.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle, quoting=csv.QUOTE_NOTNULL, lineterminator="\r\n")
-            writer.writerow([column[0] for column in cursor.description])
-            while batch := cursor.fetchmany(1024):
-                cancel.check()
-                for row in batch:
-                    writer.writerow(edits.get((count, col), value) for col, value in enumerate(row))
-                    count += 1
+        with utf8_source(source, cancel) as decoded, cancel.connection() as connection:
+            sql, params = editable_query(connection, decoded, selection, edits)
+            cursor = connection.execute(sql, params)
+            count = 0
+            with output.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle, quoting=csv.QUOTE_NOTNULL, lineterminator="\r\n")
+                writer.writerow([column[0] for column in cursor.description[1:]])
+                while batch := cursor.fetchmany(1024):
+                    cancel.check()
+                    for row in batch:
+                        writer.writerow(row[1:])
+                        count += 1
+        if save and destination.exists():
+            output.chmod(destination.stat().st_mode & 0o777)
         check_source()
         cancel.publish(output, destination)
     return count
+
+
+def save_csv(path, destination, edits, revision, *, cancel=None):
+    destination = destination.resolve()
+    export_edited_csv(path, destination, edits, revision, cancel=cancel, save=True)
+    return destination, file_revision(destination)
 
 
 class DiskResult:

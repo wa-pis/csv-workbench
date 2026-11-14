@@ -79,7 +79,7 @@ def test_cancel_running_selection_keeps_view(tmp_path, monkeypatch):
         assert release.wait(5)
         return ["id"], [("stale",)], False
 
-    monkeypatch.setattr("csv_workbench.ui.read_page", slow_read)
+    monkeypatch.setattr("csv_workbench.ui.read_editable_page", slow_read)
     try:
         window.load_view(source, Selection(filters=(("id", "x"),)))
         assert started.wait(5)
@@ -208,6 +208,82 @@ def test_column_header_actions_filter_and_sort_full_csv(tmp_path, monkeypatch):
         assert header.sortIndicatorSection() == 0
         assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
     finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_edit_sorted_filtered_cell_updates_view_and_export(tmp_path, monkeypatch):
+    from csv_workbench.core import Selection, read_page
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "data.csv"
+    original = "id,label,group\n1,b,yes\n2,a,yes\n3,c,no\n4,d,yes\n"
+    source.write_text(original, encoding="utf-8")
+    output = tmp_path / "edited.csv"
+    selection = Selection((("group", "yes"),), "label", False, ("label", "group"))
+    window = MainWindow()
+
+    def finish(name="view_job"):
+        getattr(window, name)[1].result(timeout=5)
+        window.collect_reads()
+
+    try:
+        window.load_view(source, selection, new_file=True)
+        finish()
+        assert window.model.rows == [("a", "yes"), ("b", "yes"), ("d", "yes")]
+        assert window.model.setData(window.model.index(0, 0), "z")
+        finish()
+        assert window.model.rows == [("b", "yes"), ("d", "yes"), ("z", "yes")]
+        assert window.model.setData(window.model.index(0, 1), "no")
+        finish()
+        assert window.model.rows == [("d", "yes"), ("z", "yes")]
+
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(output), ""))
+        monkeypatch.setattr(QMessageBox, "information", lambda *_: None)
+        window.save_selection()
+        finish("export_job")
+        assert read_page(output, 0) == (["label", "group"], [("d", "yes"), ("z", "yes")], False)
+        assert window.dirty
+        window.undo_action.trigger()
+        finish()
+        assert window.model.rows == [("b", "yes"), ("d", "yes"), ("z", "yes")]
+        window.redo_action.trigger()
+        finish()
+        assert window.model.rows == [("d", "yes"), ("z", "yes")]
+
+        saved = tmp_path / "whole.csv"
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(saved), ""))
+        window.save_as_action.trigger()
+        finish("save_job")
+        assert window.path == saved.resolve()
+        assert not window.dirty
+        assert read_page(saved, 0)[1] == [
+            ("1", "b", "no"),
+            ("2", "z", "yes"),
+            ("3", "c", "no"),
+            ("4", "d", "yes"),
+        ]
+        window.undo_action.trigger()
+        finish()
+        assert window.dirty
+        assert window.model.rows == [("b", "yes"), ("d", "yes"), ("z", "yes")]
+        window.save_action.trigger()
+        finish("save_job")
+        assert not window.dirty
+        assert read_page(saved, 0)[1][0] == ("1", "b", "yes")
+        window.redo_action.trigger()
+        finish()
+
+        window.load_view(window.path, Selection())
+        finish()
+        assert window.model.data(window.model.index(0, 2)) == "no"
+        assert window.model.data(window.model.index(1, 1)) == "z"
+        assert source.read_text(encoding="utf-8") == original
+    finally:
+        monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
         window.close()
         window.executor.shutdown(wait=True)
         window.deleteLater()

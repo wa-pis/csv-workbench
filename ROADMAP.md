@@ -1,6 +1,6 @@
 # CSV Workbench — roadmap
 
-Локальное настольное приложение на Python для просмотра, отбора, сортировки и экспорта CSV на macOS, Windows и Linux. Исходные файлы остаются неизменными. Базовый стек: Python 3.12+, uv, PySide6, DuckDB, pytest и Ruff.
+Локальное настольное приложение на Python для просмотра, отбора, сортировки и экспорта CSV на macOS, Windows и Linux. Исходные файлы меняются только при явном сохранении. Базовый стек: Python 3.12+, uv, PySide6, DuckDB, pytest и Ruff.
 
 v0.1: запланированные этапы закрыты. [GitHub Actions](https://github.com/wa-pis/csv-workbench/actions/runs/43586328856) подтвердил сборку и основной сценарий на Windows, Linux и macOS; архивы доступны в разделе Artifacts. Отдельный GitHub Release не публиковался.
 
@@ -24,5 +24,7 @@ v0.1: запланированные этапы закрыты. [GitHub Actions]
 Сохраняемые сессии: [`save-csv-session`](openspec/changes/archive/2026-11-14-save-csv-session/proposal.md) закрыт.
 
 Цепочки преобразований: [`reusable-csv-transformations`](openspec/changes/archive/2026-11-14-reusable-csv-transformations/proposal.md) закрыт. Запланированные этапы выполнены. Поддержку внешних форматов и второй движок отложить до конкретного сценария.
+
+Сохранение CSV и история правок: [`save-and-undo-csv`](openspec/changes/archive/2026-11-15-save-and-undo-csv/proposal.md) закрыт.
 
 Roadmap задаёт порядок и критерии готовности. Каждый этап начинается с предложения, сценариев, дизайна и списка задач в `openspec/changes/`. После реализации и проверки изменение архивируется, а согласованное поведение попадает в `openspec/specs/`.
