@@ -26,14 +26,22 @@ class CsvFormat:
     header: bool = True
 
     def __post_init__(self):
-        if self.delimiter not in (",", ";", "\t") or not isinstance(self.header, bool):
-            raise ValueError("Invalid CSV format.")
+        if (
+            not isinstance(self.delimiter, str)
+            or len(self.delimiter) != 1
+            or (self.delimiter != "\t" and not (" " <= self.delimiter <= "~"))
+            or self.delimiter == '"'
+        ):
+            raise ValueError("Enter one ASCII delimiter character other than a double quote.")
+        if not isinstance(self.header, bool):
+            raise ValueError("Invalid CSV header setting.")  # noqa: TRY004
 
     @property
     def source(self):
+        delimiter = self.delimiter.replace("'", "''")
         return CSV_SOURCE.replace(
             "header = true, delim = ','",
-            f"header = {str(self.header).lower()}, delim = '{self.delimiter}'",
+            f"header = {str(self.header).lower()}, delim = '{delimiter}'",
         )
 
 

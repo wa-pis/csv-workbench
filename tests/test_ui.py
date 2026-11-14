@@ -379,13 +379,20 @@ def test_range_and_row_history_survives_save(tmp_path, monkeypatch):
 
 
 def test_open_format_dialog_uses_manual_delimiter_and_header(tmp_path, monkeypatch):
-    from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QTableView
+    from PySide6.QtWidgets import (
+        QCheckBox,
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QLineEdit,
+        QTableView,
+    )
 
     from csv_workbench.core import CsvFormat
 
     app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
     source = tmp_path / "input.csv"
-    source.write_text("one;two\nthree;four\n", encoding="utf-8")
+    source.write_text("one;two|2\nthree;four|4\n", encoding="utf-8")
     window = MainWindow()
 
     def configure(dialog):
@@ -393,11 +400,15 @@ def test_open_format_dialog_uses_manual_delimiter_and_header(tmp_path, monkeypat
         header = dialog.findChild(QCheckBox)
         model = dialog.findChild(QTableView).model()
         assert delimiter.currentData() == ";"
-        assert model.headers == ["one", "two"]
+        assert model.headers == ["one", "two|2"]
         header.setChecked(False)
-        assert model.rows[0] == ("one", "two")
-        delimiter.setCurrentIndex(delimiter.findData(","))
-        assert model.rows[0] == ("one;two",)
+        assert model.rows[0] == ("one", "two|2")
+        delimiter.setCurrentIndex(delimiter.findText("Custom…"))
+        open_button = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Open)
+        assert not open_button.isEnabled()
+        dialog.findChild(QLineEdit).setText("|")
+        assert open_button.isEnabled()
+        assert model.rows[0] == ("one;two", "2")
         return QDialog.DialogCode.Accepted
 
     monkeypatch.setattr(QDialog, "exec", configure)
@@ -406,8 +417,8 @@ def test_open_format_dialog_uses_manual_delimiter_and_header(tmp_path, monkeypat
         window.open_file()
         window.view_job[1].result(timeout=5)
         window.collect_reads()
-        assert window.csv_format == CsvFormat(",", False)
-        assert window.model.rows == [("one;two",), ("three;four",)]
+        assert window.csv_format == CsvFormat("|", False)
+        assert window.model.rows == [("one;two", "2"), ("three;four", "4")]
     finally:
         window.close()
         window.executor.shutdown(wait=True)

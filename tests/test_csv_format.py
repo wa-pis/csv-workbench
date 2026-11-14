@@ -19,14 +19,15 @@ from csv_workbench.core import (
 from csv_workbench.session import load_session, save_session
 
 
-@pytest.mark.parametrize(("delimiter", "header"), [(";", True), ("\t", False), (",", False)])
+@pytest.mark.parametrize(("delimiter", "header"), [(";", True), ("\t", False), (",", False), ("|", True), ("'", False)])
 def test_format_is_shared_by_preview_sort_unique_export_and_save(tmp_path, delimiter, header):
     path = tmp_path / "input.csv"
     prefix = f"id{delimiter}label\r\n" if header else ""
     path.write_bytes((prefix + f'2{delimiter}"чай, кофе"\r\n1{delimiter}чaj\r\n').encode("utf-16"))
     fmt = CsvFormat(delimiter, header)
     sample = read_format_sample(path)
-    assert detect_delimiter(sample) == delimiter
+    if delimiter in ",;\t":
+        assert detect_delimiter(sample) == delimiter
     columns = ["id", "label"] if header else ["column0", "column1"]
     assert preview_format(sample, fmt) == (columns, [["2", "чай, кофе"], ["1", "чaj"]])
     assert count_rows(path, fmt=fmt) == 2
@@ -72,3 +73,9 @@ def test_old_session_defaults_to_comma_and_header(tmp_path):
     del data["format"]
     session.write_text(json.dumps(data), encoding="utf-8")
     assert load_session(session) == (source.resolve(), Selection(), CsvFormat())
+
+
+@pytest.mark.parametrize("delimiter", ["", "||", '"', "\n", "\x00", "§", None])
+def test_invalid_custom_delimiter(delimiter):
+    with pytest.raises(ValueError, match="delimiter"):
+        CsvFormat(delimiter)

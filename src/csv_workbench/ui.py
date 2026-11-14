@@ -417,11 +417,15 @@ class MainWindow(QMainWindow):
         delimiter = QComboBox()
         for label, value in (("Comma (,)", ","), ("Semicolon (;)", ";"), ("Tab (TSV)", "\t")):
             delimiter.addItem(label, value)
+        delimiter.addItem("Custom…")
+        custom = QLineEdit()
+        custom.setPlaceholderText("One ASCII character, e.g. |")
         detected = detect_delimiter(sample, "\t" if path.suffix.lower() == ".tsv" else ",")
         delimiter.setCurrentIndex(delimiter.findData(detected))
         header = QCheckBox("First record contains column names")
         header.setChecked(True)
         form.addRow("Delimiter", delimiter)
+        form.addRow("Custom delimiter", custom)
         form.addRow(header)
         table = QTableView(dialog)
         model = PageModel()
@@ -439,11 +443,22 @@ class MainWindow(QMainWindow):
         form.addRow(buttons)
 
         def current_format():
-            return CsvFormat(delimiter.currentData(), header.isChecked())
+            value = delimiter.currentData()
+            return CsvFormat(custom.text() if value is None else value, header.isChecked())
 
         def refresh():
+            form.setRowVisible(custom, delimiter.currentData() is None)
+            open_button = buttons.button(QDialogButtonBox.StandardButton.Open)
             try:
-                headers, rows = preview_format(sample, current_format())
+                fmt = current_format()
+            except ValueError as exc:
+                open_button.setEnabled(False)
+                model.replace([], [])
+                status.setText(str(exc))
+                return
+            open_button.setEnabled(True)
+            try:
+                headers, rows = preview_format(sample, fmt)
                 width = max([len(headers), *(len(row) for row in rows)])
                 headers += [""] * (width - len(headers))
                 model.replace(headers, [tuple(row + [""] * (width - len(row))) for row in rows])
@@ -457,6 +472,7 @@ class MainWindow(QMainWindow):
                 status.setText(str(exc))
 
         delimiter.currentIndexChanged.connect(refresh)
+        custom.textChanged.connect(refresh)
         header.toggled.connect(refresh)
         refresh()
         return current_format() if dialog.exec() else None
