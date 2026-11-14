@@ -1,5 +1,7 @@
 """Qt preview window."""
 
+import csv
+import io
 import json
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import replace
@@ -11,6 +13,7 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer,
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -35,6 +38,8 @@ from PySide6.QtWidgets import (
 )
 
 from csv_workbench.core import (
+    DELETED_COLUMN,
+    NEW_ROW,
     PAGE_SIZE,
     Cancellation,
     Selection,
@@ -52,6 +57,7 @@ from csv_workbench.core import (
 )
 from csv_workbench.session import load_session, save_session
 
+MISSING = object()
 ROOT_INDEX = QModelIndex()
 BUFFER_ROWS = PAGE_SIZE * 3
 JOB_NAMES = ("view_job", "count_job", "page_job", "export_job", "query_job", "save_job")
@@ -153,6 +159,8 @@ class MainWindow(QMainWindow):
         self.history = []
         self.history_pos = self.clean_pos = 0
         self.pending_history = None
+        self.source_snapshot = None
+        self.next_row_id = NEW_ROW
         self.model.cellEdited.connect(self.record_edit)
         self.applied_edits = {}
         self.refreshing_edit = False
@@ -183,6 +191,15 @@ class MainWindow(QMainWindow):
         self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
         for action in (self.save_action, self.save_as_action, self.undo_action, self.redo_action):
             action.setEnabled(False)
+        self.copy_action = edit_menu.addAction("Copy range", self.copy_range)
+        self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
+        self.paste_action = edit_menu.addAction("Paste range", self.paste_range)
+        self.paste_action.setShortcut(QKeySequence.StandardKey.Paste)
+        self.clear_action = edit_menu.addAction("Clear cells", self.clear_cells)
+        self.clear_action.setShortcut(QKeySequence.StandardKey.Delete)
+        self.add_row_action = edit_menu.addAction("Add row", lambda: self.add_rows())
+        self.clone_action = edit_menu.addAction("Duplicate rows", lambda: self.add_rows(clone=True))
+        self.delete_action = edit_menu.addAction("Delete rows", self.delete_rows)
         session_menu = self.menuBar().addMenu("Session")
         self.open_session_action = session_menu.addAction("Open session…")
         self.open_session_action.triggered.connect(self.open_session_file)
@@ -232,6 +249,7 @@ class MainWindow(QMainWindow):
         self.table.verticalScrollBar().valueChanged.connect(self.load_at_edge)
         self.status = QLabel("Open a CSV file to begin")
         self.statusBar().addWidget(self.status, 1)
+        self.update_edit_actions()
 
     def open_column_menu(self, section):
         if self.path is None or self.view_job is not None or self.distinct is not None:
@@ -336,9 +354,36 @@ class MainWindow(QMainWindow):
             self.page_job[0].cancel()
             self.page_job[1].cancel()
             self.page_job = None
-        self.save_job = self.submit(
-            save_csv, self.path, destination, self.model.edits.copy(), self.revision
+        path, revision = self.path, self.revision
+        edits = self.model.edits.copy()
+        snapshot = self.source_snapshot
+        keep_base = self.structural(edits) or any(
+            row >= NEW_ROW or col == DELETED_COLUMN
+            for entry in self.history
+            for (row, col), _, _ in entry
         )
+
+        def save(*, cancel):
+            if snapshot is not None or not keep_base:
+                base = Path(snapshot.name) / "source.csv" if snapshot else None
+                return save_csv(
+                    path, destination, edits, revision, source=base, cancel=cancel
+                ), snapshot
+            scratch = TemporaryDirectory(prefix="csv-history-")
+            base = Path(scratch.name) / "source.csv"
+            try:
+                with path.open("rb") as source, base.open("wb") as output:
+                    while chunk := source.read(1024 * 1024):
+                        cancel.check()
+                        output.write(chunk)
+                return save_csv(
+                    path, destination, edits, revision, source=base, cancel=cancel
+                ), scratch
+            except BaseException:
+                scratch.cleanup()
+                raise
+
+        self.save_job = self.submit(save)
         self.poll.start()
         self.update_status()
 
@@ -347,14 +392,14 @@ class MainWindow(QMainWindow):
         return self.history_pos != self.clean_pos
 
     def record_edit(self, key, before, after):
-        self.refresh_after_edit(("edit", (key, before, after)))
+        self.refresh_after_edit(("edit", [(key, before, after)]))
 
     def move_history(self, step):
         target = self.history_pos + step
         if not self.model.editable or not 0 <= target <= len(self.history):
             return
-        key, before, after = self.history[min(target, self.history_pos)]
-        self.model.edits[key] = before if step < 0 else after
+        for key, before, after in self.history[min(target, self.history_pos)]:
+            self.set_patch(key, before if step < 0 else after)
         self.refresh_after_edit(("move", target))
 
     def commit_history(self):
@@ -371,6 +416,107 @@ class MainWindow(QMainWindow):
         else:
             self.history_pos = value
 
+    @staticmethod
+    def structural(edits):
+        return any(row >= NEW_ROW or col == DELETED_COLUMN for row, col in edits)
+
+    def set_patch(self, key, value):
+        if value is MISSING:
+            self.model.edits.pop(key, None)
+        else:
+            self.model.edits[key] = value
+
+    def edit_batch(self, values):
+        if not self.model.editable:
+            return
+        changes = [
+            (key, self.model.edits.get(key, MISSING), value)
+            for key, value in values.items()
+            if self.model.edits.get(key, MISSING) != value
+        ]
+        if changes:
+            for key, _, value in changes:
+                self.set_patch(key, value)
+            self.refresh_after_edit(("edit", changes))
+
+    def copy_range(self):
+        indexes = self.table.selectedIndexes()
+        if not indexes:
+            return
+        values = {
+            (i.row(), i.column()): self.model.data(i, Qt.ItemDataRole.EditRole) for i in indexes
+        }
+        output = io.StringIO(newline="")
+        writer = csv.writer(output, delimiter="\t")
+        columns = range(min(c for _, c in values), max(c for _, c in values) + 1)
+        for row in range(min(r for r, _ in values), max(r for r, _ in values) + 1):
+            writer.writerow(values.get((row, col), "") for col in columns)
+        QApplication.clipboard().setText(output.getvalue())
+
+    def paste_range(self):
+        anchor = self.table.currentIndex()
+        if not self.model.editable or not anchor.isValid():
+            return
+        try:
+            rows = list(
+                csv.reader(
+                    io.StringIO(QApplication.clipboard().text(), newline=""),
+                    delimiter="\t",
+                    strict=True,
+                )
+            )
+        except csv.Error as exc:
+            QMessageBox.warning(self, "Paste range", str(exc))
+            return
+        if anchor.row() + len(rows) > self.model.rowCount() or any(
+            anchor.column() + len(row) > self.model.columnCount() for row in rows
+        ):
+            QMessageBox.warning(self, "Paste range", "The block does not fit in the loaded cells.")
+            return
+        self.edit_batch(
+            {
+                self.model.cell_key(self.model.index(anchor.row() + r, anchor.column() + c)): value
+                or None
+                for r, row in enumerate(rows)
+                for c, value in enumerate(row)
+            }
+        )
+
+    def clear_cells(self):
+        self.edit_batch(
+            {self.model.cell_key(index): None for index in self.table.selectedIndexes()}
+        )
+
+    def selected_rows(self):
+        return sorted({index.row() for index in self.table.selectedIndexes()})
+
+    def add_rows(self, *, clone=False):
+        if not self.model.editable:
+            return
+        rows = self.selected_rows() if clone else [None]
+        if clone and self.model.headers != self.source_headers:
+            QMessageBox.warning(self, "Duplicate rows", "Show all columns before duplicating rows.")
+            return
+        values = {}
+        for row in rows:
+            for col in range(len(self.source_headers)):
+                index = self.model.index(row, col) if row is not None else None
+                values[self.next_row_id, col] = (
+                    self.model.data(index, Qt.ItemDataRole.EditRole) or None
+                    if index is not None
+                    else None
+                )
+            self.next_row_id += 1
+        self.edit_batch(values)
+
+    def delete_rows(self):
+        self.edit_batch(
+            {
+                (self.model.cell_key(self.model.index(row, 0))[0], DELETED_COLUMN): None
+                for row in self.selected_rows()
+            }
+        )
+
     def save_selection(self):
         if self.path is None or self.export_job is not None:
             return
@@ -383,15 +529,28 @@ class MainWindow(QMainWindow):
         if destination:
             self.export_button.setEnabled(False)
             self.export_edits = self.model.edits.copy()
-            if self.export_edits:
-                self.export_job = self.submit(
-                    export_edited_csv,
-                    self.path,
-                    Path(destination),
-                    self.export_edits,
-                    self.revision,
-                    self.selection,
-                )
+            snapshot, path, revision, selection, edits = (
+                self.source_snapshot,
+                self.path,
+                self.revision,
+                self.selection,
+                self.export_edits,
+            )
+            if edits or snapshot:
+
+                def export(*, cancel):
+                    base = Path(snapshot.name) / "source.csv" if snapshot else path
+                    return export_edited_csv(
+                        base,
+                        Path(destination),
+                        edits,
+                        revision,
+                        selection,
+                        document=path,
+                        cancel=cancel,
+                    )
+
+                self.export_job = self.submit(export)
             else:
                 self.export_job = self.submit(
                     export_csv, self.path, Path(destination), self.selection
@@ -629,14 +788,15 @@ class MainWindow(QMainWindow):
 
     def refresh_after_edit(self, history):
         self.pending_history = history
-        if self.selection != Selection():
+        if self.selection != Selection() or self.identified or self.structural(self.model.edits):
             self.load_view(self.path, self.selection, refreshing_edit=True)
         else:
             self.applied_edits = self.model.edits.copy()
             self.commit_history()
-            if history[0] == "move":
-                self.model.replace(
-                    self.model.headers, self.model.rows, self.model.offset, self.model.row_ids
+            if self.model.rowCount():
+                self.model.dataChanged.emit(
+                    self.model.index(0, 0),
+                    self.model.index(self.model.rowCount() - 1, self.model.columnCount() - 1),
                 )
             self.update_status()
 
@@ -666,17 +826,22 @@ class MainWindow(QMainWindow):
             return
 
         edits = {} if new_file else self.model.edits.copy()
+        snapshot = None if new_file else self.source_snapshot
+        identified = distinct is None and (
+            selection != Selection() or self.structural(edits) or snapshot is not None
+        )
 
         def read_view(*, cancel):
             revision = file_revision(path)
             if not new_file and revision != self.revision:
                 raise ValueError("The source CSV changed. Reopen it before editing.")
+            base = Path(snapshot.name) / "source.csv" if snapshot else path
             source_headers = None
             if new_file and selection.visible_columns is not None:
                 source_headers = read_page(path, 0, cancel=cancel)[0]
-            if distinct is not None and edits:
+            if distinct is not None and (edits or snapshot):
                 result = prepare_editable_result(
-                    path,
+                    base,
                     replace(selection, visible_columns=(distinct,), sort_column=None),
                     edits,
                     distinct=distinct,
@@ -690,13 +855,13 @@ class MainWindow(QMainWindow):
                 )
                 return revision, result.page(0, cancel=cancel), result, source_headers
             if selection.sort_column is not None:
-                result = prepare_editable_result(path, selection, edits, cancel=cancel)
+                result = prepare_editable_result(base, selection, edits, cancel=cancel)
                 page = result.page(0, cancel=cancel)
                 if file_revision(path) != revision:
                     raise ValueError("The source CSV changed. Reopen it before editing.")
                 return revision, page, result, source_headers
-            if selection != Selection():
-                page = read_editable_page(path, 0, selection, edits, cancel=cancel)
+            if identified:
+                page = read_editable_page(base, 0, selection, edits, cancel=cancel)
             else:
                 page = read_page(path, 0, selection, cancel=cancel)
             if file_revision(path) != revision:
@@ -704,13 +869,13 @@ class MainWindow(QMainWindow):
             return revision, page, None, source_headers
 
         self.refreshing_edit = refreshing_edit
-        self.view_request = path, selection, new_file, distinct
+        self.view_request = path, selection, new_file, distinct, identified
         self.view_job = self.submit(read_view)
         self.poll.start()
         self.update_status()
 
     def apply_view(self, revision, page, result, source_headers):
-        path, selection, new_file, distinct = self.view_request
+        path, selection, new_file, distinct, identified = self.view_request
         headers, rows, has_more = page
         if self.page_job is not None:
             self.page_job[0].cancel()
@@ -731,6 +896,8 @@ class MainWindow(QMainWindow):
         self.path, self.selection, self.file_size = path, selection, revision[2]
         self.revision = revision
         if new_file:
+            self.source_snapshot = None
+            self.next_row_id = NEW_ROW
             self.model.edits.clear()
             self.history.clear()
             self.history_pos = self.clean_pos = 0
@@ -743,7 +910,8 @@ class MainWindow(QMainWindow):
             {name for name, _ in selection.conditions} if distinct is None else set()
         )
         ids = []
-        if distinct is None and selection != Selection():
+        self.identified = identified
+        if identified:
             headers, rows, ids = self.split_row_ids(headers, rows)
         self.model.replace(headers, rows, row_ids=ids)
         header = self.table.horizontalHeader()
@@ -775,15 +943,22 @@ class MainWindow(QMainWindow):
         self.page_offset = offset
         if self.result is None:
             path, revision, selection = self.path, self.revision, self.selection
-            edits = self.model.edits.copy() if selection != Selection() else {}
+            edits = self.model.edits.copy()
+            snapshot, identified = self.source_snapshot, self.identified
 
             def read_current_page(*, cancel):
                 if file_revision(path) != revision:
                     raise ValueError("The source CSV changed. Reopen it before editing.")
                 page = (
                     read_page(path, offset, selection, cancel=cancel)
-                    if selection == Selection()
-                    else read_editable_page(path, offset, selection, edits, cancel=cancel)
+                    if not identified
+                    else read_editable_page(
+                        Path(snapshot.name) / "source.csv" if snapshot else path,
+                        offset,
+                        selection,
+                        edits,
+                        cancel=cancel,
+                    )
                 )
                 if file_revision(path) != revision:
                     raise ValueError("The source CSV changed. Reopen it before editing.")
@@ -801,7 +976,7 @@ class MainWindow(QMainWindow):
 
     def apply_page(self, headers, rows, has_more):
         ids = []
-        if self.distinct is None and self.selection != Selection():
+        if self.identified:
             headers, rows, ids = self.split_row_ids(headers, rows)
         if headers != self.model.headers or not rows:
             raise ValueError("CSV changed. Reopen the file to refresh it.")
@@ -854,7 +1029,7 @@ class MainWindow(QMainWindow):
                 elif name == "query_job":
                     self.show_query_result(*result)
                 elif name == "save_job":
-                    self.path, self.revision = result
+                    (self.path, self.revision), self.source_snapshot = result
                     self.file_size = self.revision[2]
                     self.clean_pos = self.history_pos
                     self.setWindowTitle(f"CSV Workbench — {self.path.name}")
@@ -878,6 +1053,17 @@ class MainWindow(QMainWindow):
         if not self.cancel_button.isEnabled():
             self.poll.stop()
 
+    def update_edit_actions(self):
+        self.copy_action.setEnabled(self.path is not None)
+        for action in (
+            self.paste_action,
+            self.clear_action,
+            self.add_row_action,
+            self.clone_action,
+            self.delete_action,
+        ):
+            action.setEnabled(self.model.editable)
+
     def update_status(self):
         jobs = self.jobs()
         available = self.path is not None and not (
@@ -896,6 +1082,7 @@ class MainWindow(QMainWindow):
             and self.export_job is None
             and self.save_job is None
         )
+        self.update_edit_actions()
         self.cancel_button.setEnabled(any(job is not None for job in jobs))
         self.open_button.setEnabled(
             self.view_job is None and self.query_job is None and self.save_job is None

@@ -13,6 +13,8 @@ from threading import Lock
 import duckdb
 
 PAGE_SIZE = 200
+NEW_ROW = 1 << 62
+DELETED_COLUMN = -1
 CSV_SOURCE = """read_csv(?, header = true, delim = ',', quote = '"', escape = '"',
                          all_varchar = true, hive_partitioning = false)"""
 
@@ -228,10 +230,14 @@ def editable_query(connection, source, selection, edits):
             else f"s.{quoted}"
             for index, quoted in enumerate(map(quote_identifier, columns))
         )
+        patches = "(SELECT rid, map(list(col), list(val)) AS cells FROM cell_edits GROUP BY rid)"
+        if any(row >= NEW_ROW for row, _ in edits):
+            blanks = ", ".join(f"NULL::VARCHAR AS {quote_identifier(col)}" for col in columns)
+            scan = f"({scan} UNION ALL SELECT rid, {blanks} FROM {patches} WHERE rid >= {NEW_ROW})"
         scan = (
             f"(SELECT s.{row_id}, {projection} FROM {scan} s LEFT JOIN "
-            "(SELECT rid, map(list(col), list(val)) AS cells FROM cell_edits GROUP BY rid) p "
-            f"ON s.{row_id} = p.rid)"
+            f"{patches} p ON s.{row_id} = p.rid "
+            f"WHERE NOT coalesce(map_contains(p.cells, {DELETED_COLUMN}), false))"
         )
     sql, values = selection_sql(columns, selection, source=scan, row_id=row_id)
     if edits and selection.sort_column is None:
@@ -331,18 +337,29 @@ def file_revision(path: Path) -> tuple[int, int, int, int, int]:
 
 
 def export_edited_csv(
-    path, destination, edits, revision, selection=Selection(), *, cancel=None, save=False
+    path,
+    destination,
+    edits,
+    revision,
+    selection=Selection(),
+    *,
+    cancel=None,
+    save=False,
+    document=None,
 ):
     cancel = cancel or Cancellation()
     source = path.resolve(strict=True)
     destination = destination.absolute()
+    document = document or source
     if save:
         destination = destination.resolve()
-    elif destination.resolve() == source or (destination.exists() and destination.samefile(source)):
+    elif destination.resolve() == document.resolve() or (
+        destination.exists() and destination.samefile(document)
+    ):
         raise ValueError("Choose a destination other than the source CSV.")
 
     def check_source():
-        if file_revision(source) != revision:
+        if file_revision(document) != revision:
             raise ValueError("The source CSV changed. Reopen it before editing.")
 
     check_source()
@@ -358,7 +375,8 @@ def export_edited_csv(
                 while batch := cursor.fetchmany(1024):
                     cancel.check()
                     for row in batch:
-                        writer.writerow(row[1:])
+                        values = row[1:]
+                        writer.writerow(("",) if values == (None,) else values)
                         count += 1
         if save and destination.exists():
             output.chmod(destination.stat().st_mode & 0o777)
@@ -367,9 +385,11 @@ def export_edited_csv(
     return count
 
 
-def save_csv(path, destination, edits, revision, *, cancel=None):
+def save_csv(path, destination, edits, revision, *, cancel=None, source=None):
     destination = destination.resolve()
-    export_edited_csv(path, destination, edits, revision, cancel=cancel, save=True)
+    export_edited_csv(
+        source or path, destination, edits, revision, cancel=cancel, save=True, document=path
+    )
     return destination, file_revision(destination)
 
 

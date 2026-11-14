@@ -289,3 +289,70 @@ def test_edit_sorted_filtered_cell_updates_view_and_export(tmp_path, monkeypatch
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_range_and_row_history_survives_save(tmp_path, monkeypatch):
+    from PySide6.QtCore import QItemSelection, QItemSelectionModel
+
+    from csv_workbench.core import Selection, read_page
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "data.csv"
+    source.write_text("id,label\n1,a\n2,b\n3,c\n", encoding="utf-8")
+    window = MainWindow()
+
+    def finish(name):
+        getattr(window, name)[1].result(timeout=5)
+        window.collect_reads()
+
+    def select(row, last_row, col, last_col):
+        window.table.setCurrentIndex(window.model.index(row, col))
+        window.table.selectionModel().select(
+            QItemSelection(window.model.index(row, col), window.model.index(last_row, last_col)),
+            QItemSelectionModel.SelectionFlag.ClearAndSelect,
+        )
+
+    try:
+        window.load_view(source, Selection(), new_file=True)
+        finish("view_job")
+        select(0, 1, 0, 1)
+        window.copy_action.trigger()
+        assert app.clipboard().text().splitlines() == ["1\ta", "2\tb"]
+        select(1, 1, 0, 0)
+        window.paste_action.trigger()
+        assert window.model.data(window.model.index(2, 1)) == "b"
+        assert window.history_pos == 1
+        window.undo_action.trigger()
+        assert window.model.data(window.model.index(2, 1)) == "c"
+        window.redo_action.trigger()
+        select(1, 2, 1, 1)
+        window.clear_action.trigger()
+        assert [window.model.data(window.model.index(i, 1)) for i in (1, 2)] == ["NULL"] * 2
+        window.undo_action.trigger()
+        select(0, 0, 0, 1)
+        window.clone_action.trigger()
+        finish("view_job")
+        window.add_row_action.trigger()
+        finish("view_job")
+        select(1, 2, 0, 1)
+        window.delete_action.trigger()
+        finish("view_job")
+        assert window.model.rows == [("1", "a"), ("1", "a"), (None, None)]
+        window.save_action.trigger()
+        finish("save_job")
+        assert read_page(source, 0)[1] == window.model.rows
+        assert not window.dirty
+        window.undo_action.trigger()
+        finish("view_job")
+        assert window.model.rows == [("1", "a"), ("1", "a"), ("2", "b"), ("1", "a"), (None, None)]
+        window.redo_action.trigger()
+        finish("view_job")
+        assert window.model.rows == [("1", "a"), ("1", "a"), (None, None)]
+        assert not window.dirty
+    finally:
+        monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

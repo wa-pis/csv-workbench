@@ -27,4 +27,6 @@ v0.1: запланированные этапы закрыты. [GitHub Actions]
 
 Сохранение CSV и история правок: [`save-and-undo-csv`](openspec/changes/archive/2026-11-15-save-and-undo-csv/proposal.md) закрыт.
 
+Операции с диапазонами и строками: [`edit-csv-ranges-and-rows`](openspec/changes/archive/2026-11-15-edit-csv-ranges-and-rows/proposal.md) закрыт.
+
 Roadmap задаёт порядок и критерии готовности. Каждый этап начинается с предложения, сценариев, дизайна и списка задач в `openspec/changes/`. После реализации и проверки изменение архивируется, а согласованное поведение попадает в `openspec/specs/`.

@@ -66,3 +66,24 @@ def test_save_in_place_is_atomic_and_rejects_stale_revision(tmp_path):
     with pytest.raises(ValueError, match="source CSV changed"):
         save_csv(source, source, {(0, 1): "stale"}, revision)
     assert read_page(source, 0)[1] == [("1", "new"), ("2", "hidden")]
+
+
+def test_row_operations_participate_in_filter_sort_and_export(tmp_path):
+    from csv_workbench.core import DELETED_COLUMN, NEW_ROW, Selection
+
+    source = tmp_path / "source.csv"
+    source.write_text("id,label\n1,keep\n2,keep\n3,hidden\n", encoding="utf-8")
+    edits = {(0, DELETED_COLUMN): None, (NEW_ROW, 0): "4", (NEW_ROW, 1): "keep"}
+    export = tmp_path / "export.csv"
+    selection = Selection((("label", "keep"),), "id", True, ("id",))
+    assert export_edited_csv(source, export, edits, file_revision(source), selection) == 2
+    assert read_page(export, 0)[1] == [("4",), ("2",)]
+
+
+def test_blank_row_in_single_column_survives_save(tmp_path):
+    from csv_workbench.core import NEW_ROW, save_csv
+
+    source = tmp_path / "source.csv"
+    source.write_text("value\nfirst\n", encoding="utf-8")
+    save_csv(source, source, {(NEW_ROW, 0): None}, file_revision(source))
+    assert read_page(source, 0)[1] == [("first",), (None,)]
