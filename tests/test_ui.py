@@ -1,6 +1,6 @@
 from concurrent.futures import wait
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
@@ -28,7 +28,7 @@ def test_open_and_load_more(tmp_path, monkeypatch):
         window.collect_reads()
         assert f"File: {source.stat().st_size:,} bytes" in window.status.text()
         assert "Total rows: 201" in window.status.text()
-        assert "Loaded: 200" in window.status.text()
+        assert "Buffered: 200" in window.status.text()
 
         bar = window.table.verticalScrollBar()
         bar.setValue(bar.maximum())
@@ -37,7 +37,7 @@ def test_open_and_load_more(tmp_path, monkeypatch):
         assert window.model.rowCount() == 201
         assert window.model.rows[-1] == ("00201",)
         assert not window.has_more
-        assert "Loaded: 201" in window.status.text()
+        assert "Buffered: 201" in window.status.text()
 
         QTest.mouseClick(window.open_button, Qt.MouseButton.LeftButton)
         wait([window.view_job[1]], timeout=5)
@@ -48,6 +48,9 @@ def test_open_and_load_more(tmp_path, monkeypatch):
 
     finally:
         window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def test_cancel_running_selection_keeps_view(tmp_path, monkeypatch):
@@ -75,7 +78,7 @@ def test_cancel_running_selection_keeps_view(tmp_path, monkeypatch):
 
     monkeypatch.setattr("csv_workbench.ui.read_page", slow_read)
     try:
-        window.load_view(source, Selection(sort_column="id"))
+        window.load_view(source, Selection(substring="x"))
         assert started.wait(5)
         token, future = window.view_job
         assert not future.done()
@@ -91,3 +94,42 @@ def test_cancel_running_selection_keeps_view(tmp_path, monkeypatch):
     finally:
         release.set()
         window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_scroll_buffer_can_restore_evicted_rows(tmp_path):
+    from csv_workbench.core import Selection
+    from csv_workbench.ui import BUFFER_ROWS
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "many.csv"
+    source.write_text("id\n" + "".join(f"{i:04}\n" for i in range(601)), encoding="utf-8")
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    try:
+        window.load_view(source, Selection(), new_file=True)
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        bar = window.table.verticalScrollBar()
+        for _ in range(3):
+            bar.setValue(bar.maximum())
+            window.page_job[1].result(timeout=5)
+            window.collect_reads()
+            assert len(window.model.rows) <= BUFFER_ROWS
+        assert window.model.offset == 200
+        assert window.model.rows[-1] == ("0600",)
+        bar.setValue(0)
+        window.page_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.model.offset == 0
+        assert window.model.rows[0] == ("0000",)
+        assert len(window.model.rows) <= BUFFER_ROWS
+        assert window.has_more
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

@@ -7,6 +7,7 @@ import duckdb
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -24,9 +25,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from csv_workbench.core import Cancellation, Selection, count_rows, export_csv, read_page
+from csv_workbench.core import (
+    PAGE_SIZE,
+    Cancellation,
+    Selection,
+    count_rows,
+    export_csv,
+    prepare_result,
+    read_page,
+)
 
 ROOT_INDEX = QModelIndex()
+BUFFER_ROWS = PAGE_SIZE * 3
 
 
 class PageModel(QAbstractTableModel):
@@ -34,17 +44,12 @@ class PageModel(QAbstractTableModel):
         super().__init__()
         self.headers: list[str] = []
         self.rows: list[tuple] = []
+        self.offset = 0
 
-    def replace(self, headers: list[str], rows: list[tuple]) -> None:
+    def replace(self, headers: list[str], rows: list[tuple], offset: int = 0) -> None:
         self.beginResetModel()
-        self.headers, self.rows = headers, rows
+        self.headers, self.rows, self.offset = headers, rows, offset
         self.endResetModel()
-
-    def append(self, rows: list[tuple]) -> None:
-        if rows:
-            self.beginInsertRows(ROOT_INDEX, len(self.rows), len(self.rows) + len(rows) - 1)
-            self.rows.extend(rows)
-            self.endInsertRows()
 
     def rowCount(self, parent=ROOT_INDEX):
         return 0 if parent.isValid() else len(self.rows)
@@ -63,7 +68,7 @@ class PageModel(QAbstractTableModel):
             return None
         if orientation == Qt.Orientation.Horizontal:
             return self.headers[section]
-        return str(section + 1)
+        return str(self.offset + section + 1)
 
 
 class MainWindow(QMainWindow):
@@ -72,6 +77,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CSV Workbench")
         self.path: Path | None = None
         self.has_more = False
+        self.result = None
+        self.distinct = None
+        self.adjusting = False
         self.file_size = 0
         self.total_rows = None
         self.executor = ThreadPoolExecutor(max_workers=2)
@@ -95,6 +103,10 @@ class MainWindow(QMainWindow):
         self.selection_button.setEnabled(False)
         self.selection_button.clicked.connect(self.edit_selection)
         layout.addWidget(self.selection_button)
+        self.unique_button = QPushButton("Unique values…")
+        self.unique_button.setEnabled(False)
+        self.unique_button.clicked.connect(self.edit_unique)
+        layout.addWidget(self.unique_button)
         self.export_button = QPushButton("Export CSV…")
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self.save_selection)
@@ -109,7 +121,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.table, 1)
 
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.table.verticalScrollBar().valueChanged.connect(self.load_near_bottom)
+        self.table.verticalScrollBar().valueChanged.connect(self.load_at_edge)
         self.status = QLabel("Open a CSV file to begin")
         layout.addWidget(self.status)
 
@@ -148,6 +160,9 @@ class MainWindow(QMainWindow):
 
     def edit_selection(self):
         if self.path is None:
+            return
+        if self.distinct is not None:
+            self.load_view(self.path, self.selection)
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("Filter, sort and columns")
@@ -213,20 +228,53 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         dialog.exec()
 
-    def load_view(self, path: Path, selection: Selection, *, new_file: bool = False):
+    def edit_unique(self):
+        if self.path is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Unique values")
+        form = QFormLayout(dialog)
+        column = QComboBox()
+        column.addItems(self.source_headers)
+        once = QCheckBox("Only values occurring once")
+        form.addRow("Column", column)
+        form.addRow(once)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec():
+            self.load_view(
+                self.path,
+                self.selection,
+                distinct=column.currentText(),
+                singletons=once.isChecked(),
+            )
+
+    def load_view(
+        self, path: Path, selection: Selection, *, new_file=False, distinct=None, singletons=False
+    ):
         if self.view_job is not None:
             return
 
         def read_view(*, cancel):
-            return path.stat().st_size, read_page(path, 0, selection, cancel=cancel)
+            size = path.stat().st_size
+            if distinct is not None or selection.sort_column is not None:
+                result = prepare_result(
+                    path, selection, distinct=distinct, singletons=singletons, cancel=cancel
+                )
+                return size, result.page(0, cancel=cancel), result
+            return size, read_page(path, 0, selection, cancel=cancel), None
 
-        self.view_request = path, selection, new_file
+        self.view_request = path, selection, new_file, distinct
         self.view_job = self.submit(read_view)
         self.poll.start()
         self.update_status()
 
-    def apply_view(self, size, page):
-        path, selection, new_file = self.view_request
+    def apply_view(self, size, page, result):
+        path, selection, new_file, distinct = self.view_request
         headers, rows, has_more = page
         if self.page_job is not None:
             self.page_job[0].cancel()
@@ -241,25 +289,58 @@ class MainWindow(QMainWindow):
             self.source_headers = headers
 
         self.path, self.selection, self.file_size = path, selection, size
+        self.result, self.distinct = result, distinct
         self.has_more = False
         self.model.replace(headers, rows)
         self.table.scrollToTop()
         self.has_more = has_more
         self.setWindowTitle(f"CSV Workbench — {path.name}")
 
-    def load_near_bottom(self, value: int):
+    def load_at_edge(self, value: int):
+        if self.adjusting or self.path is None or self.view_job or self.page_job:
+            return
         bar = self.table.verticalScrollBar()
-        if (
-            self.path is not None
-            and self.has_more
-            and self.view_job is None
-            and self.page_job is None
-            and value >= bar.maximum() - bar.pageStep() // 2
-        ):
-            # shortcut: OFFSET rescans the CSV; use a retained result when this becomes costly.
-            self.page_job = self.submit(read_page, self.path, len(self.model.rows), self.selection)
-            self.poll.start()
-            self.update_status()
+        start = self.model.offset
+        if value == bar.maximum() and self.has_more:
+            offset = start + len(self.model.rows)
+        elif value == 0 and start:
+            offset = start - PAGE_SIZE
+        else:
+            return
+        self.page_offset = offset
+        if self.result is None:
+            self.page_job = self.submit(read_page, self.path, offset, self.selection)
+        else:
+            self.page_job = self.submit(self.result.page, offset)
+        self.poll.start()
+        self.update_status()
+
+    def apply_page(self, headers, rows, has_more):
+        if headers != self.model.headers or not rows:
+            raise ValueError("CSV changed. Reopen the file to refresh it.")
+        start = self.model.offset
+        bar = self.table.verticalScrollBar()
+        height = self.table.verticalHeader().defaultSectionSize()
+        position = bar.value()
+        if self.page_offset < start:
+            combined = rows + self.model.rows
+            trimmed = len(combined) > BUFFER_ROWS
+            start = self.page_offset
+            position += len(rows) * height
+            self.has_more = self.has_more or trimmed
+            combined = combined[:BUFFER_ROWS]
+        else:
+            combined = self.model.rows + rows
+            removed = PAGE_SIZE if len(combined) > BUFFER_ROWS else 0
+            start += removed
+            position -= removed * height
+            self.has_more = has_more
+            combined = combined[removed:]
+        self.adjusting = True
+        self.model.replace(headers, combined, start)
+        self.table.doItemsLayout()
+        bar.setValue(position)
+        self.adjusting = False
 
     def collect_reads(self):
         for name in ("view_job", "count_job", "page_job", "export_job"):
@@ -277,11 +358,7 @@ class MainWindow(QMainWindow):
                 elif name == "count_job":
                     self.total_rows = result
                 elif name == "page_job":
-                    headers, rows, has_more = result
-                    if headers != self.model.headers:
-                        raise ValueError("CSV columns changed. Reopen the file to refresh it.")
-                    self.has_more = has_more
-                    self.model.append(rows)
+                    self.apply_page(*result)
                 else:
                     QMessageBox.information(self, "Export CSV", f"Exported {result:,} rows.")
             except CancelledError:
@@ -303,8 +380,15 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(any(job is not None for job in jobs))
         self.open_button.setEnabled(self.view_job is None)
         self.selection_button.setEnabled(self.path is not None and self.view_job is None)
+        self.unique_button.setEnabled(self.path is not None and self.view_job is None)
+        self.selection_button.setText(
+            "Back to CSV selection" if self.distinct is not None else "Filter, sort and columns…"
+        )
         self.export_button.setEnabled(
-            self.path is not None and self.view_job is None and self.export_job is None
+            self.path is not None
+            and self.view_job is None
+            and self.export_job is None
+            and self.distinct is None
         )
         total = self.total_rows
         if isinstance(total, int):
@@ -316,13 +400,18 @@ class MainWindow(QMainWindow):
             progress += " • Cancelling…"
         if self.export_job is not None:
             progress += " • Exporting CSV…"
+        if self.distinct is not None:
+            progress += f" • Unique: {self.distinct}"
         self.status.setText(
             f"File: {self.file_size:,} bytes • Total rows: {total if total is not None else 'counting…'}"
-            f" • Loaded: {len(self.model.rows):,}{progress}"
+            f" • Buffered: {len(self.model.rows):,}{progress}"
         )
 
     def closeEvent(self, event):
         self.cancel_operations()
         self.poll.stop()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.result = None
+        self.view_job = None
+        self.page_job = None
         super().closeEvent(event)

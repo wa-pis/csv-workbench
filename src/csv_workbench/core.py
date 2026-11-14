@@ -136,9 +136,7 @@ def read_page(
             sql + " LIMIT ? OFFSET ?",
             [*params, PAGE_SIZE + 1, offset],
         )
-        headers = [column[0] for column in cursor.description]
-        rows = cursor.fetchall()
-    return headers, rows[:PAGE_SIZE], len(rows) > PAGE_SIZE
+        return page_result(cursor)
 
 
 def export_csv(
@@ -163,3 +161,156 @@ def export_csv(
             ).fetchone()[0]
         cancel.publish(output, destination)
     return count
+
+
+class DiskResult:
+    """A reusable query result; active readers keep its temporary directory alive."""
+
+    def __init__(self, scratch: TemporaryDirectory, path: Path):
+        self.scratch = scratch
+        self.path = path
+
+    def page(self, offset: int, *, cancel: Cancellation | None = None):
+        with (cancel or Cancellation()).connection() as connection:
+            cursor = connection.execute(
+                "SELECT * FROM read_parquet(?) LIMIT ? OFFSET ?",
+                [str(self.path), PAGE_SIZE + 1, offset],
+            )
+            return page_result(cursor)
+
+
+def page_result(cursor):
+    headers = [column[0] for column in cursor.description]
+    rows = cursor.fetchall()
+    return headers, rows[:PAGE_SIZE], len(rows) > PAGE_SIZE
+
+
+CSV_BLOCK_BYTES = 8 * 2**20
+
+
+def csv_blocks(source, cancel, block_bytes=CSV_BLOCK_BYTES):
+    """Split on record boundaries, including CSV fields containing newlines."""
+    pending = b""
+    while chunk := source.read(block_bytes):
+        cancel.check()
+        pending += chunk
+        end = pending.rfind(b"\n") + 1
+        if not end:
+            continue
+        if pending.count(b'"', 0, end) % 2:
+            # An escaped quote contributes two quotes, so it cannot change parity.
+            while end:
+                previous = pending.rfind(b"\n", 0, end - 1) + 1
+                if pending.count(b'"', previous, end) % 2:
+                    end = previous
+                    break
+                end = previous
+        if end:
+            yield pending[:end]
+            pending = pending[end:]
+    if pending:
+        yield pending
+
+
+def stage_selection(path, selection, distinct, directory, cancel):
+    """Stream just the required columns and matching rows into Parquet batches."""
+    import polars as pl
+
+    visible = (distinct,) if distinct is not None else selection.visible_columns
+    if visible is not None and not visible:
+        raise ValueError("Select at least one visible column.")
+    sort = selection.sort_column if distinct is None else None
+    files = []
+    with path.open("rb") as source:
+        blocks = csv_blocks(source, cancel)
+        first = next(blocks, None)
+        if first is None:
+            raise ValueError("CSV has no header.")
+        first_frame = pl.read_csv(first, infer_schema=False, n_threads=2, null_values="")
+        names = first_frame.columns
+        required = set(names if visible is None else visible)
+        required.update(name for name in (sort, selection.filter_column) if name is not None)
+        if missing := required.difference(names):
+            raise ValueError(f"Unknown CSV column: {min(missing)}")
+        output_columns = [name for name in names if visible is None or name in visible]
+        staged_columns = list(dict.fromkeys(output_columns + ([sort] if sort else [])))
+
+        def write_batch(frame, index):
+            frame = frame.lazy()
+            if selection.filter_column is not None and selection.substring:
+                frame = frame.filter(
+                    pl.col(selection.filter_column)
+                    .str.to_lowercase()
+                    .str.contains(pl.lit(selection.substring).str.to_lowercase(), literal=True)
+                )
+            batch = frame.select(staged_columns).collect()
+            cancel.check()
+            if batch.height:
+                file = directory / f"batch-{index:08}.parquet"
+                batch.write_parquet(file)
+                files.append(str(file))
+
+        write_batch(first_frame, 0)
+        for index, block in enumerate(blocks, 1):
+            write_batch(
+                pl.read_csv(
+                    block,
+                    has_header=False,
+                    infer_schema=False,
+                    n_threads=2,
+                    new_columns=names,
+                    null_values="",
+                    raise_if_empty=False,
+                ),
+                index,
+            )
+    if not files:
+        empty = directory / "empty.parquet"
+        pl.DataFrame(schema={name: pl.String for name in staged_columns}).write_parquet(empty)
+        files.append(str(empty))
+    return output_columns, files
+
+
+def prepare_result(
+    path: Path,
+    selection: Selection,
+    *,
+    distinct: str | None = None,
+    singletons: bool = False,
+    cancel: Cancellation | None = None,
+) -> DiskResult:
+    import polars as pl
+
+    cancel = cancel or Cancellation()
+    scratch = TemporaryDirectory(prefix="csv-result-")
+    output = Path(scratch.name) / "result.parquet"
+    try:
+        with TemporaryDirectory(prefix="csv-stage-") as staging:
+            columns, files = stage_selection(path, selection, distinct, Path(staging), cancel)
+
+            def quote(name):
+                return '"' + name.replace('"', '""') + '"'
+
+            projection = ", ".join(map(quote, columns))
+            order = ""
+            if distinct is not None:
+                having = " HAVING count(*) = 1" if singletons else ""
+                sql = (
+                    f'SELECT {projection} AS "Value", count(*) AS "Frequency"'
+                    f" FROM read_parquet(?) GROUP BY 1{having} ORDER BY 1 NULLS LAST"
+                )
+            else:
+                if selection.sort_column is not None:
+                    direction = "DESC" if selection.descending else "ASC"
+                    order = f" ORDER BY {quote(selection.sort_column)} {direction} NULLS LAST, row_number() OVER ()"
+                sql = f"SELECT {projection} FROM read_parquet(?){order}"
+            with cancel.connection() as connection:
+                connection.execute(f"COPY ({sql}) TO ? (FORMAT PARQUET)", [str(output), files])
+    except pl.exceptions.PolarsError as exc:
+        scratch.cleanup()
+        cancel.check()
+        raise ValueError(str(exc)) from exc
+    except BaseException:
+        scratch.cleanup()
+        raise
+    return DiskResult(scratch, output)

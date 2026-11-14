@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 
 from PySide6.QtWidgets import QApplication
 
-from csv_workbench.core import Selection, export_csv, read_page
+from csv_workbench.core import Selection, export_csv, prepare_result, read_page
 from csv_workbench.ui import MainWindow
 
 
@@ -23,6 +23,9 @@ def main() -> int:
             source.write_text("id,label\n001,skip\n002,keep\n", encoding="utf-8")
             selection = Selection("label", "keep", "id", visible_columns=("id",))
             if read_page(source, 0, selection) != (["id"], [("002",)], False):
+                return 1
+            result = prepare_result(source, selection, distinct="label")
+            if result.page(0) != (["Value", "Frequency"], [("keep", 1)], False):
                 return 1
             if (
                 export_csv(source, target, selection) != 1

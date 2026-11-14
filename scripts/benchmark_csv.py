@@ -9,15 +9,26 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter, sleep
 
-from csv_workbench.core import Selection, count_rows, export_csv, read_page
+from csv_workbench.core import Selection, count_rows, export_csv, prepare_result, read_page
 
 
 def run(operation, source, output):
     selection = Selection("label", "match", "id", True, ("id", "payload"))
+
+    def cached(distinct=None):
+        result = prepare_result(
+            source, Selection() if distinct == "label" else selection, distinct=distinct
+        )
+        result.page(0)
+        result.page(200)
+
     actions = {
         "open": lambda: read_page(source, 0),
         "count": lambda: count_rows(source),
         "select": lambda: read_page(source, 0, selection),
+        "cached-sort": cached,
+        "distinct": lambda: cached("id"),
+        "distinct-low": lambda: cached("label"),
         "export": lambda: export_csv(source, output, selection),
     }
     start = perf_counter()
@@ -67,5 +78,5 @@ if __name__ == "__main__":
         for filename in sys.argv[1:]:
             source = Path(filename).resolve(strict=True)
             print(f"{source.name}: {source.stat().st_size:,} bytes", flush=True)
-            for operation in ("open", "count", "select", "export"):
+            for operation in ("open", "cached-sort", "distinct", "distinct-low"):
                 measure(source, operation)
