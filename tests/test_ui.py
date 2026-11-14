@@ -16,6 +16,9 @@ def test_open_and_load_more(tmp_path, monkeypatch):
     errors = []
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args[-1]))
 
+    from csv_workbench.core import CsvFormat
+
+    monkeypatch.setattr(MainWindow, "configure_format", lambda *_: CsvFormat())
     window = MainWindow()
     window.show()
     app.processEvents()
@@ -74,7 +77,7 @@ def test_cancel_running_selection_keeps_view(tmp_path, monkeypatch):
         window.collect_reads()
     started, release = Event(), Event()
 
-    def slow_read(*args, cancel):
+    def slow_read(*args, cancel, fmt):
         started.set()
         assert release.wait(5)
         return ["id"], [("stale",)], False
@@ -368,6 +371,44 @@ def test_range_and_row_history_survives_save(tmp_path, monkeypatch):
         assert not window.dirty
     finally:
         monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_open_format_dialog_uses_manual_delimiter_and_header(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QTableView
+
+    from csv_workbench.core import CsvFormat
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "input.csv"
+    source.write_text("one;two\nthree;four\n", encoding="utf-8")
+    window = MainWindow()
+
+    def configure(dialog):
+        delimiter = dialog.findChild(QComboBox)
+        header = dialog.findChild(QCheckBox)
+        model = dialog.findChild(QTableView).model()
+        assert delimiter.currentData() == ";"
+        assert model.headers == ["one", "two"]
+        header.setChecked(False)
+        assert model.rows[0] == ("one", "two")
+        delimiter.setCurrentIndex(delimiter.findData(","))
+        assert model.rows[0] == ("one;two",)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QDialog, "exec", configure)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (str(source), ""))
+    try:
+        window.open_file()
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.csv_format == CsvFormat(",", False)
+        assert window.model.rows == [("one;two",), ("three;four",)]
+    finally:
         window.close()
         window.executor.shutdown(wait=True)
         window.deleteLater()

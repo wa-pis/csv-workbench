@@ -33,4 +33,6 @@ v0.1: запланированные этапы закрыты. [GitHub Actions]
 
 Сборка macOS Intel: [`package-macos-intel`](openspec/changes/archive/2026-11-15-package-macos-intel/proposal.md) закрыт; [CI](https://github.com/wa-pis/csv-workbench/actions/runs/43642899420) подтвердил сборки Windows x64, Linux x64, macOS x64 и macOS ARM64.
 
+Настройка формата открытия и предпросмотр CSV/TSV: [`configure-csv-format`](openspec/changes/archive/2026-11-15-configure-csv-format/proposal.md) закрыт.
+
 Roadmap задаёт порядок и критерии готовности. Каждый этап начинается с предложения, сценариев, дизайна и списка задач в `openspec/changes/`. После реализации и проверки изменение архивируется, а согласованное поведение попадает в `openspec/specs/`.

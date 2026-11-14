@@ -2,6 +2,7 @@
 
 import codecs
 import csv
+import io
 import re
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
@@ -17,6 +18,73 @@ NEW_ROW = 1 << 62
 DELETED_COLUMN = -1
 CSV_SOURCE = """read_csv(?, header = true, delim = ',', quote = '"', escape = '"',
                          all_varchar = true, hive_partitioning = false)"""
+
+
+@dataclass(frozen=True)
+class CsvFormat:
+    delimiter: str = ","
+    header: bool = True
+
+    def __post_init__(self):
+        if self.delimiter not in (",", ";", "\t") or not isinstance(self.header, bool):
+            raise ValueError("Invalid CSV format.")
+
+    @property
+    def source(self):
+        return CSV_SOURCE.replace(
+            "header = true, delim = ','",
+            f"header = {str(self.header).lower()}, delim = '{self.delimiter}'",
+        )
+
+
+def read_format_sample(path):
+    if not path.is_file():
+        raise ValueError(f"Not a regular file: {path}")
+    with path.open(encoding=detect_encoding(path), newline="") as handle:
+        sample = handle.read(128 * 1024 + 1)
+    return sample[: 128 * 1024], len(sample) > 128 * 1024
+
+
+def format_records(sample, delimiter, limit=11):
+    text, truncated = sample
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
+    rows = []
+    try:
+        for row in reader:
+            if row:
+                rows.append(row)
+            if len(rows) == limit:
+                break
+        else:
+            if truncated and rows and not text.endswith(("\n", "\r")):
+                rows.pop()
+    except csv.Error:
+        if not truncated or reader.line_num < len(text.splitlines()):
+            raise
+    return rows
+
+
+def detect_delimiter(sample, fallback=","):
+    best, score = fallback, 1
+    for delimiter in (fallback, ",", ";", "\t"):
+        try:
+            rows = format_records(sample, delimiter)
+        except csv.Error:
+            continue
+        if rows and len(rows[0]) > score and all(len(row) == len(rows[0]) for row in rows):
+            best, score = delimiter, len(rows[0])
+    return best
+
+
+def preview_format(sample, fmt):
+    rows = format_records(sample, fmt.delimiter, limit=10 + fmt.header)
+    if not rows:
+        return [], []
+    if fmt.header:
+        return rows[0], rows[1:]
+    width = max(map(len, rows))
+    digits = len(str(width - 1))
+    return [f"column{i:0{digits}d}" for i in range(width)], rows
 
 
 @dataclass(frozen=True)
@@ -163,11 +231,11 @@ def csv_pattern(path: Path) -> str:
     return re.sub(r"[*?\[]", lambda match: f"[{match[0]}]", path.as_posix())
 
 
-def count_rows(path: Path, *, cancel: Cancellation | None = None) -> int:
+def count_rows(path: Path, *, fmt=CsvFormat(), cancel: Cancellation | None = None) -> int:
     cancel = cancel or Cancellation()
     with utf8_source(path, cancel) as source, cancel.connection() as connection:
         return connection.execute(
-            f"SELECT count(*) FROM {CSV_SOURCE}", [csv_pattern(source)]
+            f"SELECT count(*) FROM {fmt.source}", [csv_pattern(source)]
         ).fetchone()[0]
 
 
@@ -186,14 +254,16 @@ def filter_clause(selection, identifier):
     )
 
 
-def selection_query(connection, path: Path, selection: Selection) -> tuple[str, list[str]]:
+def selection_query(
+    connection, path: Path, selection: Selection, fmt=CsvFormat()
+) -> tuple[str, list[str]]:
     pattern = csv_pattern(path)
     columns = (
-        connection.sql(f"SELECT * FROM {CSV_SOURCE}", params=[pattern]).columns
+        connection.sql(f"SELECT * FROM {fmt.source}", params=[pattern]).columns
         if selection != Selection()
         else []
     )
-    sql, values = selection_sql(columns, selection)
+    sql, values = selection_sql(columns, selection, source=fmt.source)
     return sql, [pattern, *values]
 
 
@@ -232,16 +302,16 @@ def selection_sql(
     return f"SELECT {projection} FROM {source}{where}{order}", values
 
 
-def editable_query(connection, source, selection, edits):
+def editable_query(connection, source, selection, edits, fmt=CsvFormat()):
     pattern = csv_pattern(source)
-    columns = connection.sql(f"SELECT * FROM {CSV_SOURCE}", params=[pattern]).columns
+    columns = connection.sql(f"SELECT * FROM {fmt.source}", params=[pattern]).columns
     name = "__csv_source_row"
     folded = {column.casefold() for column in columns}
     while name.casefold() in folded:
         name += "_"
     row_id = quote_identifier(name)
     edited_columns = {col for _, col in edits}
-    scan = f"(SELECT row_number() OVER () - 1 AS {row_id}, * FROM {CSV_SOURCE})"
+    scan = f"(SELECT row_number() OVER () - 1 AS {row_id}, * FROM {fmt.source})"
     if edits:
         connection.execute("CREATE TEMP TABLE cell_edits (rid BIGINT, col INTEGER, val VARCHAR)")
         connection.executemany(
@@ -269,20 +339,22 @@ def editable_query(connection, source, selection, edits):
     return sql, [pattern, *values]
 
 
-def read_editable_page(path, offset, selection, edits, *, cancel):
+def read_editable_page(path, offset, selection, edits, *, cancel, fmt=CsvFormat()):
     with utf8_source(path, cancel) as source, cancel.connection() as connection:
-        sql, params = editable_query(connection, source, selection, edits)
+        sql, params = editable_query(connection, source, selection, edits, fmt)
         return page_result(
             connection.execute(sql + " LIMIT ? OFFSET ?", [*params, PAGE_SIZE + 1, offset])
         )
 
 
-def prepare_editable_result(path, selection, edits, *, cancel, distinct=None, singletons=False):
+def prepare_editable_result(
+    path, selection, edits, *, cancel, distinct=None, singletons=False, fmt=CsvFormat()
+):
     scratch = TemporaryDirectory(prefix="csv-result-")
     output = Path(scratch.name) / "result.parquet"
     try:
         with utf8_source(path, cancel) as source, cancel.connection() as connection:
-            sql, params = editable_query(connection, source, selection, edits)
+            sql, params = editable_query(connection, source, selection, edits, fmt)
             if distinct is not None:
                 having = " HAVING count(*) = 1" if singletons else ""
                 sql = (
@@ -302,10 +374,11 @@ def read_page(
     selection: Selection = Selection(),
     *,
     cancel: Cancellation | None = None,
+    fmt=CsvFormat(),
 ) -> tuple[list[str], list[tuple], bool]:
     cancel = cancel or Cancellation()
     with utf8_source(path, cancel) as source, cancel.connection() as connection:
-        sql, params = selection_query(connection, source, selection)
+        sql, params = selection_query(connection, source, selection, fmt)
         cancel.check()
         cursor = connection.execute(
             sql + " LIMIT ? OFFSET ?",
@@ -314,12 +387,12 @@ def read_page(
         return page_result(cursor)
 
 
-def query_csv(path: Path, sql: str, *, cancel: Cancellation | None = None):
+def query_csv(path: Path, sql: str, *, fmt=CsvFormat(), cancel: Cancellation | None = None):
     cancel = cancel or Cancellation()
     with cancel.connection() as connection:
         with utf8_source(path, cancel) as source:
             connection.execute(
-                f"CREATE TABLE csv_data AS SELECT * FROM {CSV_SOURCE}", [csv_pattern(source)]
+                f"CREATE TABLE csv_data AS SELECT * FROM {fmt.source}", [csv_pattern(source)]
             )
         cancel.check()
         connection.execute("SET enable_external_access = false")
@@ -332,7 +405,12 @@ def query_csv(path: Path, sql: str, *, cancel: Cancellation | None = None):
 
 
 def export_csv(
-    path: Path, destination: Path, selection: Selection, *, cancel: Cancellation | None = None
+    path: Path,
+    destination: Path,
+    selection: Selection,
+    *,
+    fmt=CsvFormat(),
+    cancel: Cancellation | None = None,
 ) -> int:
     cancel = cancel or Cancellation()
     cancel.check()
@@ -344,7 +422,7 @@ def export_csv(
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "export.csv"
         with utf8_source(source, cancel) as decoded, cancel.connection() as connection:
-            sql, params = selection_query(connection, decoded, selection)
+            sql, params = selection_query(connection, decoded, selection, fmt)
             cancel.check()
             # DuckDB binds the COPY destination before the inner query parameters.
             count = connection.execute(
@@ -370,6 +448,7 @@ def export_edited_csv(
     cancel=None,
     save=False,
     document=None,
+    fmt=CsvFormat(),
 ):
     cancel = cancel or Cancellation()
     source = path.resolve(strict=True)
@@ -390,12 +469,18 @@ def export_edited_csv(
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "edited.csv"
         with utf8_source(source, cancel) as decoded, cancel.connection() as connection:
-            sql, params = editable_query(connection, decoded, selection, edits)
+            sql, params = editable_query(connection, decoded, selection, edits, fmt)
             cursor = connection.execute(sql, params)
             count = 0
             with output.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.writer(handle, quoting=csv.QUOTE_NOTNULL, lineterminator="\r\n")
-                writer.writerow([column[0] for column in cursor.description[1:]])
+                writer = csv.writer(
+                    handle,
+                    delimiter=fmt.delimiter if save else ",",
+                    quoting=csv.QUOTE_NOTNULL,
+                    lineterminator="\r\n",
+                )
+                if not save or fmt.header:
+                    writer.writerow([column[0] for column in cursor.description[1:]])
                 while batch := cursor.fetchmany(1024):
                     cancel.check()
                     for row in batch:
@@ -409,10 +494,17 @@ def export_edited_csv(
     return count
 
 
-def save_csv(path, destination, edits, revision, *, cancel=None, source=None):
+def save_csv(path, destination, edits, revision, *, cancel=None, source=None, fmt=CsvFormat()):
     destination = destination.resolve()
     export_edited_csv(
-        source or path, destination, edits, revision, cancel=cancel, save=True, document=path
+        source or path,
+        destination,
+        edits,
+        revision,
+        cancel=cancel,
+        save=True,
+        document=path,
+        fmt=fmt,
     )
     return destination, file_revision(destination)
 
@@ -466,7 +558,7 @@ def csv_blocks(source, cancel, block_bytes=CSV_BLOCK_BYTES):
         yield pending
 
 
-def stage_selection(path, selection, distinct, directory, cancel):
+def stage_selection(path, selection, distinct, directory, cancel, fmt=CsvFormat()):
     """Stream just the required columns into Parquet batches."""
     import polars as pl
 
@@ -480,7 +572,17 @@ def stage_selection(path, selection, distinct, directory, cancel):
         first = next(blocks, None)
         if first is None:
             raise ValueError("CSV has no header.")
-        first_frame = pl.read_csv(first, infer_schema=False, n_threads=2, null_values="")
+        first_frame = pl.read_csv(
+            first,
+            has_header=fmt.header,
+            separator=fmt.delimiter,
+            infer_schema=False,
+            n_threads=2,
+            null_values="",
+        )
+        if not fmt.header:
+            digits = len(str(first_frame.width - 1))
+            first_frame.columns = [f"column{i:0{digits}d}" for i in range(first_frame.width)]
         names = first_frame.columns
         required = set(names if visible is None else visible)
         required.update(column for column, _ in selection.conditions)
@@ -521,6 +623,7 @@ def stage_selection(path, selection, distinct, directory, cancel):
                 pl.read_csv(
                     block,
                     has_header=False,
+                    separator=fmt.delimiter,
                     infer_schema=False,
                     n_threads=2,
                     new_columns=names,
@@ -543,6 +646,7 @@ def prepare_result(
     distinct: str | None = None,
     singletons: bool = False,
     cancel: Cancellation | None = None,
+    fmt=CsvFormat(),
 ) -> DiskResult:
     import polars as pl
 
@@ -552,7 +656,9 @@ def prepare_result(
     try:
         with TemporaryDirectory(prefix="csv-stage-") as staging:
             with utf8_source(path, cancel) as source:
-                columns, files = stage_selection(source, selection, distinct, Path(staging), cancel)
+                columns, files = stage_selection(
+                    source, selection, distinct, Path(staging), cancel, fmt
+                )
 
             projection = ", ".join(map(quote_identifier, columns))
             if distinct is not None:

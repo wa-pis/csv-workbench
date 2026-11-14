@@ -1,5 +1,6 @@
 from csv_workbench.core import (
     Cancellation,
+    CsvFormat,
     Selection,
     export_csv,
     prepare_editable_result,
@@ -34,7 +35,7 @@ def test_multisort_uses_hidden_keys_and_stable_ties_in_all_outputs(tmp_path):
     assert read_page(output, 0) == expected
     session = tmp_path / "test.csvsession"
     save_session(session, source, selection)
-    assert load_session(session) == (source.resolve(), selection)
+    assert load_session(session) == (source.resolve(), selection, CsvFormat())
 
 
 def test_edit_changes_secondary_sort_key(tmp_path):

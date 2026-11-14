@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from csv_workbench.core import Selection
+from csv_workbench.core import CsvFormat, Selection
 from csv_workbench.session import load_session, save_session
 
 
@@ -11,7 +11,7 @@ def test_round_trip(tmp_path):
     session = tmp_path / "saved.csvsession"
     selection = Selection((("label", "Привет"), ("id", "01")), "id", True, ("label",), True)
     save_session(session, source, selection)
-    assert load_session(session) == (source.resolve(), selection)
+    assert load_session(session) == (source.resolve(), selection, CsvFormat())
 
 
 def test_session_rejects_invalid_filter_shape(tmp_path):

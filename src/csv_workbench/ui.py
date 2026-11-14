@@ -55,15 +55,19 @@ from csv_workbench.core import (
     NEW_ROW,
     PAGE_SIZE,
     Cancellation,
+    CsvFormat,
     Selection,
     count_rows,
+    detect_delimiter,
     export_csv,
     export_edited_csv,
     file_revision,
     prepare_editable_result,
     prepare_result,
+    preview_format,
     query_csv,
     read_editable_page,
+    read_format_sample,
     read_page,
     save_csv,
     selection_sql,
@@ -260,6 +264,7 @@ class MainWindow(QMainWindow):
         self.poll.timeout.connect(self.collect_reads)
         self.source_headers: list[str] = []
         self.selection = Selection()
+        self.csv_format = CsvFormat()
         self.model = PageModel()
         self.history = []
         self.history_pos = self.clean_pos = 0
@@ -390,9 +395,71 @@ class MainWindow(QMainWindow):
         self.load_view(self.path, selection)
 
     def open_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV (*.csv);;All files (*)")
-        if path:
-            self.load_view(Path(path), Selection(), new_file=True)
+        name, _ = QFileDialog.getOpenFileName(
+            self, "Open CSV / TSV", "", "Delimited files (*.csv *.tsv);;All files (*)"
+        )
+        if name:
+            path = Path(name)
+            try:
+                fmt = self.configure_format(path)
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(self, "Open CSV", str(exc))
+                return
+            if fmt is not None:
+                self.load_view(path, Selection(), new_file=True, fmt=fmt)
+
+    def configure_format(self, path):
+        sample = read_format_sample(path)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"File format — {path.name}")
+        dialog.resize(680, 350)
+        form = QFormLayout(dialog)
+        delimiter = QComboBox()
+        for label, value in (("Comma (,)", ","), ("Semicolon (;)", ";"), ("Tab (TSV)", "\t")):
+            delimiter.addItem(label, value)
+        detected = detect_delimiter(sample, "\t" if path.suffix.lower() == ".tsv" else ",")
+        delimiter.setCurrentIndex(delimiter.findData(detected))
+        header = QCheckBox("First record contains column names")
+        header.setChecked(True)
+        form.addRow("Delimiter", delimiter)
+        form.addRow(header)
+        table = QTableView(dialog)
+        model = PageModel()
+        model.setParent(table)
+        table.setModel(model)
+        form.addRow(table)
+        status = QLabel()
+        status.setWordWrap(True)
+        form.addRow(status)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        def current_format():
+            return CsvFormat(delimiter.currentData(), header.isChecked())
+
+        def refresh():
+            try:
+                headers, rows = preview_format(sample, current_format())
+                width = max([len(headers), *(len(row) for row in rows)])
+                headers += [""] * (width - len(headers))
+                model.replace(headers, [tuple(row + [""] * (width - len(row))) for row in rows])
+                status.setText(
+                    "Preview: up to 10 records"
+                    if headers
+                    else "No complete records in the preview sample."
+                )
+            except (csv.Error, ValueError) as exc:
+                model.replace([], [])
+                status.setText(str(exc))
+
+        delimiter.currentIndexChanged.connect(refresh)
+        header.toggled.connect(refresh)
+        refresh()
+        return current_format() if dialog.exec() else None
 
     def open_session_file(self):
         filename, _ = QFileDialog.getOpenFileName(
@@ -400,8 +467,8 @@ class MainWindow(QMainWindow):
         )
         if filename:
             try:
-                path, selection = load_session(Path(filename))
-                self.load_view(path, selection, new_file=True)
+                path, selection, fmt = load_session(Path(filename))
+                self.load_view(path, selection, new_file=True, fmt=fmt)
             except (OSError, ValueError) as exc:
                 QMessageBox.critical(self, "Open session", str(exc))
 
@@ -419,13 +486,13 @@ class MainWindow(QMainWindow):
             if not destination.suffix:
                 destination = destination.with_suffix(".csvsession")
             try:
-                save_session(destination, self.path, self.selection)
+                save_session(destination, self.path, self.selection, self.csv_format)
             except (OSError, ValueError) as exc:
                 QMessageBox.critical(self, "Save session", str(exc))
 
-    def submit(self, operation, *args):
+    def submit(self, operation, *args, **kwargs):
         token = Cancellation()
-        future = self.executor.submit(operation, *args, cancel=token)
+        future = self.executor.submit(operation, *args, cancel=token, **kwargs)
         return token, future
 
     def cancel_operations(self):
@@ -444,21 +511,23 @@ class MainWindow(QMainWindow):
             name, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save As",
-                str(self.path.with_name(f"{self.path.stem}-copy.csv")),
+                str(self.path.with_name(f"{self.path.stem}-copy{self.path.suffix or '.csv'}")),
                 "CSV (*.csv)",
             )
             if not name:
                 return
             destination = Path(name)
             if not destination.suffix:
-                destination = destination.with_suffix(".csv")
+                destination = destination.with_suffix(
+                    ".tsv" if self.csv_format.delimiter == "\t" else ".csv"
+                )
         elif not self.dirty:
             return
         if self.page_job is not None:
             self.page_job[0].cancel()
             self.page_job[1].cancel()
             self.page_job = None
-        path, revision = self.path, self.revision
+        path, revision, fmt = self.path, self.revision, self.csv_format
         edits = self.model.edits.copy()
         snapshot = self.source_snapshot
         keep_base = self.structural(edits) or any(
@@ -471,7 +540,7 @@ class MainWindow(QMainWindow):
             if snapshot is not None or not keep_base:
                 base = Path(snapshot.name) / "source.csv" if snapshot else None
                 return save_csv(
-                    path, destination, edits, revision, source=base, cancel=cancel
+                    path, destination, edits, revision, source=base, cancel=cancel, fmt=fmt
                 ), snapshot
             scratch = TemporaryDirectory(prefix="csv-history-")
             base = Path(scratch.name) / "source.csv"
@@ -481,7 +550,7 @@ class MainWindow(QMainWindow):
                         cancel.check()
                         output.write(chunk)
                 return save_csv(
-                    path, destination, edits, revision, source=base, cancel=cancel
+                    path, destination, edits, revision, source=base, cancel=cancel, fmt=fmt
                 ), scratch
             except BaseException:
                 scratch.cleanup()
@@ -640,6 +709,7 @@ class MainWindow(QMainWindow):
                 self.selection,
                 self.export_edits,
             )
+            fmt = self.csv_format
             if edits or snapshot:
 
                 def export(*, cancel):
@@ -651,19 +721,22 @@ class MainWindow(QMainWindow):
                         revision,
                         selection,
                         document=path,
+                        fmt=fmt,
                         cancel=cancel,
                     )
 
                 self.export_job = self.submit(export)
             else:
                 self.export_job = self.submit(
-                    export_csv, self.path, Path(destination), self.selection
+                    export_csv, self.path, Path(destination), self.selection, fmt=fmt
                 )
             self.poll.start()
             self.update_status()
 
     def preview_sql(self):
-        sql, values = selection_sql(self.source_headers, self.selection)
+        sql, values = selection_sql(
+            self.source_headers, self.selection, source=self.csv_format.source
+        )
         dialog = QDialog(self)
         dialog.setWindowTitle("SQL for current CSV selection")
         dialog.resize(720, 360)
@@ -704,7 +777,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(buttons)
         if dialog.exec():
             self.sql_text = editor.toPlainText()
-            self.query_job = self.submit(query_csv, self.path, self.sql_text)
+            self.query_job = self.submit(query_csv, self.path, self.sql_text, fmt=self.csv_format)
             self.poll.start()
             self.update_status()
 
@@ -924,6 +997,7 @@ class MainWindow(QMainWindow):
         distinct=None,
         singletons=False,
         refreshing_edit=False,
+        fmt=None,
     ):
         if (
             self.view_job is not None
@@ -933,6 +1007,7 @@ class MainWindow(QMainWindow):
         ):
             return
 
+        fmt = fmt or (CsvFormat() if new_file else self.csv_format)
         edits = {} if new_file else self.model.edits.copy()
         snapshot = None if new_file else self.source_snapshot
         identified = distinct is None and (
@@ -946,7 +1021,7 @@ class MainWindow(QMainWindow):
             base = Path(snapshot.name) / "source.csv" if snapshot else path
             source_headers = None
             if new_file and selection.visible_columns is not None:
-                source_headers = read_page(path, 0, cancel=cancel)[0]
+                source_headers = read_page(path, 0, cancel=cancel, fmt=fmt)[0]
             if distinct is not None and (edits or snapshot):
                 result = prepare_editable_result(
                     base,
@@ -957,35 +1032,41 @@ class MainWindow(QMainWindow):
                     distinct=distinct,
                     singletons=singletons,
                     cancel=cancel,
+                    fmt=fmt,
                 )
                 return revision, result.page(0, cancel=cancel), result, source_headers
             if distinct is not None:
                 result = prepare_result(
-                    path, selection, distinct=distinct, singletons=singletons, cancel=cancel
+                    path,
+                    selection,
+                    distinct=distinct,
+                    singletons=singletons,
+                    cancel=cancel,
+                    fmt=fmt,
                 )
                 return revision, result.page(0, cancel=cancel), result, source_headers
             if selection.sort_column is not None:
-                result = prepare_editable_result(base, selection, edits, cancel=cancel)
+                result = prepare_editable_result(base, selection, edits, cancel=cancel, fmt=fmt)
                 page = result.page(0, cancel=cancel)
                 if file_revision(path) != revision:
                     raise ValueError("The source CSV changed. Reopen it before editing.")
                 return revision, page, result, source_headers
             if identified:
-                page = read_editable_page(base, 0, selection, edits, cancel=cancel)
+                page = read_editable_page(base, 0, selection, edits, cancel=cancel, fmt=fmt)
             else:
-                page = read_page(path, 0, selection, cancel=cancel)
+                page = read_page(path, 0, selection, cancel=cancel, fmt=fmt)
             if file_revision(path) != revision:
                 raise ValueError("The source CSV changed. Reopen it before editing.")
             return revision, page, None, source_headers
 
         self.refreshing_edit = refreshing_edit
-        self.view_request = path, selection, new_file, distinct, identified
+        self.view_request = path, selection, new_file, distinct, identified, fmt
         self.view_job = self.submit(read_view)
         self.poll.start()
         self.update_status()
 
     def apply_view(self, revision, page, result, source_headers):
-        path, selection, new_file, distinct, identified = self.view_request
+        path, selection, new_file, distinct, identified, fmt = self.view_request
         headers, rows, has_more = page
         if self.page_job is not None:
             self.page_job[0].cancel()
@@ -996,7 +1077,7 @@ class MainWindow(QMainWindow):
                 self.count_job[0].cancel()
                 self.count_job[1].cancel()
             self.total_rows = None
-            self.count_job = self.submit(count_rows, path)
+            self.count_job = self.submit(count_rows, path, fmt=fmt)
             self.source_headers = (
                 source_headers
                 if source_headers is not None
@@ -1005,6 +1086,7 @@ class MainWindow(QMainWindow):
 
         self.path, self.selection, self.file_size = path, selection, revision[2]
         self.revision = revision
+        self.csv_format = fmt
         if new_file:
             self.source_snapshot = None
             self.next_row_id = NEW_ROW
@@ -1048,13 +1130,13 @@ class MainWindow(QMainWindow):
         if self.result is None:
             path, revision, selection = self.path, self.revision, self.selection
             edits = self.model.edits.copy()
-            snapshot, identified = self.source_snapshot, self.identified
+            snapshot, identified, fmt = self.source_snapshot, self.identified, self.csv_format
 
             def read_current_page(*, cancel):
                 if file_revision(path) != revision:
                     raise ValueError("The source CSV changed. Reopen it before editing.")
                 page = (
-                    read_page(path, offset, selection, cancel=cancel)
+                    read_page(path, offset, selection, cancel=cancel, fmt=fmt)
                     if not identified
                     else read_editable_page(
                         Path(snapshot.name) / "source.csv" if snapshot else path,
@@ -1062,6 +1144,7 @@ class MainWindow(QMainWindow):
                         selection,
                         edits,
                         cancel=cancel,
+                        fmt=fmt,
                     )
                 )
                 if file_revision(path) != revision:

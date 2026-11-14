@@ -5,23 +5,28 @@ from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from csv_workbench.core import Selection
+from csv_workbench.core import CsvFormat, Selection
 
 
-def save_session(destination: Path, source: Path, selection: Selection) -> None:
+def save_session(destination: Path, source: Path, selection: Selection, fmt=None) -> None:
     source = source.resolve()
     if destination.suffix.lower() != ".csvsession":
         raise ValueError("Choose a .csvsession file.")
     if destination.resolve() == source or (destination.exists() and destination.samefile(source)):
         raise ValueError("Choose a destination other than the source CSV.")
-    data = {"version": 1, "source": str(source), "selection": asdict(selection)}
+    data = {
+        "version": 1,
+        "source": str(source),
+        "selection": asdict(selection),
+        "format": asdict(fmt or CsvFormat()),
+    }
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "session"
         output.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         output.replace(destination)
 
 
-def load_session(path: Path) -> tuple[Path, Selection]:
+def load_session(path: Path) -> tuple[Path, Selection, CsvFormat]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
         raise ValueError("Unsupported session format.")
@@ -68,11 +73,19 @@ def load_session(path: Path) -> tuple[Path, Selection]:
         or not isinstance(match_any, bool)
     ):
         raise ValueError("Invalid session selection.")
-    return Path(source), Selection(
-        tuple((column, value) for column, value in filters),
-        sort,
-        descending,
-        tuple(columns) if columns is not None else None,
-        match_any,
-        tuple((column, direction) for column, direction in extra),
+    settings = data.get("format", {})
+    if not isinstance(settings, dict):
+        raise ValueError("Invalid format in session file.")  # noqa: TRY004
+    fmt = CsvFormat(settings.get("delimiter", ","), settings.get("header", True))
+    return (
+        Path(source),
+        Selection(
+            tuple((column, value) for column, value in filters),
+            sort,
+            descending,
+            tuple(columns) if columns is not None else None,
+            match_any,
+            tuple((column, direction) for column, direction in extra),
+        ),
+        fmt,
     )
