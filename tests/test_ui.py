@@ -186,27 +186,44 @@ def test_column_header_actions_filter_and_sort_full_csv(tmp_path, monkeypatch):
         window.load_view(source, Selection(), new_file=True)
         finish_view()
         monkeypatch.setattr(QInputDialog, "getText", lambda *_: ("keep", True))
-        labels = iter(["Add contains filter…", "Sort descending"])
-
-        def choose_action(menu, _):
-            label = next(labels)
-            return next(action for action in menu.actions() if action.text() == label)
+        from PySide6.QtCore import QRect
 
         class TestMenu(QMenu):
             def exec(self, position):
-                return choose_action(self, position)
+                return self.actions()[0]
 
         monkeypatch.setattr("csv_workbench.ui.QMenu", TestMenu)
         header = window.table.horizontalHeader()
-        header.sectionClicked.emit(1)
-        finish_view()
+        window.show()
+        app.processEvents()
+
+        def click(section, control, modifier=Qt.KeyboardModifier.NoModifier):
+            rect = QRect(
+                header.sectionViewportPosition(section),
+                0,
+                header.sectionSize(section),
+                header.height(),
+            )
+            QTest.mouseClick(
+                header.viewport(),
+                Qt.MouseButton.LeftButton,
+                modifier,
+                header.control_rects(rect)[control].center(),
+            )
+            finish_view()
+
+        click(1, 1)
         assert window.model.headerData(1, Qt.Orientation.Horizontal) == "label  •"
-        header.sectionClicked.emit(0)
-        finish_view()
+        click(0, 0)
+        assert window.model.rows == [("202", "keep"), ("203", "keep")]
+        click(1, 0, Qt.KeyboardModifier.AltModifier)
+        assert header.sort_keys == (("id", False), ("label", False))
+        click(0, 0)
+        assert header.sort_keys == (("id", True),)
         assert window.model.rows == [("203", "keep"), ("202", "keep")]
-        assert header.isSortIndicatorShown()
-        assert header.sortIndicatorSection() == 0
-        assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+        click(0, 0)
+        assert not header.sort_keys
+        assert window.model.rows == [("202", "keep"), ("203", "keep")]
     finally:
         window.close()
         window.executor.shutdown(wait=True)

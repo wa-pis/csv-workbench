@@ -5,7 +5,7 @@ import csv
 import re
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Lock
@@ -26,6 +26,27 @@ class Selection:
     descending: bool = False
     visible_columns: tuple[str, ...] | None = None
     match_any: bool = False
+    extra_sort: tuple[tuple[str, bool], ...] = ()
+
+    @property
+    def sort_keys(self):
+        return (
+            ((self.sort_column, self.descending), *self.extra_sort)
+            if self.sort_column is not None
+            else ()
+        )
+
+    def cycle_sort(self, column, *, append=False):
+        keys = dict(self.sort_keys)
+        previous = keys.get(column)
+        if not append:
+            keys.clear()
+        if previous is True:
+            keys.pop(column, None)
+        else:
+            keys[column] = previous is False
+        (first, descending), *extra = list(keys.items()) or [(None, False)]
+        return replace(self, sort_column=first, descending=descending, extra_sort=tuple(extra))
 
     @property
     def conditions(self):
@@ -176,6 +197,14 @@ def selection_query(connection, path: Path, selection: Selection) -> tuple[str, 
     return sql, [pattern, *values]
 
 
+def sort_clause(selection, identifier, tie_breaker="row_number() OVER ()"):
+    keys = [
+        f"{identifier(column)} {'DESC' if descending else 'ASC'} NULLS LAST"
+        for column, descending in selection.sort_keys
+    ]
+    return " ORDER BY " + ", ".join([*keys, tie_breaker]) if keys else ""
+
+
 def selection_sql(
     columns: list[str], selection: Selection, *, source=CSV_SOURCE, row_id=None
 ) -> tuple[str, list[str]]:
@@ -197,12 +226,7 @@ def selection_sql(
                 identifier(name) for name in columns if name in selection.visible_columns
             )
         where, values = filter_clause(selection, identifier)
-        if selection.sort_column is not None:
-            column = identifier(selection.sort_column)
-            direction = "DESC" if selection.descending else "ASC"
-            tie_breaker = row_id or "row_number() OVER ()"
-            order = f" ORDER BY {column} {direction} NULLS LAST, {tie_breaker}"
-
+        order = sort_clause(selection, identifier, row_id or "row_number() OVER ()")
     if row_id is not None:
         projection = f"{row_id}, {projection if projection != '*' else ', '.join(map(quote_identifier, columns))}"
     return f"SELECT {projection} FROM {source}{where}{order}", values
@@ -449,7 +473,7 @@ def stage_selection(path, selection, distinct, directory, cancel):
     visible = (distinct,) if distinct is not None else selection.visible_columns
     if visible is not None and not visible:
         raise ValueError("Select at least one visible column.")
-    sort = selection.sort_column if distinct is None else None
+    sort = [column for column, _ in selection.sort_keys] if distinct is None else []
     files = []
     with path.open("rb") as source, cancel.connection() as connection:
         blocks = csv_blocks(source, cancel)
@@ -460,14 +484,13 @@ def stage_selection(path, selection, distinct, directory, cancel):
         names = first_frame.columns
         required = set(names if visible is None else visible)
         required.update(column for column, _ in selection.conditions)
-        if sort is not None:
-            required.add(sort)
+        required.update(sort)
         if missing := required.difference(names):
             raise ValueError(f"Unknown CSV column: {min(missing)}")
         output_columns = [name for name in names if visible is None or name in visible]
         staged_columns = [name for name in names if name in required]
 
-        result_columns = list(dict.fromkeys(output_columns + ([sort] if sort is not None else [])))
+        result_columns = list(dict.fromkeys(output_columns + sort))
         projection = ", ".join(map(quote_identifier, result_columns))
         where, values = filter_clause(selection, quote_identifier)
         raw = directory / "input-block.parquet"
@@ -532,7 +555,6 @@ def prepare_result(
                 columns, files = stage_selection(source, selection, distinct, Path(staging), cancel)
 
             projection = ", ".join(map(quote_identifier, columns))
-            order = ""
             if distinct is not None:
                 having = " HAVING count(*) = 1" if singletons else ""
                 sql = (
@@ -540,9 +562,7 @@ def prepare_result(
                     f" FROM read_parquet(?) GROUP BY 1{having} ORDER BY 1 NULLS LAST"
                 )
             else:
-                if selection.sort_column is not None:
-                    direction = "DESC" if selection.descending else "ASC"
-                    order = f" ORDER BY {quote_identifier(selection.sort_column)} {direction} NULLS LAST, row_number() OVER ()"
+                order = sort_clause(selection, quote_identifier)
                 sql = f"SELECT {projection} FROM read_parquet(?){order}"
             with cancel.connection() as connection:
                 connection.execute(f"COPY ({sql}) TO ? (FORMAT PARQUET)", [str(output), files])

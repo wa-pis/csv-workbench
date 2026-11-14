@@ -34,6 +34,7 @@ def load_session(path: Path) -> tuple[Path, Selection]:
     filters = selection.get("filters")
     columns = selection.get("visible_columns")
     sort = selection.get("sort_column")
+    extra = selection.get("extra_sort", [])
     descending = selection.get("descending")
     match_any = selection.get("match_any")
     if (
@@ -53,6 +54,16 @@ def load_session(path: Path) -> tuple[Path, Selection]:
             )
         )
         or (sort is not None and not isinstance(sort, str))
+        or not isinstance(extra, list)
+        or any(
+            not isinstance(key, list)
+            or len(key) != 2
+            or not isinstance(key[0], str)
+            or not isinstance(key[1], bool)
+            for key in extra
+        )
+        or (extra and sort is None)
+        or len({key[0] for key in extra} | {sort}) != len(extra) + 1
         or not isinstance(descending, bool)
         or not isinstance(match_any, bool)
     ):
@@ -63,4 +74,5 @@ def load_session(path: Path) -> tuple[Path, Selection]:
         descending,
         tuple(columns) if columns is not None else None,
         match_any,
+        tuple((column, direction) for column, direction in extra),
     )

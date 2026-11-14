@@ -9,7 +9,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import duckdb
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QEvent,
+    QModelIndex,
+    QPoint,
+    QRect,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -21,6 +30,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -32,7 +42,10 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QStyle,
+    QStyleOptionButton,
     QTableView,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -129,6 +142,98 @@ class PageModel(QAbstractTableModel):
             name = self.headers[section]
             return f"{name}  •" if name in self.filtered_columns else name
         return str(self.offset + section + 1)
+
+
+class CsvHeader(QHeaderView):
+    sortRequested = Signal(int, bool)
+    filterRequested = Signal(int)
+    button_width = 24
+
+    def __init__(self, parent):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.sort_keys = ()
+        self.filtered = set()
+        self.controls_enabled = False
+        self.pressed_control = None
+        self.setMinimumSectionSize(90)
+
+    def control_rects(self, rect):
+        width = self.button_width
+        return tuple(
+            QRect(rect.right() - width * n + 1, rect.top() + 2, width, rect.height() - 4)
+            for n in (2, 1)
+        )
+
+    def paintSection(self, painter, rect, logical_index):
+        if not self.controls_enabled:
+            super().paintSection(painter, rect, logical_index)
+            return
+        sort, filters = self.control_rects(rect)
+        painter.save()
+        painter.setClipRect(rect.adjusted(0, 0, -self.button_width * 2, 0))
+        super().paintSection(painter, rect, logical_index)
+        painter.restore()
+        column = self.model().headers[logical_index]
+        arrow = "↕"
+        for index, (name, descending) in enumerate(self.sort_keys, 1):
+            if name == column:
+                arrow = ("↓" if descending else "↑") + (
+                    str(index) if len(self.sort_keys) > 1 else ""
+                )
+                break
+        for bounds, label in ((sort, arrow), (filters, "●" if column in self.filtered else "F")):
+            option = QStyleOptionButton()
+            option.initFrom(self)
+            option.rect = bounds
+            option.text = label
+            self.style().drawControl(QStyle.ControlElement.CE_PushButton, option, painter, self)
+
+    def control_at(self, point):
+        section = self.logicalIndexAt(point)
+        if not self.controls_enabled or section < 0:
+            return None
+        rect = QRect(
+            self.sectionViewportPosition(section), 0, self.sectionSize(section), self.height()
+        )
+        for control, bounds in enumerate(self.control_rects(rect)):
+            if bounds.contains(point):
+                return section, control
+        return None
+
+    def viewportEvent(self, event):
+        if event.type() == QEvent.Type.ToolTip:
+            hit = self.control_at(event.pos())
+            if hit is not None:
+                section, control = hit
+                column = self.model().headers[section]
+                tip = (
+                    f"Sort {column} (Alt: keep other keys)" if control == 0 else f"Filter {column}"
+                )
+                QToolTip.showText(event.globalPos(), tip, self.viewport())
+                return True
+        return super().viewportEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.pressed_control = self.control_at(event.position().toPoint())
+            if self.pressed_control is not None:
+                return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.pressed_control is None:
+            super().mouseReleaseEvent(event)
+            return
+        pressed, self.pressed_control = self.pressed_control, None
+        if pressed != self.control_at(event.position().toPoint()):
+            return
+        section, control = pressed
+        if control == 0:
+            self.sortRequested.emit(
+                section, bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+            )
+        else:
+            self.filterRequested.emit(section)
 
 
 class MainWindow(QMainWindow):
@@ -238,11 +343,13 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.verticalHeader().setDefaultSectionSize(23)
-        header = self.table.horizontalHeader()
+        header = CsvHeader(self.table)
+        self.table.setHorizontalHeader(header)
         header.setSectionsClickable(True)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setStretchLastSection(True)
-        header.sectionClicked.connect(self.open_column_menu)
+        header.sortRequested.connect(self.cycle_column_sort)
+        header.filterRequested.connect(self.open_column_menu)
         layout.addWidget(self.table, 1)
 
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -251,17 +358,18 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.status, 1)
         self.update_edit_actions()
 
+    def cycle_column_sort(self, section, append):
+        if self.path is not None and self.view_job is None and self.distinct is None:
+            self.load_view(
+                self.path, self.selection.cycle_sort(self.model.headers[section], append=append)
+            )
+
     def open_column_menu(self, section):
         if self.path is None or self.view_job is not None or self.distinct is not None:
             return
         column = self.model.headers[section]
         current = self.selection
         menu = QMenu(self)
-        asc = menu.addAction("Sort ascending")
-        desc = menu.addAction("Sort descending")
-        unsort = menu.addAction("Clear sort")
-        unsort.setEnabled(current.sort_column == column)
-        menu.addSeparator()
         add_filter = menu.addAction("Add contains filter…")
         clear_filter = menu.addAction("Clear filters for this column")
         remaining = tuple(pair for pair in current.filters if pair[0] != column)
@@ -270,11 +378,7 @@ class MainWindow(QMainWindow):
         action = menu.exec(
             header.mapToGlobal(QPoint(header.sectionViewportPosition(section), header.height()))
         )
-        if action in (asc, desc):
-            selection = replace(current, sort_column=column, descending=action == desc)
-        elif action == unsort:
-            selection = replace(current, sort_column=None, descending=False)
-        elif action == add_filter:
+        if action == add_filter:
             value, accepted = QInputDialog.getText(self, "Column filter", f"{column} contains:")
             if not accepted or not value:
                 return
@@ -748,6 +852,10 @@ class MainWindow(QMainWindow):
                 direction.currentIndex() == 1,
                 visible if len(visible) != columns.count() else None,
                 match_any=mode.currentIndex() == 1,
+                extra_sort=current.extra_sort
+                if (sort_column.currentData(), direction.currentIndex() == 1)
+                == (current.sort_column, current.descending)
+                else (),
             )
             self.load_view(self.path, selection)
             dialog.accept()
@@ -842,7 +950,9 @@ class MainWindow(QMainWindow):
             if distinct is not None and (edits or snapshot):
                 result = prepare_editable_result(
                     base,
-                    replace(selection, visible_columns=(distinct,), sort_column=None),
+                    replace(
+                        selection, visible_columns=(distinct,), sort_column=None, extra_sort=()
+                    ),
                     edits,
                     distinct=distinct,
                     singletons=singletons,
@@ -915,16 +1025,10 @@ class MainWindow(QMainWindow):
             headers, rows, ids = self.split_row_ids(headers, rows)
         self.model.replace(headers, rows, row_ids=ids)
         header = self.table.horizontalHeader()
-        if distinct is None and selection.sort_column in headers:
-            header.setSortIndicator(
-                headers.index(selection.sort_column),
-                Qt.SortOrder.DescendingOrder
-                if selection.descending
-                else Qt.SortOrder.AscendingOrder,
-            )
-            header.setSortIndicatorShown(True)
-        else:
-            header.setSortIndicatorShown(False)
+        header.controls_enabled = distinct is None
+        header.sort_keys = selection.sort_keys
+        header.filtered = self.model.filtered_columns
+        header.viewport().update()
         self.table.scrollToTop()
         self.has_more = has_more
         self.setWindowTitle(f"CSV Workbench — {path.name}")
