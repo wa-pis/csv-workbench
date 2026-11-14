@@ -1,5 +1,6 @@
 """Read pages from a local CSV without modifying the source."""
 
+import codecs
 import re
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
@@ -17,11 +18,15 @@ CSV_SOURCE = """read_csv(?, header = true, delim = ',', quote = '"', escape = '"
 
 @dataclass(frozen=True)
 class Selection:
-    filter_column: str | None = None
-    substring: str = ""
+    filters: tuple[tuple[str, str], ...] = ()
     sort_column: str | None = None
     descending: bool = False
     visible_columns: tuple[str, ...] | None = None
+    match_any: bool = False
+
+    @property
+    def conditions(self):
+        return tuple((column, value) for column, value in self.filters if value)
 
 
 class Cancellation:
@@ -73,6 +78,58 @@ class Cancellation:
             output.replace(destination)
 
 
+def detect_encoding(path: Path) -> str:
+    with path.open("rb") as source:
+        sample = source.read(128 * 1024)
+        complete = not source.read(1)
+    for bom, codec in (
+        (codecs.BOM_UTF32_LE, "utf-32"),
+        (codecs.BOM_UTF32_BE, "utf-32"),
+        (codecs.BOM_UTF16_LE, "utf-16"),
+        (codecs.BOM_UTF16_BE, "utf-16"),
+        (codecs.BOM_UTF8, "utf-8-sig"),
+    ):
+        if sample.startswith(bom):
+            return codec
+    if b"\x00" in sample:
+        raise ValueError("Unknown CSV encoding; save the file as UTF-8 or UTF-16 with BOM.")
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(sample, final=complete)
+    except UnicodeDecodeError:
+        from charset_normalizer import from_bytes
+
+        match = from_bytes(sample, cp_isolation=["cp1251", "cp1252", "koi8_r", "cp866"]).best()
+        if match is None:
+            raise ValueError("Could not detect the CSV encoding; save the file as UTF-8.") from None
+        return match.encoding
+    return "utf-8"
+
+
+@contextmanager
+def utf8_source(path: Path, cancel: Cancellation):
+    cancel.check()
+    path = path.resolve(strict=True)
+    if not path.is_file():
+        raise ValueError(f"Not a regular file: {path}")
+    encoding = detect_encoding(path)
+    if encoding in {"utf-8", "utf-8-sig"}:
+        yield path
+        return
+
+    # shortcut: legacy encodings use a temporary copy; cache it if repeated scans become costly.
+    with TemporaryDirectory(prefix="csv-encoding-") as scratch:
+        converted = Path(scratch) / "source.csv"
+        with (
+            path.open(encoding=encoding, newline="") as source,
+            converted.open("w", encoding="utf-8", newline="") as output,
+        ):
+            while chunk := source.read(1024 * 1024):
+                cancel.check()
+                output.write(chunk)
+        cancel.check()
+        yield converted
+
+
 def csv_pattern(path: Path) -> str:
     path = path.resolve(strict=True)
     if not path.is_file():
@@ -83,10 +140,26 @@ def csv_pattern(path: Path) -> str:
 
 
 def count_rows(path: Path, *, cancel: Cancellation | None = None) -> int:
-    with (cancel or Cancellation()).connection() as connection:
+    cancel = cancel or Cancellation()
+    with utf8_source(path, cancel) as source, cancel.connection() as connection:
         return connection.execute(
-            f"SELECT count(*) FROM {CSV_SOURCE}", [csv_pattern(path)]
+            f"SELECT count(*) FROM {CSV_SOURCE}", [csv_pattern(source)]
         ).fetchone()[0]
+
+
+def quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def filter_clause(selection, identifier):
+    predicates = [
+        f"contains(lower({identifier(column)}), lower(?))" for column, _ in selection.conditions
+    ]
+    joiner = " OR " if selection.match_any else " AND "
+    return (
+        " WHERE " + joiner.join(predicates) if predicates else "",
+        [value for _, value in selection.conditions],
+    )
 
 
 def selection_query(connection, path: Path, selection: Selection) -> tuple[str, list[str]]:
@@ -99,7 +172,7 @@ def selection_query(connection, path: Path, selection: Selection) -> tuple[str, 
         def identifier(name: str) -> str:
             if name not in columns:
                 raise ValueError(f"Unknown CSV column: {name}")
-            return '"' + name.replace('"', '""') + '"'
+            return quote_identifier(name)
 
         if selection.visible_columns is not None:
             if not selection.visible_columns:
@@ -109,10 +182,8 @@ def selection_query(connection, path: Path, selection: Selection) -> tuple[str, 
             projection = ", ".join(
                 identifier(name) for name in columns if name in selection.visible_columns
             )
-        if selection.filter_column is not None and selection.substring:
-            column = identifier(selection.filter_column)
-            where = f" WHERE contains(lower({column}), lower(?))"
-            params.append(selection.substring)
+        where, values = filter_clause(selection, identifier)
+        params.extend(values)
         if selection.sort_column is not None:
             column = identifier(selection.sort_column)
             direction = "DESC" if selection.descending else "ASC"
@@ -129,8 +200,8 @@ def read_page(
     cancel: Cancellation | None = None,
 ) -> tuple[list[str], list[tuple], bool]:
     cancel = cancel or Cancellation()
-    with cancel.connection() as connection:
-        sql, params = selection_query(connection, path, selection)
+    with utf8_source(path, cancel) as source, cancel.connection() as connection:
+        sql, params = selection_query(connection, source, selection)
         cancel.check()
         cursor = connection.execute(
             sql + " LIMIT ? OFFSET ?",
@@ -151,8 +222,8 @@ def export_csv(
 
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "export.csv"
-        with cancel.connection() as connection:
-            sql, params = selection_query(connection, source, selection)
+        with utf8_source(source, cancel) as decoded, cancel.connection() as connection:
+            sql, params = selection_query(connection, decoded, selection)
             cancel.check()
             # DuckDB binds the COPY destination before the inner query parameters.
             count = connection.execute(
@@ -213,7 +284,7 @@ def csv_blocks(source, cancel, block_bytes=CSV_BLOCK_BYTES):
 
 
 def stage_selection(path, selection, distinct, directory, cancel):
-    """Stream just the required columns and matching rows into Parquet batches."""
+    """Stream just the required columns into Parquet batches."""
     import polars as pl
 
     visible = (distinct,) if distinct is not None else selection.visible_columns
@@ -221,7 +292,7 @@ def stage_selection(path, selection, distinct, directory, cancel):
         raise ValueError("Select at least one visible column.")
     sort = selection.sort_column if distinct is None else None
     files = []
-    with path.open("rb") as source:
+    with path.open("rb") as source, cancel.connection() as connection:
         blocks = csv_blocks(source, cancel)
         first = next(blocks, None)
         if first is None:
@@ -229,26 +300,38 @@ def stage_selection(path, selection, distinct, directory, cancel):
         first_frame = pl.read_csv(first, infer_schema=False, n_threads=2, null_values="")
         names = first_frame.columns
         required = set(names if visible is None else visible)
-        required.update(name for name in (sort, selection.filter_column) if name is not None)
+        required.update(column for column, _ in selection.conditions)
+        if sort is not None:
+            required.add(sort)
         if missing := required.difference(names):
             raise ValueError(f"Unknown CSV column: {min(missing)}")
         output_columns = [name for name in names if visible is None or name in visible]
-        staged_columns = list(dict.fromkeys(output_columns + ([sort] if sort else [])))
+        staged_columns = [name for name in names if name in required]
+
+        result_columns = list(dict.fromkeys(output_columns + ([sort] if sort is not None else [])))
+        projection = ", ".join(map(quote_identifier, result_columns))
+        where, values = filter_clause(selection, quote_identifier)
+        raw = directory / "input-block.parquet"
 
         def write_batch(frame, index):
-            frame = frame.lazy()
-            if selection.filter_column is not None and selection.substring:
-                frame = frame.filter(
-                    pl.col(selection.filter_column)
-                    .str.to_lowercase()
-                    .str.contains(pl.lit(selection.substring).str.to_lowercase(), literal=True)
-                )
-            batch = frame.select(staged_columns).collect()
             cancel.check()
-            if batch.height:
-                file = directory / f"batch-{index:08}.parquet"
-                batch.write_parquet(file)
-                files.append(str(file))
+            if not frame.height:
+                return
+            file = directory / f"batch-{index:08}.parquet"
+            if where:
+                frame.select(staged_columns).write_parquet(raw)
+                cancel.check()
+                count = connection.execute(
+                    f"COPY (SELECT {projection} FROM read_parquet(?){where}) TO ? (FORMAT PARQUET)",
+                    [str(file), str(raw), *values],
+                ).fetchone()[0]
+                raw.unlink()
+                if not count:
+                    file.unlink()
+                    return
+            else:
+                frame.select(result_columns).write_parquet(file)
+            files.append(str(file))
 
         write_batch(first_frame, 0)
         for index, block in enumerate(blocks, 1):
@@ -266,7 +349,7 @@ def stage_selection(path, selection, distinct, directory, cancel):
             )
     if not files:
         empty = directory / "empty.parquet"
-        pl.DataFrame(schema={name: pl.String for name in staged_columns}).write_parquet(empty)
+        pl.DataFrame(schema={name: pl.String for name in result_columns}).write_parquet(empty)
         files.append(str(empty))
     return output_columns, files
 
@@ -286,12 +369,10 @@ def prepare_result(
     output = Path(scratch.name) / "result.parquet"
     try:
         with TemporaryDirectory(prefix="csv-stage-") as staging:
-            columns, files = stage_selection(path, selection, distinct, Path(staging), cancel)
+            with utf8_source(path, cancel) as source:
+                columns, files = stage_selection(source, selection, distinct, Path(staging), cancel)
 
-            def quote(name):
-                return '"' + name.replace('"', '""') + '"'
-
-            projection = ", ".join(map(quote, columns))
+            projection = ", ".join(map(quote_identifier, columns))
             order = ""
             if distinct is not None:
                 having = " HAVING count(*) = 1" if singletons else ""
@@ -302,7 +383,7 @@ def prepare_result(
             else:
                 if selection.sort_column is not None:
                     direction = "DESC" if selection.descending else "ASC"
-                    order = f" ORDER BY {quote(selection.sort_column)} {direction} NULLS LAST, row_number() OVER ()"
+                    order = f" ORDER BY {quote_identifier(selection.sort_column)} {direction} NULLS LAST, row_number() OVER ()"
                 sql = f"SELECT {projection} FROM read_parquet(?){order}"
             with cancel.connection() as connection:
                 connection.execute(f"COPY ({sql}) TO ? (FORMAT PARQUET)", [str(output), files])

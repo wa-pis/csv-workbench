@@ -38,7 +38,7 @@ def test_filter_and_sort_before_pagination(tmp_path):
         "id,label\n" + "".join(f"{i:05},MaTcH%_\n" for i in range(1, 202)) + "99999,matchXX\n",
         encoding="utf-8",
     )
-    selection = Selection("label", "match%_", "id", True, ("id",))
+    selection = Selection((("label", "match%_"),), "id", True, ("id",))
     headers, rows, has_next = read_page(path, 0, selection)
     assert headers == ["id"]
     assert rows == [(f"{i:05}",) for i in range(201, 1, -1)]
@@ -62,7 +62,7 @@ def test_sort_ties_nulls_and_column_order(tmp_path):
 def test_no_matches_keeps_visible_headers(tmp_path):
     path = tmp_path / "empty-view.csv"
     path.write_text("id,label\n001,hello\n", encoding="utf-8")
-    selection = Selection("label", "missing", visible_columns=("id",))
+    selection = Selection((("label", "missing"),), visible_columns=("id",))
     assert read_page(path, 0, selection) == (["id"], [], False)
     with pytest.raises(ValueError, match="at least one"):
         read_page(path, 0, Selection(visible_columns=()))

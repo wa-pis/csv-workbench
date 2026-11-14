@@ -78,7 +78,7 @@ def test_cancel_running_selection_keeps_view(tmp_path, monkeypatch):
 
     monkeypatch.setattr("csv_workbench.ui.read_page", slow_read)
     try:
-        window.load_view(source, Selection(substring="x"))
+        window.load_view(source, Selection(filters=(("id", "x"),)))
         assert started.wait(5)
         token, future = window.view_job
         assert not future.done()

@@ -14,7 +14,7 @@ def test_export_full_selection(tmp_path):
         encoding="utf-8",
     )
     destination = tmp_path / "result's.csv"
-    selection = Selection("filter", "match", "id", True, ("id", "note"))
+    selection = Selection((("filter", "match"),), "id", True, ("id", "note"))
 
     assert len(read_page(source, 0, selection)[1]) == 200
     assert export_csv(source, destination, selection) == 201
@@ -30,7 +30,8 @@ def test_export_empty_selection(tmp_path):
     source.write_text("id,label\n001,match\n", encoding="utf-8")
     destination = tmp_path / "result.csv"
     assert (
-        export_csv(source, destination, Selection("label", "absent", visible_columns=("id",))) == 0
+        export_csv(source, destination, Selection((("label", "absent"),), visible_columns=("id",)))
+        == 0
     )
     assert destination.read_text(encoding="utf-8") == "id\n"
 

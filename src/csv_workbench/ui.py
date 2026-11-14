@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -169,18 +171,57 @@ class MainWindow(QMainWindow):
         form = QFormLayout(dialog)
         current = self.selection
 
-        filter_column = QComboBox()
-        sort_column = QComboBox()
-        for combo, name in (
-            (filter_column, current.filter_column),
-            (sort_column, current.sort_column),
-        ):
-            combo.addItem("None", None)
-            for header in self.source_headers:
-                combo.addItem(header, header)
-            combo.setCurrentIndex(combo.findData(name) if name is not None else 0)
+        mode = QComboBox()
+        mode.addItems(["All conditions (AND)", "Any condition (OR)"])
+        mode.setCurrentIndex(int(current.match_any))
+        form.addRow("Match", mode)
 
-        substring = QLineEdit(current.substring)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        filter_widget = QWidget()
+        filter_rows = QVBoxLayout(filter_widget)
+        scroll.setWidget(filter_widget)
+        form.addRow("Filters", scroll)
+        conditions = []
+
+        def add_condition(column=None, value=""):
+            row = QWidget()
+            widgets = QHBoxLayout(row)
+            field = QComboBox()
+            field.addItems(self.source_headers)
+            if column is not None:
+                field.setCurrentText(column)
+            substring = QLineEdit(value)
+            substring.setPlaceholderText("Contains")
+            remove = QPushButton("Remove")
+            widgets.addWidget(field)
+            widgets.addWidget(substring)
+            widgets.addWidget(remove)
+            condition = field, substring
+            conditions.append(condition)
+            filter_rows.addWidget(row)
+
+            def remove_condition():
+                conditions.remove(condition)
+                filter_rows.removeWidget(row)
+                row.hide()
+                row.deleteLater()
+
+            remove.clicked.connect(remove_condition)
+
+        for column, value in current.conditions or ((None, ""),):
+            add_condition(column, value)
+        add = QPushButton("Add condition")
+        add.clicked.connect(lambda: add_condition())
+        form.addRow(add)
+
+        sort_column = QComboBox()
+        sort_column.addItem("None", None)
+        for header in self.source_headers:
+            sort_column.addItem(header, header)
+        if current.sort_column is not None:
+            sort_column.setCurrentIndex(sort_column.findData(current.sort_column))
+
         direction = QComboBox()
         direction.addItems(["Ascending", "Descending"])
         direction.setCurrentIndex(int(current.descending))
@@ -190,8 +231,6 @@ class MainWindow(QMainWindow):
             visible = current.visible_columns is None or header in current.visible_columns
             item.setCheckState(Qt.CheckState.Checked if visible else Qt.CheckState.Unchecked)
 
-        form.addRow("Filter column", filter_column)
-        form.addRow("Contains", substring)
         form.addRow("Sort column", sort_column)
         form.addRow("Direction", direction)
         form.addRow("Visible columns", columns)
@@ -210,11 +249,15 @@ class MainWindow(QMainWindow):
                 if (item := columns.item(i)).checkState() == Qt.CheckState.Checked
             )
             selection = Selection(
-                filter_column.currentData(),
-                substring.text(),
+                tuple(
+                    (field.currentText(), value.text())
+                    for field, value in conditions
+                    if value.text()
+                ),
                 sort_column.currentData(),
                 direction.currentIndex() == 1,
                 visible if len(visible) != columns.count() else None,
+                match_any=mode.currentIndex() == 1,
             )
             self.load_view(self.path, selection)
             dialog.accept()

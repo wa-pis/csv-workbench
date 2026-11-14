@@ -11,7 +11,7 @@ def test_cached_sort_reads_later_pages_without_csv(tmp_path):
     source.write_text(
         "id,label\n" + "".join(f"{i:04},keep\n" for i in range(405)) + "9999,exclude\n"
     )
-    result = prepare_result(source, Selection("label", "keep", "id", True, ("id",)))
+    result = prepare_result(source, Selection((("label", "keep"),), "id", True, ("id",)))
     with result.scratch:
         source.unlink()
         assert result.page(0)[1][0] == ("0404",)
@@ -23,7 +23,7 @@ def test_cached_sort_reads_later_pages_without_csv(tmp_path):
 def test_distinct_counts_all_matching_rows_in_hidden_column(tmp_path, singletons):
     source = tmp_path / "input.csv"
     source.write_text("id,label,value\n" + "0,keep,x\n" * 201 + "1,keep,y\n2,keep,\n3,skip,y\n")
-    selection = Selection("label", "keep", visible_columns=("id",))
+    selection = Selection((("label", "keep"),), visible_columns=("id",))
     result = prepare_result(source, selection, distinct="value", singletons=singletons)
     with result.scratch:
         expected = [("y", 1), (None, 1)]

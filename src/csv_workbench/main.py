@@ -20,12 +20,15 @@ def main() -> int:
         with TemporaryDirectory() as scratch:
             source = Path(scratch) / "input.csv"
             target = source.with_name("export.csv")
-            source.write_text("id,label\n001,skip\n002,keep\n", encoding="utf-8")
-            selection = Selection("label", "keep", "id", visible_columns=("id",))
+            label = "Привет, мир! Это проверка русского текста для таблицы"
+            source.write_bytes(f'id,label\n001,skip\n002,"{label}"\n'.encode("cp1251"))
+            selection = Selection(
+                (("label", "ПРИВЕТ"), ("id", "002")), "id", visible_columns=("id",)
+            )
             if read_page(source, 0, selection) != (["id"], [("002",)], False):
                 return 1
             result = prepare_result(source, selection, distinct="label")
-            if result.page(0) != (["Value", "Frequency"], [("keep", 1)], False):
+            if result.page(0) != (["Value", "Frequency"], [(label, 1)], False):
                 return 1
             if (
                 export_csv(source, target, selection) != 1
