@@ -164,10 +164,19 @@ def filter_clause(selection, identifier):
 
 def selection_query(connection, path: Path, selection: Selection) -> tuple[str, list[str]]:
     pattern = csv_pattern(path)
+    columns = (
+        connection.sql(f"SELECT * FROM {CSV_SOURCE}", params=[pattern]).columns
+        if selection != Selection()
+        else []
+    )
+    sql, values = selection_sql(columns, selection)
+    return sql, [pattern, *values]
+
+
+def selection_sql(columns: list[str], selection: Selection) -> tuple[str, list[str]]:
     projection, where, order = "*", "", ""
-    params = [pattern]
+    values = []
     if selection != Selection():
-        columns = connection.sql(f"SELECT * FROM {CSV_SOURCE}", params=[pattern]).columns
 
         def identifier(name: str) -> str:
             if name not in columns:
@@ -183,13 +192,12 @@ def selection_query(connection, path: Path, selection: Selection) -> tuple[str, 
                 identifier(name) for name in columns if name in selection.visible_columns
             )
         where, values = filter_clause(selection, identifier)
-        params.extend(values)
         if selection.sort_column is not None:
             column = identifier(selection.sort_column)
             direction = "DESC" if selection.descending else "ASC"
             order = f" ORDER BY {column} {direction} NULLS LAST, row_number() OVER ()"
 
-    return f"SELECT {projection} FROM {CSV_SOURCE}{where}{order}", params
+    return f"SELECT {projection} FROM {CSV_SOURCE}{where}{order}", values
 
 
 def read_page(
@@ -207,6 +215,23 @@ def read_page(
             sql + " LIMIT ? OFFSET ?",
             [*params, PAGE_SIZE + 1, offset],
         )
+        return page_result(cursor)
+
+
+def query_csv(path: Path, sql: str, *, cancel: Cancellation | None = None):
+    cancel = cancel or Cancellation()
+    with cancel.connection() as connection:
+        with utf8_source(path, cancel) as source:
+            connection.execute(
+                f"CREATE TABLE csv_data AS SELECT * FROM {CSV_SOURCE}", [csv_pattern(source)]
+            )
+        cancel.check()
+        connection.execute("SET enable_external_access = false")
+        connection.execute("SET lock_configuration = true")
+        statements = connection.extract_statements(sql)
+        if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+            raise ValueError("Enter one SELECT statement.")
+        cursor = connection.sql(statements[0].query).limit(PAGE_SIZE + 1)
         return page_result(cursor)
 
 

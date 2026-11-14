@@ -17,6 +17,12 @@ v0.1: запланированные этапы закрыты. [GitHub Actions]
 
 Условия AND/OR: [`combine-csv-filters`](openspec/changes/archive/2026-11-14-combine-csv-filters/proposal.md) закрыт.
 
-Далее: предпросмотр SQL и редактор запросов, сохраняемые сессии и цепочки преобразований. Оформлять отдельными изменениями по мере необходимости. Поддержку внешних форматов и второй движок отложить до конкретного сценария.
+Предпросмотр SQL: [`preview-selection-sql`](openspec/changes/archive/2026-11-14-preview-selection-sql/proposal.md) закрыт.
+
+Редактор SQL: [`query-csv-with-sql`](openspec/changes/archive/2026-11-14-query-csv-with-sql/proposal.md) закрыт.
+
+Сохраняемые сессии: [`save-csv-session`](openspec/changes/archive/2026-11-14-save-csv-session/proposal.md) закрыт.
+
+Цепочки преобразований: [`reusable-csv-transformations`](openspec/changes/archive/2026-11-14-reusable-csv-transformations/proposal.md) закрыт. Запланированные этапы выполнены. Поддержку внешних форматов и второй движок отложить до конкретного сценария.
 
 Roadmap задаёт порядок и критерии готовности. Каждый этап начинается с предложения, сценариев, дизайна и списка задач в `openspec/changes/`. После реализации и проверки изменение архивируется, а согласованное поведение попадает в `openspec/specs/`.

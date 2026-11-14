@@ -1,7 +1,9 @@
 """Qt preview window."""
 
+import json
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import duckdb
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
@@ -20,6 +22,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QTableView,
@@ -34,11 +37,15 @@ from csv_workbench.core import (
     count_rows,
     export_csv,
     prepare_result,
+    query_csv,
     read_page,
+    selection_sql,
 )
+from csv_workbench.session import load_session, save_session
 
 ROOT_INDEX = QModelIndex()
 BUFFER_ROWS = PAGE_SIZE * 3
+JOB_NAMES = ("view_job", "count_job", "page_job", "export_job", "query_job")
 
 
 class PageModel(QAbstractTableModel):
@@ -89,6 +96,8 @@ class MainWindow(QMainWindow):
         self.page_job = None
         self.export_job = None
         self.view_job = None
+        self.query_job = None
+        self.sql_text = "SELECT * FROM csv_data"
         self.poll = QTimer(self, interval=30)
         self.poll.timeout.connect(self.collect_reads)
         self.source_headers: list[str] = []
@@ -101,10 +110,24 @@ class MainWindow(QMainWindow):
         self.open_button = QPushButton("Open CSV")
         self.open_button.clicked.connect(self.open_file)
         layout.addWidget(self.open_button)
+        session_menu = self.menuBar().addMenu("Session")
+        self.open_session_action = session_menu.addAction("Open session…")
+        self.open_session_action.triggered.connect(self.open_session_file)
+        self.save_session_action = session_menu.addAction("Save session…")
+        self.save_session_action.triggered.connect(self.save_session_file)
+        self.save_session_action.setEnabled(False)
         self.selection_button = QPushButton("Filter, sort and columns…")
         self.selection_button.setEnabled(False)
         self.selection_button.clicked.connect(self.edit_selection)
         layout.addWidget(self.selection_button)
+        self.sql_button = QPushButton("Preview SQL…")
+        self.sql_button.setEnabled(False)
+        self.sql_button.clicked.connect(self.preview_sql)
+        layout.addWidget(self.sql_button)
+        self.query_button = QPushButton("SQL editor…")
+        self.query_button.setEnabled(False)
+        self.query_button.clicked.connect(self.edit_sql)
+        layout.addWidget(self.query_button)
         self.unique_button = QPushButton("Unique values…")
         self.unique_button.setEnabled(False)
         self.unique_button.clicked.connect(self.edit_unique)
@@ -132,13 +155,42 @@ class MainWindow(QMainWindow):
         if path:
             self.load_view(Path(path), Selection(), new_file=True)
 
+    def open_session_file(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Open session", "", "Session (*.csvsession)"
+        )
+        if filename:
+            try:
+                path, selection = load_session(Path(filename))
+                self.load_view(path, selection, new_file=True)
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(self, "Open session", str(exc))
+
+    def save_session_file(self):
+        if self.path is None:
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save session",
+            str(self.path.with_suffix(".csvsession")),
+            "Session (*.csvsession)",
+        )
+        if filename:
+            destination = Path(filename)
+            if not destination.suffix:
+                destination = destination.with_suffix(".csvsession")
+            try:
+                save_session(destination, self.path, self.selection)
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(self, "Save session", str(exc))
+
     def submit(self, operation, *args):
         token = Cancellation()
         future = self.executor.submit(operation, *args, cancel=token)
         return token, future
 
     def cancel_operations(self):
-        for job in (self.view_job, self.count_job, self.page_job, self.export_job):
+        for job in self.jobs():
             if job is not None:
                 token, future = job
                 token.cancel()
@@ -159,6 +211,98 @@ class MainWindow(QMainWindow):
             self.export_job = self.submit(export_csv, self.path, Path(destination), self.selection)
             self.poll.start()
             self.update_status()
+
+    def preview_sql(self):
+        sql, values = selection_sql(self.source_headers, self.selection)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("SQL for current CSV selection")
+        dialog.resize(720, 360)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("DuckDB SQL"))
+        query = QPlainTextEdit(sql, dialog)
+        query.setReadOnly(True)
+        layout.addWidget(query)
+        layout.addWidget(QLabel("Parameters in order (bind the path to a UTF-8 CSV first)"))
+        parameters = QPlainTextEdit(
+            json.dumps(["<UTF-8 CSV path>", *values], ensure_ascii=False, indent=2), dialog
+        )
+        parameters.setReadOnly(True)
+        layout.addWidget(parameters)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def edit_sql(self):
+        if self.path is None or self.query_job is not None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("SQL editor")
+        dialog.resize(720, 360)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Run one SELECT against csv_data. Use WITH for multiple steps."))
+        editor = QPlainTextEdit(self.sql_text, dialog)
+        layout.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        run = buttons.addButton("Run", QDialogButtonBox.ButtonRole.AcceptRole)
+        run.clicked.connect(dialog.accept)
+        open_sql = buttons.addButton("Open SQL…", QDialogButtonBox.ButtonRole.ActionRole)
+        open_sql.clicked.connect(lambda: self.open_sql_file(editor))
+        save_sql = buttons.addButton("Save SQL…", QDialogButtonBox.ButtonRole.ActionRole)
+        save_sql.clicked.connect(lambda: self.save_sql_file(editor))
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec():
+            self.sql_text = editor.toPlainText()
+            self.query_job = self.submit(query_csv, self.path, self.sql_text)
+            self.poll.start()
+            self.update_status()
+
+    def open_sql_file(self, editor):
+        filename, _ = QFileDialog.getOpenFileName(editor, "Open SQL", "", "SQL (*.sql)")
+        if filename:
+            try:
+                editor.setPlainText(Path(filename).read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(editor, "Open SQL", str(exc))
+
+    def save_sql_file(self, editor):
+        filename, _ = QFileDialog.getSaveFileName(editor, "Save SQL", "", "SQL (*.sql)")
+        if not filename:
+            return
+        destination = Path(filename)
+        if not destination.suffix:
+            destination = destination.with_suffix(".sql")
+        try:
+            if destination.suffix.lower() != ".sql":
+                raise ValueError("Choose a .sql file.")
+            if destination.resolve() == self.path.resolve():
+                raise ValueError("Choose a destination other than the source CSV.")
+            with TemporaryDirectory(dir=destination.parent) as scratch:
+                output = Path(scratch) / "pipeline.sql"
+                output.write_text(editor.toPlainText(), encoding="utf-8")
+                output.replace(destination)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(editor, "Save SQL", str(exc))
+
+    def show_query_result(self, headers, rows, has_more):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("SQL result")
+        dialog.resize(720, 480)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            QLabel(f"{len(rows)} rows shown" + (" • More rows available" if has_more else ""))
+        )
+        table = QTableView(dialog)
+        model = PageModel()
+        model.setParent(table)
+        model.replace(headers, rows)
+        table.setModel(model)
+        layout.addWidget(table)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def edit_selection(self):
         if self.path is None:
@@ -304,19 +448,22 @@ class MainWindow(QMainWindow):
 
         def read_view(*, cancel):
             size = path.stat().st_size
+            source_headers = None
+            if new_file and selection.visible_columns is not None:
+                source_headers = read_page(path, 0, cancel=cancel)[0]
             if distinct is not None or selection.sort_column is not None:
                 result = prepare_result(
                     path, selection, distinct=distinct, singletons=singletons, cancel=cancel
                 )
-                return size, result.page(0, cancel=cancel), result
-            return size, read_page(path, 0, selection, cancel=cancel), None
+                return size, result.page(0, cancel=cancel), result, source_headers
+            return size, read_page(path, 0, selection, cancel=cancel), None, source_headers
 
         self.view_request = path, selection, new_file, distinct
         self.view_job = self.submit(read_view)
         self.poll.start()
         self.update_status()
 
-    def apply_view(self, size, page, result):
+    def apply_view(self, size, page, result, source_headers):
         path, selection, new_file, distinct = self.view_request
         headers, rows, has_more = page
         if self.page_job is not None:
@@ -329,7 +476,7 @@ class MainWindow(QMainWindow):
                 self.count_job[1].cancel()
             self.total_rows = None
             self.count_job = self.submit(count_rows, path)
-            self.source_headers = headers
+            self.source_headers = source_headers if source_headers is not None else headers
 
         self.path, self.selection, self.file_size = path, selection, size
         self.result, self.distinct = result, distinct
@@ -385,8 +532,11 @@ class MainWindow(QMainWindow):
         bar.setValue(position)
         self.adjusting = False
 
+    def jobs(self):
+        return tuple(getattr(self, name) for name in JOB_NAMES)
+
     def collect_reads(self):
-        for name in ("view_job", "count_job", "page_job", "export_job"):
+        for name in JOB_NAMES:
             job = getattr(self, name)
             if job is None or not job[1].done():
                 continue
@@ -402,6 +552,8 @@ class MainWindow(QMainWindow):
                     self.total_rows = result
                 elif name == "page_job":
                     self.apply_page(*result)
+                elif name == "query_job":
+                    self.show_query_result(*result)
                 else:
                     QMessageBox.information(self, "Export CSV", f"Exported {result:,} rows.")
             except CancelledError:
@@ -419,11 +571,19 @@ class MainWindow(QMainWindow):
             self.poll.stop()
 
     def update_status(self):
-        jobs = (self.view_job, self.count_job, self.page_job, self.export_job)
+        jobs = self.jobs()
         self.cancel_button.setEnabled(any(job is not None for job in jobs))
-        self.open_button.setEnabled(self.view_job is None)
+        self.open_button.setEnabled(self.view_job is None and self.query_job is None)
+        self.open_session_action.setEnabled(self.open_button.isEnabled())
+        self.save_session_action.setEnabled(self.path is not None and self.view_job is None)
+        self.query_button.setEnabled(
+            self.path is not None and self.view_job is None and self.query_job is None
+        )
         self.selection_button.setEnabled(self.path is not None and self.view_job is None)
         self.unique_button.setEnabled(self.path is not None and self.view_job is None)
+        self.sql_button.setEnabled(
+            self.path is not None and self.view_job is None and self.distinct is None
+        )
         self.selection_button.setText(
             "Back to CSV selection" if self.distinct is not None else "Filter, sort and columns…"
         )
@@ -443,6 +603,8 @@ class MainWindow(QMainWindow):
             progress += " • Cancelling…"
         if self.export_job is not None:
             progress += " • Exporting CSV…"
+        if self.query_job is not None:
+            progress += " • Running SQL…"
         if self.distinct is not None:
             progress += f" • Unique: {self.distinct}"
         self.status.setText(

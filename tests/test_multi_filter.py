@@ -1,8 +1,9 @@
 from csv import reader
 
+import duckdb
 import pytest
 
-from csv_workbench.core import Selection, export_csv, prepare_result, read_page
+from csv_workbench.core import Selection, export_csv, prepare_result, read_page, selection_sql
 
 
 @pytest.mark.parametrize(
@@ -29,6 +30,14 @@ def test_filter_groups_across_all_csv_paths(tmp_path, match_any, ids, counts):
     )
     expected = (["id"], [(value,) for value in ids], False)
     assert read_page(source, 0, selection) == expected
+
+    sql, values = selection_sql(["id", "tag", "text", "group"], selection)
+    assert values == ["tag", "%_"]
+    assert "LIMIT" not in sql
+    with duckdb.connect() as connection:
+        preview = connection.execute(sql, [source.as_posix(), *values])
+        assert [column[0] for column in preview.description] == ["id"]
+        assert preview.fetchall() == expected[1]
 
     result = prepare_result(source, selection)
     with result.scratch:
@@ -66,8 +75,6 @@ def test_unicode_filter_is_identical_across_engines(tmp_path):
 
 
 def test_staging_writes_only_matching_rows_and_needed_columns(tmp_path):
-    import duckdb
-
     from csv_workbench.core import Cancellation, stage_selection
 
     source = tmp_path / "rows.csv"

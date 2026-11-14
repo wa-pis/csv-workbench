@@ -135,3 +135,31 @@ def test_scroll_buffer_can_restore_evicted_rows(tmp_path):
         window.executor.shutdown(wait=True)
         window.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_open_session_restores_selection_and_keeps_all_source_headers(tmp_path, monkeypatch):
+    from csv_workbench.core import Selection
+    from csv_workbench.session import save_session
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "preview.csv"
+    source.write_text("id,label\n001,keep\n002,skip\n003,keep\n", encoding="utf-8")
+    session = tmp_path / "saved.csvsession"
+    selection = Selection((("label", "keep"),), "id", True, ("id",))
+    save_session(session, source, selection)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (str(session), ""))
+    window = MainWindow()
+    try:
+        window.open_session_action.trigger()
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.selection == selection
+        assert window.source_headers == ["id", "label"]
+        assert window.model.headers == ["id"]
+        assert window.model.rows == [("003",), ("001",)]
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
