@@ -51,6 +51,7 @@ def test_open_and_load_more(tmp_path, monkeypatch):
         window.close()
         window.executor.shutdown(wait=True)
         window.deleteLater()
+        app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
@@ -98,6 +99,7 @@ def test_cancel_running_selection_keeps_view(tmp_path, monkeypatch):
         window.close()
         window.executor.shutdown(wait=True)
         window.deleteLater()
+        app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
@@ -134,6 +136,7 @@ def test_scroll_buffer_can_restore_evicted_rows(tmp_path):
         window.close()
         window.executor.shutdown(wait=True)
         window.deleteLater()
+        app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
@@ -157,6 +160,53 @@ def test_open_session_restores_selection_and_keeps_all_source_headers(tmp_path, 
         assert window.source_headers == ["id", "label"]
         assert window.model.headers == ["id"]
         assert window.model.rows == [("003",), ("001",)]
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_column_header_actions_filter_and_sort_full_csv(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog, QMenu
+
+    from csv_workbench.core import Selection
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    window = MainWindow()
+    source = tmp_path / "data.csv"
+    source.write_text("id,label\n" + "001,skip\n" * 200 + "202,keep\n203,keep\n", encoding="utf-8")
+    try:
+
+        def finish_view():
+            window.view_job[1].result(timeout=5)
+            window.collect_reads()
+
+        window.load_view(source, Selection(), new_file=True)
+        finish_view()
+        monkeypatch.setattr(QInputDialog, "getText", lambda *_: ("keep", True))
+        labels = iter(["Add contains filter…", "Sort descending"])
+
+        def choose_action(menu, _):
+            label = next(labels)
+            return next(action for action in menu.actions() if action.text() == label)
+
+        class TestMenu(QMenu):
+            def exec(self, position):
+                return choose_action(self, position)
+
+        monkeypatch.setattr("csv_workbench.ui.QMenu", TestMenu)
+        header = window.table.horizontalHeader()
+        header.sectionClicked.emit(1)
+        finish_view()
+        assert window.model.headerData(1, Qt.Orientation.Horizontal) == "label  •"
+        header.sectionClicked.emit(0)
+        finish_view()
+        assert window.model.rows == [("203", "keep"), ("202", "keep")]
+        assert header.isSortIndicatorShown()
+        assert header.sortIndicatorSection() == 0
+        assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
     finally:
         window.close()
         window.executor.shutdown(wait=True)

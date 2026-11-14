@@ -1,6 +1,7 @@
 """Read pages from a local CSV without modifying the source."""
 
 import codecs
+import csv
 import re
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
@@ -255,6 +256,44 @@ def export_csv(
                 f"COPY ({sql}) TO ? (FORMAT CSV, HEADER true, COMPRESSION none)",
                 [str(output), *params],
             ).fetchone()[0]
+        cancel.publish(output, destination)
+    return count
+
+
+def file_revision(path: Path) -> tuple[int, int, int, int, int]:
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def export_edited_csv(path, destination, edits, revision, *, cancel=None):
+    cancel = cancel or Cancellation()
+    source = path.resolve(strict=True)
+    destination = destination.absolute()
+    if destination.resolve() == source or (destination.exists() and destination.samefile(source)):
+        raise ValueError("Choose a destination other than the source CSV.")
+
+    def check_source():
+        if file_revision(source) != revision:
+            raise ValueError("The source CSV changed. Reopen it before editing.")
+
+    check_source()
+    with (
+        TemporaryDirectory(dir=destination.parent) as scratch,
+        utf8_source(source, cancel) as decoded,
+        cancel.connection() as connection,
+    ):
+        output = Path(scratch) / "edited.csv"
+        cursor = connection.execute(f"SELECT * FROM {CSV_SOURCE}", [csv_pattern(decoded)])
+        count = 0
+        with output.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, quoting=csv.QUOTE_NOTNULL, lineterminator="\r\n")
+            writer.writerow([column[0] for column in cursor.description])
+            while batch := cursor.fetchmany(1024):
+                cancel.check()
+                for row in batch:
+                    writer.writerow(edits.get((count, col), value) for col, value in enumerate(row))
+                    count += 1
+        check_source()
         cancel.publish(output, destination)
     return count
 

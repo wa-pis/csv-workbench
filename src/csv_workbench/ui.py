@@ -2,11 +2,12 @@
 
 import json
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import duckdb
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -16,11 +17,13 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -36,6 +39,8 @@ from csv_workbench.core import (
     Selection,
     count_rows,
     export_csv,
+    export_edited_csv,
+    file_revision,
     prepare_result,
     query_csv,
     read_page,
@@ -54,6 +59,9 @@ class PageModel(QAbstractTableModel):
         self.headers: list[str] = []
         self.rows: list[tuple] = []
         self.offset = 0
+        self.filtered_columns: set[str] = set()
+        self.edits: dict[tuple[int, int], str] = {}
+        self.editable = False
 
     def replace(self, headers: list[str], rows: list[tuple], offset: int = 0) -> None:
         self.beginResetModel()
@@ -67,16 +75,40 @@ class PageModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.headers)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+        if not index.isValid() or role not in (
+            Qt.ItemDataRole.DisplayRole,
+            Qt.ItemDataRole.EditRole,
+        ):
             return None
-        value = self.rows[index.row()][index.column()]
+        value = self.edits.get(
+            (self.offset + index.row(), index.column()), self.rows[index.row()][index.column()]
+        )
+        if role == Qt.ItemDataRole.EditRole:
+            return "" if value is None else str(value)
         return "NULL" if value is None else str(value)
+
+    def flags(self, index):
+        flags = super().flags(index)
+        return flags | Qt.ItemFlag.ItemIsEditable if self.editable and index.isValid() else flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if not self.editable or not index.isValid() or role != Qt.ItemDataRole.EditRole:
+            return False
+        if value != self.data(index, role):
+            key = self.offset + index.row(), index.column()
+            if value == self.rows[index.row()][index.column()]:
+                self.edits.pop(key, None)
+            else:
+                self.edits[key] = value
+            self.dataChanged.emit(index, index, [role, Qt.ItemDataRole.DisplayRole])
+        return True
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal:
-            return self.headers[section]
+            name = self.headers[section]
+            return f"{name}  •" if name in self.filtered_columns else name
         return str(self.offset + section + 1)
 
 
@@ -84,6 +116,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CSV Workbench")
+        self.resize(960, 640)
         self.path: Path | None = None
         self.has_more = False
         self.result = None
@@ -103,52 +136,104 @@ class MainWindow(QMainWindow):
         self.source_headers: list[str] = []
         self.selection = Selection()
         self.model = PageModel()
+        self.saved_edits = {}
+        self.model.dataChanged.connect(self.update_status)
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(6, 3, 6, 3)
+        toolbar.setSpacing(4)
+        layout.addLayout(toolbar)
 
         self.open_button = QPushButton("Open CSV")
         self.open_button.clicked.connect(self.open_file)
-        layout.addWidget(self.open_button)
+        toolbar.addWidget(self.open_button)
         session_menu = self.menuBar().addMenu("Session")
         self.open_session_action = session_menu.addAction("Open session…")
         self.open_session_action.triggered.connect(self.open_session_file)
         self.save_session_action = session_menu.addAction("Save session…")
         self.save_session_action.triggered.connect(self.save_session_file)
         self.save_session_action.setEnabled(False)
-        self.selection_button = QPushButton("Filter, sort and columns…")
+        self.selection_button = QPushButton("Selection…")
         self.selection_button.setEnabled(False)
         self.selection_button.clicked.connect(self.edit_selection)
-        layout.addWidget(self.selection_button)
+        toolbar.addWidget(self.selection_button)
         self.sql_button = QPushButton("Preview SQL…")
         self.sql_button.setEnabled(False)
         self.sql_button.clicked.connect(self.preview_sql)
-        layout.addWidget(self.sql_button)
+        toolbar.addWidget(self.sql_button)
         self.query_button = QPushButton("SQL editor…")
         self.query_button.setEnabled(False)
         self.query_button.clicked.connect(self.edit_sql)
-        layout.addWidget(self.query_button)
+        toolbar.addWidget(self.query_button)
         self.unique_button = QPushButton("Unique values…")
         self.unique_button.setEnabled(False)
         self.unique_button.clicked.connect(self.edit_unique)
-        layout.addWidget(self.unique_button)
+        toolbar.addWidget(self.unique_button)
+        toolbar.addStretch()
         self.export_button = QPushButton("Export CSV…")
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self.save_selection)
-        layout.addWidget(self.export_button)
-        self.cancel_button = QPushButton("Cancel operations")
+        toolbar.addWidget(self.export_button)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip("Cancel running operations")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_operations)
-        layout.addWidget(self.cancel_button)
+        toolbar.addWidget(self.cancel_button)
 
         self.table = QTableView()
         self.table.setModel(self.model)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setDefaultSectionSize(23)
+        header = self.table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        header.setStretchLastSection(True)
+        header.sectionClicked.connect(self.open_column_menu)
         layout.addWidget(self.table, 1)
 
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.table.verticalScrollBar().valueChanged.connect(self.load_at_edge)
         self.status = QLabel("Open a CSV file to begin")
-        layout.addWidget(self.status)
+        self.statusBar().addWidget(self.status, 1)
+
+    def open_column_menu(self, section):
+        if self.path is None or self.view_job is not None or self.distinct is not None:
+            return
+        column = self.model.headers[section]
+        current = self.selection
+        menu = QMenu(self)
+        asc = menu.addAction("Sort ascending")
+        desc = menu.addAction("Sort descending")
+        unsort = menu.addAction("Clear sort")
+        unsort.setEnabled(current.sort_column == column)
+        menu.addSeparator()
+        add_filter = menu.addAction("Add contains filter…")
+        clear_filter = menu.addAction("Clear filters for this column")
+        remaining = tuple(pair for pair in current.filters if pair[0] != column)
+        clear_filter.setEnabled(any(name == column for name, _ in current.conditions))
+        header = self.table.horizontalHeader()
+        action = menu.exec(
+            header.mapToGlobal(QPoint(header.sectionViewportPosition(section), header.height()))
+        )
+        if action in (asc, desc):
+            selection = replace(current, sort_column=column, descending=action == desc)
+        elif action == unsort:
+            selection = replace(current, sort_column=None, descending=False)
+        elif action == add_filter:
+            value, accepted = QInputDialog.getText(self, "Column filter", f"{column} contains:")
+            if not accepted or not value:
+                return
+            selection = replace(current, filters=(*current.filters, (column, value)))
+        elif action == clear_filter:
+            selection = replace(current, filters=remaining)
+        else:
+            return
+        self.load_view(self.path, selection)
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV (*.csv);;All files (*)")
@@ -208,7 +293,19 @@ class MainWindow(QMainWindow):
         )
         if destination:
             self.export_button.setEnabled(False)
-            self.export_job = self.submit(export_csv, self.path, Path(destination), self.selection)
+            self.export_edits = self.model.edits.copy()
+            if self.export_edits:
+                self.export_job = self.submit(
+                    export_edited_csv,
+                    self.path,
+                    Path(destination),
+                    self.export_edits,
+                    self.revision,
+                )
+            else:
+                self.export_job = self.submit(
+                    export_csv, self.path, Path(destination), self.selection
+                )
             self.poll.start()
             self.update_status()
 
@@ -443,11 +540,15 @@ class MainWindow(QMainWindow):
     def load_view(
         self, path: Path, selection: Selection, *, new_file=False, distinct=None, singletons=False
     ):
-        if self.view_job is not None:
+        if (
+            self.view_job is not None
+            or (self.export_job is not None and self.export_edits)
+            or not self.confirm_discard_edits()
+        ):
             return
 
         def read_view(*, cancel):
-            size = path.stat().st_size
+            revision = file_revision(path)
             source_headers = None
             if new_file and selection.visible_columns is not None:
                 source_headers = read_page(path, 0, cancel=cancel)[0]
@@ -455,15 +556,15 @@ class MainWindow(QMainWindow):
                 result = prepare_result(
                     path, selection, distinct=distinct, singletons=singletons, cancel=cancel
                 )
-                return size, result.page(0, cancel=cancel), result, source_headers
-            return size, read_page(path, 0, selection, cancel=cancel), None, source_headers
+                return revision, result.page(0, cancel=cancel), result, source_headers
+            return revision, read_page(path, 0, selection, cancel=cancel), None, source_headers
 
         self.view_request = path, selection, new_file, distinct
         self.view_job = self.submit(read_view)
         self.poll.start()
         self.update_status()
 
-    def apply_view(self, size, page, result, source_headers):
+    def apply_view(self, revision, page, result, source_headers):
         path, selection, new_file, distinct = self.view_request
         headers, rows, has_more = page
         if self.page_job is not None:
@@ -478,10 +579,27 @@ class MainWindow(QMainWindow):
             self.count_job = self.submit(count_rows, path)
             self.source_headers = source_headers if source_headers is not None else headers
 
-        self.path, self.selection, self.file_size = path, selection, size
+        self.path, self.selection, self.file_size = path, selection, revision[2]
+        self.revision = revision
+        self.model.edits.clear()
+        self.saved_edits.clear()
         self.result, self.distinct = result, distinct
         self.has_more = False
+        self.model.filtered_columns = (
+            {name for name, _ in selection.conditions} if distinct is None else set()
+        )
         self.model.replace(headers, rows)
+        header = self.table.horizontalHeader()
+        if distinct is None and selection.sort_column in headers:
+            header.setSortIndicator(
+                headers.index(selection.sort_column),
+                Qt.SortOrder.DescendingOrder
+                if selection.descending
+                else Qt.SortOrder.AscendingOrder,
+            )
+            header.setSortIndicatorShown(True)
+        else:
+            header.setSortIndicatorShown(False)
         self.table.scrollToTop()
         self.has_more = has_more
         self.setWindowTitle(f"CSV Workbench — {path.name}")
@@ -499,7 +617,17 @@ class MainWindow(QMainWindow):
             return
         self.page_offset = offset
         if self.result is None:
-            self.page_job = self.submit(read_page, self.path, offset, self.selection)
+            path, revision, selection = self.path, self.revision, self.selection
+
+            def read_current_page(*, cancel):
+                if file_revision(path) != revision:
+                    raise ValueError("The source CSV changed. Reopen it before editing.")
+                page = read_page(path, offset, selection, cancel=cancel)
+                if file_revision(path) != revision:
+                    raise ValueError("The source CSV changed. Reopen it before editing.")
+                return page
+
+            self.page_job = self.submit(read_current_page)
         else:
             self.page_job = self.submit(self.result.page, offset)
         self.poll.start()
@@ -555,6 +683,8 @@ class MainWindow(QMainWindow):
                 elif name == "query_job":
                     self.show_query_result(*result)
                 else:
+                    if self.export_edits:
+                        self.saved_edits = self.export_edits
                     QMessageBox.information(self, "Export CSV", f"Exported {result:,} rows.")
             except CancelledError:
                 if name == "count_job":
@@ -572,21 +702,29 @@ class MainWindow(QMainWindow):
 
     def update_status(self):
         jobs = self.jobs()
+        self.model.editable = (
+            self.path is not None
+            and self.selection == Selection()
+            and self.distinct is None
+            and self.view_job is None
+            and self.export_job is None
+        )
         self.cancel_button.setEnabled(any(job is not None for job in jobs))
         self.open_button.setEnabled(self.view_job is None and self.query_job is None)
         self.open_session_action.setEnabled(self.open_button.isEnabled())
         self.save_session_action.setEnabled(self.path is not None and self.view_job is None)
         self.query_button.setEnabled(
-            self.path is not None and self.view_job is None and self.query_job is None
+            self.path is not None
+            and self.view_job is None
+            and self.query_job is None
+            and not self.model.edits
         )
         self.selection_button.setEnabled(self.path is not None and self.view_job is None)
         self.unique_button.setEnabled(self.path is not None and self.view_job is None)
         self.sql_button.setEnabled(
             self.path is not None and self.view_job is None and self.distinct is None
         )
-        self.selection_button.setText(
-            "Back to CSV selection" if self.distinct is not None else "Filter, sort and columns…"
-        )
+        self.selection_button.setText("Back to CSV" if self.distinct is not None else "Selection…")
         self.export_button.setEnabled(
             self.path is not None
             and self.view_job is None
@@ -607,12 +745,25 @@ class MainWindow(QMainWindow):
             progress += " • Running SQL…"
         if self.distinct is not None:
             progress += f" • Unique: {self.distinct}"
+        if self.model.edits and self.model.edits != self.saved_edits:
+            progress += " • Unsaved edits"
         self.status.setText(
             f"File: {self.file_size:,} bytes • Total rows: {total if total is not None else 'counting…'}"
             f" • Buffered: {len(self.model.rows):,}{progress}"
         )
 
+    def confirm_discard_edits(self):
+        if not self.model.edits or self.model.edits == self.saved_edits:
+            return True
+        return (
+            QMessageBox.question(self, "Unsaved edits", "Discard unsaved changes to the CSV?")
+            == QMessageBox.StandardButton.Yes
+        )
+
     def closeEvent(self, event):
+        if not self.confirm_discard_edits():
+            event.ignore()
+            return
         self.cancel_operations()
         self.poll.stop()
         self.executor.shutdown(wait=False, cancel_futures=True)
