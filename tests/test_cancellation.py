@@ -43,7 +43,7 @@ def test_cancel_interrupts_active_connection(monkeypatch):
 def test_export_cancellation_before_publish_keeps_destination(tmp_path, monkeypatch):
     source = tmp_path / "source.csv"
     destination = tmp_path / "existing.csv"
-    source.write_text("id\n001\n", encoding="utf-8")
+    source.write_bytes(b"id\n001\n")
     destination.write_bytes(b"old export")
     token = Cancellation()
     publish = token.publish
