@@ -24,8 +24,9 @@ def test_open_and_load_more(tmp_path, monkeypatch):
         window.view_job[1].result(timeout=5)
         window.collect_reads()
         assert window.model.rowCount() == 200
-        window.count_job[1].result(timeout=5)
-        window.collect_reads()
+        if window.count_job is not None:
+            window.count_job[1].result(timeout=5)
+            window.collect_reads()
         assert f"File: {source.stat().st_size:,} bytes" in window.status.text()
         assert "Total rows: 201" in window.status.text()
         assert "Buffered: 200" in window.status.text()
@@ -67,8 +68,9 @@ def test_cancel_running_selection_keeps_view(tmp_path, monkeypatch):
     window.load_view(source, Selection(), new_file=True)
     window.view_job[1].result(timeout=5)
     window.collect_reads()
-    window.count_job[1].result(timeout=5)
-    window.collect_reads()
+    if window.count_job is not None:
+        window.count_job[1].result(timeout=5)
+        window.collect_reads()
     started, release = Event(), Event()
 
     def slow_read(*args, cancel):
