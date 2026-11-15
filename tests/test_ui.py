@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from csv_workbench.ui import MainWindow
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def preset_settings(tmp_path, monkeypatch):
     path = str(tmp_path / "format-settings.ini")
 
@@ -556,6 +556,57 @@ def test_format_dialogs_save_and_reapply_presets(tmp_path, monkeypatch, preset_s
         assert exporting.load() == {}
         assert exporting.default_name() is None
         assert opening.default_name() == "Report"
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_open_recent_restores_saved_format_and_handles_missing_files(tmp_path, monkeypatch, preset_settings):
+    from csv_workbench.core import CsvFormat, Selection
+    from csv_workbench.recent import recent_files
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "R&D.tsv"
+    source.write_bytes("001\t'чай\tкофе'\n".encode("cp1251"))
+    other = tmp_path / "other.csv"
+    other.write_text("id\n002\n", encoding="utf-8")
+    fmt = CsvFormat("\t", False, "cp1251", "'")
+    errors = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args[-1]))
+    window = MainWindow()
+
+    def finish():
+        wait([window.view_job[1]], timeout=5)
+        window.collect_reads()
+        assert window.view_job is None
+
+    def open_recent(path):
+        window.populate_recent_files()
+        label = str(path).replace("&", "&&")
+        next(action for action in window.recent_menu.actions() if action.text() == label).trigger()
+        finish()
+
+    try:
+        window.load_view(source, Selection(), new_file=True, fmt=fmt)
+        finish()
+        window.load_view(other, Selection(), new_file=True)
+        finish()
+        open_recent(source)
+        assert window.csv_format == fmt
+        assert window.model.rows == [("001", "чай\tкофе")]
+        assert recent_files(preset_settings)[0] == (source, fmt)
+        if window.count_job:
+            window.count_job[1].result(timeout=5)
+            window.collect_reads()
+        source.unlink()
+        open_recent(other)
+        open_recent(source)
+        assert window.path == other
+        assert window.model.rows == [("002",)]
+        assert errors and recent_files(preset_settings)[0][0] == other
     finally:
         window.close()
         window.executor.shutdown(wait=True)

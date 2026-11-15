@@ -76,6 +76,7 @@ from csv_workbench.core import (
     selection_sql,
 )
 from csv_workbench.presets import FormatPresets, export_format_presets, import_format_presets
+from csv_workbench.recent import recent_files, remember_file
 from csv_workbench.session import load_session, save_session
 
 MISSING = object()
@@ -353,6 +354,10 @@ class MainWindow(QMainWindow):
         self.open_button.clicked.connect(self.open_file)
         toolbar.addWidget(self.open_button)
         file_menu = self.menuBar().addMenu("File")
+        self.settings = QSettings("CSV Workbench", "CSV Workbench")
+        self.recent_menu = file_menu.addMenu("Open Recent")
+        self.recent_menu.aboutToShow.connect(self.populate_recent_files)
+        file_menu.addSeparator()
         self.save_action = file_menu.addAction("Save", self.save_document)
         self.save_action.setShortcut(QKeySequence.StandardKey.Save)
         self.save_as_action = file_menu.addAction(
@@ -459,6 +464,20 @@ class MainWindow(QMainWindow):
             return
         self.load_view(self.path, selection)
 
+    def populate_recent_files(self):
+        self.recent_menu.clear()
+        entries = recent_files(self.settings)
+        if not entries:
+            self.recent_menu.addAction("No recent files").setEnabled(False)
+        for path, fmt in entries:
+            label = str(path).replace("&", "&&").replace("\n", " ").replace("\t", " ")
+            self.recent_menu.addAction(
+                label,
+                lambda checked=False, path=path, fmt=fmt: self.load_view(
+                    path, Selection(), new_file=True, fmt=fmt
+                ),
+            )
+
     def open_file(self):
         name, _ = QFileDialog.getOpenFileName(
             self, "Open CSV / TSV", "", "Delimited files (*.csv *.tsv);;All files (*)"
@@ -475,7 +494,7 @@ class MainWindow(QMainWindow):
 
     def add_format_presets(self, form, fields, refresh, *, exporting=False):
         dialog = form.parentWidget()
-        settings = QSettings("CSV Workbench", "CSV Workbench")
+        settings = self.settings
         store = FormatPresets(settings, exporting=exporting)
         combo = QComboBox()
         combo.setObjectName("formatPresets")
@@ -1378,6 +1397,8 @@ class MainWindow(QMainWindow):
         self.table.scrollToTop()
         self.has_more = has_more
         self.setWindowTitle(f"CSV Workbench — {path.name}")
+        if new_file:
+            remember_file(self.settings, path, fmt)
 
     def load_at_edge(self, value: int):
         if self.adjusting or self.path is None or self.view_job or self.page_job or self.save_job:
@@ -1480,7 +1501,10 @@ class MainWindow(QMainWindow):
                 elif name == "query_job":
                     self.show_query_result(*result)
                 elif name == "save_job":
+                    old_path = self.path
                     (self.path, self.revision), self.source_snapshot = result
+                    if self.path != old_path:
+                        remember_file(self.settings, self.path, self.csv_format)
                     self.file_size = self.revision[2]
                     self.clean_pos = self.history_pos
                     self.setWindowTitle(f"CSV Workbench — {self.path.name}")

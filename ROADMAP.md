@@ -45,4 +45,6 @@ v0.1: запланированные этапы закрыты. [GitHub Actions]
 
 Перенос пресетов CSV/TSV через JSON: [`transfer-csv-format-presets`](openspec/changes/archive/2026-11-15-transfer-csv-format-presets/proposal.md) закрыт.
 
+Недавние файлы CSV/TSV: [`recent-csv-files`](openspec/changes/archive/2026-11-15-recent-csv-files/proposal.md) закрыт.
+
 Roadmap задаёт порядок и критерии готовности. Каждый этап начинается с предложения, сценариев, дизайна и списка задач в `openspec/changes/`. После реализации и проверки изменение архивируется, а согласованное поведение попадает в `openspec/specs/`.
