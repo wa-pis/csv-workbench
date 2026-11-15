@@ -490,12 +490,13 @@ def test_format_dialogs_save_and_reapply_presets(tmp_path, monkeypatch, preset_s
     source = tmp_path / "report.txt"
     source.write_bytes("001|'данные|здесь'\n".encode("cp1251"))
     fmt = CsvFormat("|", False, "cp1251", "'")
-    FormatPresets(preset_settings).save("Report", fmt)
+    opening = FormatPresets(preset_settings)
+    opening.save("Report", fmt)
+    opening.set_default("Report")
 
     def use_open_preset(dialog):
         combo = dialog.findChild(QComboBox, "formatPresets")
-        combo.setCurrentIndex(combo.findText("Report"))
-        combo.activated.emit(combo.currentIndex())
+        assert combo.currentText() == "Report"
         model = dialog.findChild(QTableView).model()
         assert model.rows == [("001", "данные|здесь")]
         return QDialog.DialogCode.Accepted
@@ -517,7 +518,25 @@ def test_format_dialogs_save_and_reapply_presets(tmp_path, monkeypatch, preset_s
         quote.setText('"')
         header.setChecked(True)
         combo.activated.emit(combo.currentIndex())
+        manage = next(b for b in dialog.findChildren(QPushButton) if b.text() == "Manage…")
+        next(a for a in manage.menu().actions() if a.text() == "Set as Default").trigger()
         return QDialog.DialogCode.Accepted
+
+    def rename_export_default(dialog):
+        combo = dialog.findChild(QComboBox, "formatPresets")
+        assert combo.currentText() == "TSV report"
+        manage = next(b for b in dialog.findChildren(QPushButton) if b.text() == "Manage…")
+        next(a for a in manage.menu().actions() if a.text() == "Rename…").trigger()
+        assert combo.currentText() == "Renamed TSV"
+        return QDialog.DialogCode.Accepted
+
+    def delete_export_default(dialog):
+        combo = dialog.findChild(QComboBox, "formatPresets")
+        assert combo.currentText() == "Renamed TSV"
+        manage = next(b for b in dialog.findChildren(QPushButton) if b.text() == "Manage…")
+        next(a for a in manage.menu().actions() if a.text() == "Delete…").trigger()
+        assert combo.currentIndex() == 0
+        return QDialog.DialogCode.Rejected
 
     window = MainWindow()
     try:
@@ -526,7 +545,17 @@ def test_format_dialogs_save_and_reapply_presets(tmp_path, monkeypatch, preset_s
         monkeypatch.setattr(QInputDialog, "getText", lambda *_: ("TSV report", True))
         monkeypatch.setattr(QDialog, "exec", save_and_load_export_preset)
         assert window.configure_export_format() == export_format
-        assert FormatPresets(preset_settings, exporting=True).load() == {"TSV report": export_format}
+        exporting = FormatPresets(preset_settings, exporting=True)
+        assert exporting.default_name() == "TSV report"
+        monkeypatch.setattr(QInputDialog, "getText", lambda *_, **__: ("Renamed TSV", True))
+        monkeypatch.setattr(QDialog, "exec", rename_export_default)
+        assert window.configure_export_format() == export_format
+        monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+        monkeypatch.setattr(QDialog, "exec", delete_export_default)
+        assert window.configure_export_format() is None
+        assert exporting.load() == {}
+        assert exporting.default_name() is None
+        assert opening.default_name() == "Report"
     finally:
         window.close()
         window.executor.shutdown(wait=True)

@@ -479,9 +479,17 @@ class MainWindow(QMainWindow):
         combo = QComboBox()
         combo.setObjectName("formatPresets")
         save = QPushButton("Save Preset…")
+        manage = QPushButton("Manage…")
+        menu = QMenu(manage)
+        rename = menu.addAction("Rename…")
+        delete = menu.addAction("Delete…")
+        make_default = menu.addAction("Set as Default")
+        clear_default = menu.addAction("Clear Default")
+        manage.setMenu(menu)
         row = QHBoxLayout()
         row.addWidget(combo, 1)
         row.addWidget(save)
+        row.addWidget(manage)
         form.insertRow(0, "Preset", row)
 
         def populate(selected=None):
@@ -513,9 +521,60 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError) as exc:
                 QMessageBox.warning(dialog, "Format preset", str(exc))
 
-        populate()
+        def selected_name():
+            return combo.currentText() if combo.currentIndex() > 0 else None
+
+        def update_menu():
+            name = selected_name()
+            default = store.default_name()
+            rename.setEnabled(name is not None)
+            delete.setEnabled(name is not None)
+            make_default.setEnabled(name is not None and name != default)
+            clear_default.setEnabled(default is not None)
+            manage.setToolTip(f"Default preset: {default}" if default else "No default preset")
+
+        def rename_preset():
+            old = selected_name()
+            name, accepted = QInputDialog.getText(
+                dialog, "Rename preset", "New name:", text=old
+            )
+            if accepted:
+                try:
+                    populate(store.rename(old, name))
+                except (OSError, ValueError) as exc:
+                    QMessageBox.warning(dialog, "Format preset", str(exc))
+
+        def delete_preset():
+            name = selected_name()
+            if QMessageBox.question(
+                dialog, "Delete preset", f"Delete the preset “{name}”?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) == QMessageBox.StandardButton.Yes:
+                try:
+                    store.delete(name)
+                    populate()
+                except (OSError, ValueError) as exc:
+                    QMessageBox.warning(dialog, "Format preset", str(exc))
+
+        def set_default(name):
+            try:
+                store.set_default(name)
+                update_menu()
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(dialog, "Format preset", str(exc))
+
+        default = store.default_name()
+        populate(default)
+        update_menu()
+        combo.currentIndexChanged.connect(update_menu)
         combo.activated.connect(apply_preset)
         save.clicked.connect(save_preset)
+        rename.triggered.connect(rename_preset)
+        delete.triggered.connect(delete_preset)
+        make_default.triggered.connect(lambda: set_default(selected_name()))
+        clear_default.triggered.connect(lambda: set_default(None))
+        apply_preset(combo.currentIndex())
 
     def configure_format(self, path):
         dialog = QDialog(self)

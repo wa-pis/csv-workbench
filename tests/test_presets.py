@@ -34,3 +34,40 @@ def test_presets_skip_invalid_entries_and_reject_blank_names(tmp_path):
     assert store.load() == {"OK": CsvFormat(";")}
     settings.setValue(store.key, "{")
     assert store.load() == {}
+
+
+def test_defaults_follow_rename_and_delete_only_in_their_scope(tmp_path):
+    path = str(tmp_path / "settings.ini")
+    settings = QSettings(path, QSettings.Format.IniFormat)
+    opening = FormatPresets(settings)
+    exporting = FormatPresets(settings, exporting=True)
+    opening.save("Report", CsvFormat("|", False))
+    opening.save("Other", CsvFormat(";"))
+    exporting.save("Report", CsvFormat("\t", False))
+    assert opening.default_name() is None
+    opening.set_default("Report")
+    exporting.set_default("Report")
+
+    with pytest.raises(ValueError, match="already exists"):
+        opening.rename("Report", "Other")
+    with pytest.raises(ValueError, match="name"):
+        opening.rename("Report", "  ")
+    assert opening.rename("Report", "  Renamed  ") == "Renamed"
+    opening.delete("Other")
+
+    reopened = QSettings(path, QSettings.Format.IniFormat)
+    opening = FormatPresets(reopened)
+    exporting = FormatPresets(reopened, exporting=True)
+    assert opening.load() == {"Renamed": CsvFormat("|", False)}
+    assert opening.default_name() == "Renamed"
+    assert exporting.default_name() == "Report"
+    with pytest.raises(ValueError, match="no longer exists"):
+        opening.set_default("Report")
+    assert opening.default_name() == "Renamed"
+    opening.delete("Renamed")
+    assert opening.load() == {}
+    assert opening.default_name() is None
+    assert exporting.default_name() == "Report"
+    exporting.set_default(None)
+    assert exporting.default_name() is None
+    assert exporting.load() == {"Report": CsvFormat("\t", False)}
