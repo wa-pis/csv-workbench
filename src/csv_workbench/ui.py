@@ -75,7 +75,7 @@ from csv_workbench.core import (
     save_csv,
     selection_sql,
 )
-from csv_workbench.presets import FormatPresets
+from csv_workbench.presets import FormatPresets, export_format_presets, import_format_presets
 from csv_workbench.session import load_session, save_session
 
 MISSING = object()
@@ -475,7 +475,8 @@ class MainWindow(QMainWindow):
 
     def add_format_presets(self, form, fields, refresh, *, exporting=False):
         dialog = form.parentWidget()
-        store = FormatPresets(QSettings("CSV Workbench", "CSV Workbench"), exporting=exporting)
+        settings = QSettings("CSV Workbench", "CSV Workbench")
+        store = FormatPresets(settings, exporting=exporting)
         combo = QComboBox()
         combo.setObjectName("formatPresets")
         save = QPushButton("Save Preset…")
@@ -485,6 +486,9 @@ class MainWindow(QMainWindow):
         delete = menu.addAction("Delete…")
         make_default = menu.addAction("Set as Default")
         clear_default = menu.addAction("Clear Default")
+        menu.addSeparator()
+        import_json = menu.addAction("Import Presets from JSON…")
+        export_json = menu.addAction("Export Presets to JSON…")
         manage.setMenu(menu)
         row = QHBoxLayout()
         row.addWidget(combo, 1)
@@ -564,6 +568,41 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError) as exc:
                 QMessageBox.warning(dialog, "Format preset", str(exc))
 
+        def confirm_replace(conflicts):
+            details = "\n".join(
+                f"{scope.title()}: {', '.join(names)}" for scope, names in conflicts.items()
+            )
+            message = QMessageBox(dialog)
+            message.setWindowTitle("Import format presets")
+            message.setIcon(QMessageBox.Icon.Question)
+            message.setTextFormat(Qt.TextFormat.PlainText)
+            message.setText(f"Replace these presets and import both lists?\n\n{details}")
+            message.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            message.setDefaultButton(QMessageBox.StandardButton.No)
+            return message.exec() == QMessageBox.StandardButton.Yes
+
+        def import_presets():
+            filename, _ = QFileDialog.getOpenFileName(
+                dialog, "Import format presets", "", "JSON (*.json)"
+            )
+            if filename:
+                try:
+                    if import_format_presets(settings, Path(filename), confirm_replace=confirm_replace):
+                        populate()
+                        update_menu()
+                except (OSError, ValueError) as exc:
+                    QMessageBox.warning(dialog, "Import format presets", str(exc))
+
+        def export_presets():
+            filename, _ = QFileDialog.getSaveFileName(
+                dialog, "Export format presets", "csv-format-presets.json", "JSON (*.json)"
+            )
+            if filename:
+                try:
+                    export_format_presets(settings, Path(filename))
+                except OSError as exc:
+                    QMessageBox.warning(dialog, "Export format presets", str(exc))
+
         default = store.default_name()
         populate(default)
         update_menu()
@@ -574,6 +613,8 @@ class MainWindow(QMainWindow):
         delete.triggered.connect(delete_preset)
         make_default.triggered.connect(lambda: set_default(selected_name()))
         clear_default.triggered.connect(lambda: set_default(None))
+        import_json.triggered.connect(import_presets)
+        export_json.triggered.connect(export_presets)
         apply_preset(combo.currentIndex())
 
     def configure_format(self, path):

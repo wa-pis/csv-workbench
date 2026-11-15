@@ -2,6 +2,8 @@
 
 import json
 from dataclasses import asdict
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from PySide6.QtCore import QSettings
 
@@ -73,10 +75,80 @@ class FormatPresets:
         self._write(presets, name)
 
     def _write(self, presets, default):
+        self._stage(presets, default)
+        sync_settings(self.settings)
+
+    def _stage(self, presets, default):
         self.settings.setValue(
             self.key, json.dumps({label: asdict(value) for label, value in presets.items()})
         )
         self.settings.setValue(f"{self.key}Default", default if default in presets else "")
-        self.settings.sync()
-        if self.settings.status() != QSettings.Status.NoError:
-            raise OSError("Could not save the format preset.")
+
+def sync_settings(settings):
+    settings.sync()
+    if settings.status() != QSettings.Status.NoError:
+        raise OSError("Could not save the format presets.")
+
+
+def preset_stores(settings):
+    return {"open": FormatPresets(settings), "export": FormatPresets(settings, exporting=True)}
+
+
+def export_format_presets(settings, destination: Path):
+    document = {"version": 1}
+    for scope, store in preset_stores(settings).items():
+        presets = store.load()
+        default = store.default_name()
+        document[scope] = {
+            "presets": {name: asdict(fmt) for name, fmt in presets.items()},
+            "default": default if default in presets else None,
+        }
+    with TemporaryDirectory(dir=destination.parent) as scratch:
+        output = Path(scratch) / "presets.json"
+        output.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        output.replace(destination)
+
+
+def unique_json_keys(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key: {key!r}.")
+        result[key] = value
+    return result
+
+
+def import_format_presets(settings, source: Path, *, confirm_replace=None):
+    document = json.loads(source.read_text(encoding="utf-8-sig"), object_pairs_hook=unique_json_keys)
+    if not isinstance(document, dict) or type(document.get("version")) is not int or document["version"] != 1:
+        raise ValueError("Unsupported preset JSON version.")
+    pending = []
+    conflicts = {}
+    for scope, store in preset_stores(settings).items():
+        data = document.get(scope)
+        if not isinstance(data, dict) or not isinstance(data.get("presets"), dict) or "default" not in data:
+            raise ValueError(f"Invalid preset list: {scope}.")
+        incoming = {}
+        for name, fields in data["presets"].items():
+            try:
+                if (
+                    not name or name != name.strip() or not isinstance(fields, dict)
+                    or fields.keys() != {"delimiter", "header", "encoding", "quote"}
+                ):
+                    raise ValueError
+                incoming[name] = CsvFormat(**fields)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid preset in {scope}: {name!r}.") from exc
+        default = data["default"]
+        if default is not None and (not isinstance(default, str) or default not in incoming):
+            raise ValueError(f"Invalid default preset: {scope}.")
+        existing = store.load()
+        if names := sorted(existing.keys() & incoming.keys()):
+            conflicts[scope] = names
+        pending.append((store, existing | incoming, default))
+    if conflicts and (confirm_replace is None or not confirm_replace(conflicts)):
+        return False
+    for store, presets, default in pending:
+        store._stage(presets, default)
+    sync_settings(settings)
+    return True
