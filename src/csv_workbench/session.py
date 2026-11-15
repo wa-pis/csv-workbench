@@ -76,7 +76,12 @@ def load_session(path: Path) -> tuple[Path, Selection, CsvFormat]:
     settings = data.get("format", {})
     if not isinstance(settings, dict):
         raise ValueError("Invalid format in session file.")  # noqa: TRY004
-    fmt = CsvFormat(settings.get("delimiter", ","), settings.get("header", True))
+    fmt = CsvFormat(
+        settings.get("delimiter", ","),
+        settings.get("header", True),
+        settings.get("encoding"),
+        settings.get("quote", '"'),
+    )
     return (
         Path(source),
         Selection(

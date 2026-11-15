@@ -79,3 +79,48 @@ def test_old_session_defaults_to_comma_and_header(tmp_path):
 def test_invalid_custom_delimiter(delimiter):
     with pytest.raises(ValueError, match="delimiter"):
         CsvFormat(delimiter)
+
+
+def test_manual_encoding_and_quote_apply_to_full_file(tmp_path):
+    path = tmp_path / "input.csv"
+    fmt = CsvFormat(";", True, "cp1251", "'")
+    text = "id;label\n2;'чай; кофе\nи ''сахар'''\n1;молоко\n"
+    path.write_bytes(text.encode("cp1251"))
+    rows = [("2", "чай; кофе\nи 'сахар'"), ("1", "молоко")]
+    assert preview_format(read_format_sample(path, fmt.encoding), fmt) == (
+        ["id", "label"],
+        [list(row) for row in rows],
+    )
+    assert read_page(path, 0, fmt=fmt)[1] == rows
+    assert count_rows(path, fmt=fmt) == 2
+    assert query_csv(path, "SELECT label FROM csv_data ORDER BY id", fmt=fmt)[1] == [
+        (row[1],) for row in reversed(rows)
+    ]
+    selection = Selection(sort_column="id")
+    result = prepare_result(path, selection, fmt=fmt)
+    with result.scratch:
+        assert result.page(0)[1] == rows[::-1]
+    result = prepare_result(path, Selection(), distinct="label", fmt=fmt)
+    with result.scratch:
+        assert dict(result.page(0)[1]) == {row[1]: 1 for row in rows}
+    output = tmp_path / "export.csv"
+    export_csv(path, output, selection, fmt=fmt)
+    assert read_page(output, 0)[1] == rows[::-1]
+
+    revision = file_revision(path)
+    with pytest.raises(UnicodeEncodeError):
+        save_csv(path, path, {(0, 1): "🙂"}, revision, fmt=fmt)
+    assert path.read_bytes() == text.encode("cp1251")
+    save_csv(path, path, {(0, 1): "новый; чай"}, revision, fmt=fmt)
+    assert "'новый; чай'".encode("cp1251") in path.read_bytes()
+    assert read_page(path, 0, fmt=fmt)[1][0] == ("2", "новый; чай")
+
+    session = tmp_path / "saved.csvsession"
+    save_session(session, path, selection, fmt)
+    assert load_session(session) == (path.resolve(), selection, fmt)
+
+
+@pytest.mark.parametrize("quote", ["", "''", ",", "\n", "«"])
+def test_invalid_quote(quote):
+    with pytest.raises(ValueError, match="quote"):
+        CsvFormat(quote=quote)

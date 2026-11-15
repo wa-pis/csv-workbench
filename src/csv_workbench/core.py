@@ -16,14 +16,26 @@ import duckdb
 PAGE_SIZE = 200
 NEW_ROW = 1 << 62
 DELETED_COLUMN = -1
-CSV_SOURCE = """read_csv(?, header = true, delim = ',', quote = '"', escape = '"',
-                         all_varchar = true, hive_partitioning = false)"""
+CSV_ENCODINGS = {
+    "Auto": None,
+    "UTF-8": "utf-8-sig",
+    "UTF-16 with BOM": "utf-16",
+    "UTF-16 LE (no BOM)": "utf-16-le",
+    "UTF-16 BE (no BOM)": "utf-16-be",
+    "UTF-32 with BOM": "utf-32",
+    "Windows-1251": "cp1251",
+    "Windows-1252": "cp1252",
+    "KOI8-R": "koi8-r",
+    "CP866": "cp866",
+}
 
 
 @dataclass(frozen=True)
 class CsvFormat:
     delimiter: str = ","
     header: bool = True
+    encoding: str | None = None
+    quote: str = '"'
 
     def __post_init__(self):
         if (
@@ -36,26 +48,40 @@ class CsvFormat:
         if not isinstance(self.header, bool):
             raise ValueError("Invalid CSV header setting.")  # noqa: TRY004
 
+        if self.encoding not in CSV_ENCODINGS.values():
+            raise ValueError("Unsupported CSV encoding.")
+        if (
+            not isinstance(self.quote, str)
+            or len(self.quote) != 1
+            or not (" " <= self.quote <= "~")
+            or self.quote == self.delimiter
+        ):
+            raise ValueError("Enter one printable ASCII quote character distinct from the delimiter.")
+
     @property
     def source(self):
         delimiter = self.delimiter.replace("'", "''")
-        return CSV_SOURCE.replace(
-            "header = true, delim = ','",
-            f"header = {str(self.header).lower()}, delim = '{delimiter}'",
+        quote = self.quote.replace("'", "''")
+        return (
+            f"read_csv(?, header = {str(self.header).lower()}, delim = '{delimiter}', "
+            f"quote = '{quote}', escape = '{quote}', all_varchar = true, hive_partitioning = false)"
         )
 
 
-def read_format_sample(path):
+CSV_SOURCE = CsvFormat().source
+
+
+def read_format_sample(path, encoding=None):
     if not path.is_file():
         raise ValueError(f"Not a regular file: {path}")
-    with path.open(encoding=detect_encoding(path), newline="") as handle:
+    with path.open(encoding=encoding or detect_encoding(path), newline="") as handle:
         sample = handle.read(128 * 1024 + 1)
     return sample[: 128 * 1024], len(sample) > 128 * 1024
 
 
-def format_records(sample, delimiter, limit=11):
+def format_records(sample, delimiter, limit=11, *, quote='"'):
     text, truncated = sample
-    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, quotechar=quote, strict=True)
     rows = []
     try:
         for row in reader:
@@ -72,11 +98,13 @@ def format_records(sample, delimiter, limit=11):
     return rows
 
 
-def detect_delimiter(sample, fallback=","):
-    best, score = fallback, 1
-    for delimiter in (fallback, ",", ";", "\t"):
+def detect_delimiter(sample, fallback=",", *, quote='"'):
+    best, score = (fallback if fallback != quote else ";"), 1
+    for delimiter in dict.fromkeys((fallback, ",", ";", "\t")):
+        if delimiter == quote:
+            continue
         try:
-            rows = format_records(sample, delimiter)
+            rows = format_records(sample, delimiter, quote=quote)
         except csv.Error:
             continue
         if rows and len(rows[0]) > score and all(len(row) == len(rows[0]) for row in rows):
@@ -85,7 +113,7 @@ def detect_delimiter(sample, fallback=","):
 
 
 def preview_format(sample, fmt):
-    rows = format_records(sample, fmt.delimiter, limit=10 + fmt.header)
+    rows = format_records(sample, fmt.delimiter, limit=10 + fmt.header, quote=fmt.quote)
     if not rows:
         return [], []
     if fmt.header:
@@ -206,12 +234,12 @@ def detect_encoding(path: Path) -> str:
 
 
 @contextmanager
-def utf8_source(path: Path, cancel: Cancellation):
+def utf8_source(path: Path, cancel: Cancellation, fmt=CsvFormat()):
     cancel.check()
     path = path.resolve(strict=True)
     if not path.is_file():
         raise ValueError(f"Not a regular file: {path}")
-    encoding = detect_encoding(path)
+    encoding = fmt.encoding or detect_encoding(path)
     if encoding in {"utf-8", "utf-8-sig"}:
         yield path
         return
@@ -241,7 +269,7 @@ def csv_pattern(path: Path) -> str:
 
 def count_rows(path: Path, *, fmt=CsvFormat(), cancel: Cancellation | None = None) -> int:
     cancel = cancel or Cancellation()
-    with utf8_source(path, cancel) as source, cancel.connection() as connection:
+    with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
         return connection.execute(
             f"SELECT count(*) FROM {fmt.source}", [csv_pattern(source)]
         ).fetchone()[0]
@@ -348,7 +376,7 @@ def editable_query(connection, source, selection, edits, fmt=CsvFormat()):
 
 
 def read_editable_page(path, offset, selection, edits, *, cancel, fmt=CsvFormat()):
-    with utf8_source(path, cancel) as source, cancel.connection() as connection:
+    with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
         sql, params = editable_query(connection, source, selection, edits, fmt)
         return page_result(
             connection.execute(sql + " LIMIT ? OFFSET ?", [*params, PAGE_SIZE + 1, offset])
@@ -361,7 +389,7 @@ def prepare_editable_result(
     scratch = TemporaryDirectory(prefix="csv-result-")
     output = Path(scratch.name) / "result.parquet"
     try:
-        with utf8_source(path, cancel) as source, cancel.connection() as connection:
+        with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
             sql, params = editable_query(connection, source, selection, edits, fmt)
             if distinct is not None:
                 having = " HAVING count(*) = 1" if singletons else ""
@@ -385,7 +413,7 @@ def read_page(
     fmt=CsvFormat(),
 ) -> tuple[list[str], list[tuple], bool]:
     cancel = cancel or Cancellation()
-    with utf8_source(path, cancel) as source, cancel.connection() as connection:
+    with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
         sql, params = selection_query(connection, source, selection, fmt)
         cancel.check()
         cursor = connection.execute(
@@ -398,7 +426,7 @@ def read_page(
 def query_csv(path: Path, sql: str, *, fmt=CsvFormat(), cancel: Cancellation | None = None):
     cancel = cancel or Cancellation()
     with cancel.connection() as connection:
-        with utf8_source(path, cancel) as source:
+        with utf8_source(path, cancel, fmt) as source:
             connection.execute(
                 f"CREATE TABLE csv_data AS SELECT * FROM {fmt.source}", [csv_pattern(source)]
             )
@@ -429,7 +457,7 @@ def export_csv(
 
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "export.csv"
-        with utf8_source(source, cancel) as decoded, cancel.connection() as connection:
+        with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
             sql, params = selection_query(connection, decoded, selection, fmt)
             cancel.check()
             # DuckDB binds the COPY destination before the inner query parameters.
@@ -476,14 +504,15 @@ def export_edited_csv(
     check_source()
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "edited.csv"
-        with utf8_source(source, cancel) as decoded, cancel.connection() as connection:
+        with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
             sql, params = editable_query(connection, decoded, selection, edits, fmt)
             cursor = connection.execute(sql, params)
             count = 0
-            with output.open("w", encoding="utf-8", newline="") as handle:
+            with output.open("w", encoding=(fmt.encoding if save else None) or "utf-8", newline="") as handle:
                 writer = csv.writer(
                     handle,
                     delimiter=fmt.delimiter if save else ",",
+                    quotechar=fmt.quote if save else '"',
                     quoting=csv.QUOTE_NOTNULL,
                     lineterminator="\r\n",
                 )
@@ -542,8 +571,24 @@ def page_result(cursor):
 CSV_BLOCK_BYTES = 8 * 2**20
 
 
-def csv_blocks(source, cancel, block_bytes=CSV_BLOCK_BYTES):
+def custom_quote_boundary(data, opening, closing):
+    end = pos = 0
+    while match := opening.search(data, pos):
+        end = max(end, data.rfind(b"\n", pos, match.end() - 1) + 1)
+        match = closing.match(data, match.end())
+        if match is None:
+            return end
+        pos = match.end()
+    return max(end, data.rfind(b"\n", pos) + 1)
+
+
+def csv_blocks(source, cancel, block_bytes=CSV_BLOCK_BYTES, *, quote=b'"', delimiter=b","):
     """Split on record boundaries, including CSV fields containing newlines."""
+    opening = closing = None
+    if quote != b'"':
+        escaped = re.escape(quote)
+        opening = re.compile(rb"(?:\A|[" + re.escape(delimiter) + rb"\n])" + escaped)
+        closing = re.compile(rb"(?:[^" + escaped + rb"]++|" + escaped * 2 + rb")*+" + escaped)
     pending = b""
     while chunk := source.read(block_bytes):
         cancel.check()
@@ -551,11 +596,13 @@ def csv_blocks(source, cancel, block_bytes=CSV_BLOCK_BYTES):
         end = pending.rfind(b"\n") + 1
         if not end:
             continue
-        if pending.count(b'"', 0, end) % 2:
+        if opening is not None:
+            end = custom_quote_boundary(pending, opening, closing)
+        elif pending.count(quote, 0, end) % 2:
             # An escaped quote contributes two quotes, so it cannot change parity.
             while end:
                 previous = pending.rfind(b"\n", 0, end - 1) + 1
-                if pending.count(b'"', previous, end) % 2:
+                if pending.count(quote, previous, end) % 2:
                     end = previous
                     break
                 end = previous
@@ -576,7 +623,9 @@ def stage_selection(path, selection, distinct, directory, cancel, fmt=CsvFormat(
     sort = [column for column, _ in selection.sort_keys] if distinct is None else []
     files = []
     with path.open("rb") as source, cancel.connection() as connection:
-        blocks = csv_blocks(source, cancel)
+        blocks = csv_blocks(
+            source, cancel, quote=fmt.quote.encode("ascii"), delimiter=fmt.delimiter.encode("ascii")
+        )
         first = next(blocks, None)
         if first is None:
             raise ValueError("CSV has no header.")
@@ -584,6 +633,7 @@ def stage_selection(path, selection, distinct, directory, cancel, fmt=CsvFormat(
             first,
             has_header=fmt.header,
             separator=fmt.delimiter,
+            quote_char=fmt.quote,
             infer_schema=False,
             n_threads=2,
             null_values="",
@@ -632,6 +682,7 @@ def stage_selection(path, selection, distinct, directory, cancel, fmt=CsvFormat(
                     block,
                     has_header=False,
                     separator=fmt.delimiter,
+                    quote_char=fmt.quote,
                     infer_schema=False,
                     n_threads=2,
                     new_columns=names,
@@ -663,7 +714,7 @@ def prepare_result(
     output = Path(scratch.name) / "result.parquet"
     try:
         with TemporaryDirectory(prefix="csv-stage-") as staging:
-            with utf8_source(path, cancel) as source:
+            with utf8_source(path, cancel, fmt) as source:
                 columns, files = stage_selection(
                     source, selection, distinct, Path(staging), cancel, fmt
                 )

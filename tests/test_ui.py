@@ -378,7 +378,7 @@ def test_range_and_row_history_survives_save(tmp_path, monkeypatch):
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def test_open_format_dialog_uses_manual_delimiter_and_header(tmp_path, monkeypatch):
+def test_open_format_dialog_updates_for_manual_encoding_quote_and_delimiter(tmp_path, monkeypatch):
     from PySide6.QtWidgets import (
         QCheckBox,
         QComboBox,
@@ -392,23 +392,30 @@ def test_open_format_dialog_uses_manual_delimiter_and_header(tmp_path, monkeypat
 
     app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
     source = tmp_path / "input.csv"
-    source.write_text("one;two|2\nthree;four|4\n", encoding="utf-8")
+    source.write_bytes("один;два|'2|3'\nтри;четыре|4\n".encode("utf-16-le"))
     window = MainWindow()
 
     def configure(dialog):
-        delimiter = dialog.findChild(QComboBox)
+        delimiter, encoding = dialog.findChildren(QComboBox)
+        custom, quote = dialog.findChildren(QLineEdit)
         header = dialog.findChild(QCheckBox)
         model = dialog.findChild(QTableView).model()
-        assert delimiter.currentData() == ";"
-        assert model.headers == ["one", "two|2"]
-        header.setChecked(False)
-        assert model.rows[0] == ("one", "two|2")
-        delimiter.setCurrentIndex(delimiter.findText("Custom…"))
         open_button = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Open)
         assert not open_button.isEnabled()
-        dialog.findChild(QLineEdit).setText("|")
+        encoding.setCurrentIndex(encoding.findData("utf-16-le"))
         assert open_button.isEnabled()
-        assert model.rows[0] == ("one;two", "2")
+        assert delimiter.currentData() == ";"
+        assert model.headers == ["один", "два|'2|3'"]
+        header.setChecked(False)
+        delimiter.setCurrentIndex(delimiter.findText("Custom…"))
+        assert not open_button.isEnabled()
+        custom.setText("|")
+        assert model.rows[0] == ("один;два", "'2", "3'")
+        quote.setText("|")
+        assert not open_button.isEnabled()
+        quote.setText("'")
+        assert open_button.isEnabled()
+        assert model.rows[0] == ("один;два", "2|3")
         return QDialog.DialogCode.Accepted
 
     monkeypatch.setattr(QDialog, "exec", configure)
@@ -417,8 +424,8 @@ def test_open_format_dialog_uses_manual_delimiter_and_header(tmp_path, monkeypat
         window.open_file()
         window.view_job[1].result(timeout=5)
         window.collect_reads()
-        assert window.csv_format == CsvFormat("|", False)
-        assert window.model.rows == [("one;two", "2"), ("three;four", "4")]
+        assert window.csv_format == CsvFormat("|", False, "utf-16-le", "'")
+        assert window.model.rows == [("один;два", "2|3"), ("три;четыре", "4")]
     finally:
         window.close()
         window.executor.shutdown(wait=True)

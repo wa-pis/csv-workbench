@@ -15,6 +15,7 @@ from PySide6.QtCore import (
     QModelIndex,
     QPoint,
     QRect,
+    QSignalBlocker,
     Qt,
     QTimer,
     Signal,
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from csv_workbench.core import (
+    CSV_ENCODINGS,
     DELETED_COLUMN,
     NEW_ROW,
     PAGE_SIZE,
@@ -409,7 +411,6 @@ class MainWindow(QMainWindow):
                 self.load_view(path, Selection(), new_file=True, fmt=fmt)
 
     def configure_format(self, path):
-        sample = read_format_sample(path)
         dialog = QDialog(self)
         dialog.setWindowTitle(f"File format — {path.name}")
         dialog.resize(680, 350)
@@ -420,12 +421,21 @@ class MainWindow(QMainWindow):
         delimiter.addItem("Custom…")
         custom = QLineEdit()
         custom.setPlaceholderText("One ASCII character, e.g. |")
-        detected = detect_delimiter(sample, "\t" if path.suffix.lower() == ".tsv" else ",")
-        delimiter.setCurrentIndex(delimiter.findData(detected))
+        encoding = QComboBox()
+        for label, codec in CSV_ENCODINGS.items():
+            encoding.addItem(label, codec)
+        quote = QLineEdit('"')
+        quote.setPlaceholderText("One ASCII character")
+        sample = None
+        sample_encoding = object()
+        manual_delimiter = False
+        fallback = "\t" if path.suffix.lower() == ".tsv" else ","
         header = QCheckBox("First record contains column names")
         header.setChecked(True)
         form.addRow("Delimiter", delimiter)
         form.addRow("Custom delimiter", custom)
+        form.addRow("Encoding", encoding)
+        form.addRow("Quote character", quote)
         form.addRow(header)
         table = QTableView(dialog)
         model = PageModel()
@@ -444,21 +454,36 @@ class MainWindow(QMainWindow):
 
         def current_format():
             value = delimiter.currentData()
-            return CsvFormat(custom.text() if value is None else value, header.isChecked())
+            return CsvFormat(
+                custom.text() if value is None else value,
+                header.isChecked(),
+                encoding.currentData(),
+                quote.text(),
+            )
+
+        def choose_delimiter():
+            nonlocal manual_delimiter
+            manual_delimiter = True
+            refresh()
 
         def refresh():
+            nonlocal sample, sample_encoding
             form.setRowVisible(custom, delimiter.currentData() is None)
             open_button = buttons.button(QDialogButtonBox.StandardButton.Open)
+            open_button.setEnabled(False)
             try:
+                codec = encoding.currentData()
+                if codec != sample_encoding:
+                    sample = read_format_sample(path, codec)
+                    sample_encoding = codec
+                quote_char = quote.text()
+                if not manual_delimiter and len(quote_char) == 1 and " " <= quote_char <= "~":
+                    suggested = detect_delimiter(sample, fallback, quote=quote_char)
+                    with QSignalBlocker(delimiter):
+                        delimiter.setCurrentIndex(delimiter.findData(suggested))
                 fmt = current_format()
-            except ValueError as exc:
-                open_button.setEnabled(False)
-                model.replace([], [])
-                status.setText(str(exc))
-                return
-            open_button.setEnabled(True)
-            try:
                 headers, rows = preview_format(sample, fmt)
+                open_button.setEnabled(True)
                 width = max([len(headers), *(len(row) for row in rows)])
                 headers += [""] * (width - len(headers))
                 model.replace(headers, [tuple(row + [""] * (width - len(row))) for row in rows])
@@ -467,11 +492,13 @@ class MainWindow(QMainWindow):
                     if headers
                     else "No complete records in the preview sample."
                 )
-            except (csv.Error, ValueError) as exc:
+            except (csv.Error, OSError, ValueError) as exc:
                 model.replace([], [])
                 status.setText(str(exc))
 
-        delimiter.currentIndexChanged.connect(refresh)
+        delimiter.currentIndexChanged.connect(choose_delimiter)
+        encoding.currentIndexChanged.connect(refresh)
+        quote.textChanged.connect(refresh)
         custom.textChanged.connect(refresh)
         header.toggled.connect(refresh)
         refresh()

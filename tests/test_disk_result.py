@@ -82,3 +82,19 @@ def test_csv_blocks_keep_quoted_multiline_records_together():
     records = [b"id,text\r\n", b'001,"a\n\n\nb""c"\r\n', b"002,z"]
     blocks = list(csv_blocks(BytesIO(b"".join(records)), Cancellation(), block_bytes=5))
     assert blocks == records
+
+
+def test_custom_quote_blocks_ignore_apostrophes_in_unquoted_fields():
+    from io import BytesIO
+
+    from csv_workbench.core import csv_blocks
+
+    records = [b"1;O'Brien\n", b"2;'multi\nline and ''quoted'''\n", b"3;other\n"]
+    for size in range(1, 35):
+        blocks = list(
+            csv_blocks(
+                BytesIO(b"".join(records)), Cancellation(), block_bytes=size, quote=b"'", delimiter=b";"
+            )
+        )
+        assert b"".join(blocks) == b"".join(records)
+        assert all(block.endswith(tuple(records)) for block in blocks)
