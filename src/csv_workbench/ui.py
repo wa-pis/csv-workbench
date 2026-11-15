@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionButton,
     QTableView,
+    QTabWidget,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -313,8 +314,9 @@ class CsvFormatFields:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, workspace=None):
         super().__init__()
+        self.workspace = workspace
         self.setWindowTitle("CSV Workbench")
         self.resize(960, 640)
         self.path: Path | None = None
@@ -329,6 +331,7 @@ class MainWindow(QMainWindow):
         self.page_job = None
         self.export_job = None
         self.save_job = None
+        self.write_destination = None
         self.view_job = None
         self.query_job = None
         self.sql_text = "SELECT * FROM csv_data"
@@ -393,6 +396,14 @@ class MainWindow(QMainWindow):
         self.save_session_action = session_menu.addAction("Save session…")
         self.save_session_action.triggered.connect(self.save_session_file)
         self.save_session_action.setEnabled(False)
+        if workspace is not None:
+            self.menuBar().setNativeMenuBar(False)
+            for action in (
+                self.save_action, self.save_as_action, self.undo_action, self.redo_action,
+                self.copy_action, self.paste_action, self.clear_action,
+            ):
+                self.addAction(action)
+                action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.selection_button = QPushButton("Selection…")
         self.selection_button.setEnabled(False)
         self.selection_button.clicked.connect(self.edit_selection)
@@ -482,8 +493,8 @@ class MainWindow(QMainWindow):
                 label = f"★ {label}"
             self.recent_menu.addAction(
                 label,
-                lambda checked=False, entry=entry: self.load_view(
-                    entry.path, Selection(), new_file=True, fmt=entry.format
+                lambda checked=False, entry=entry: self.open_document(
+                    entry.path, Selection(), entry.format
                 ),
             )
 
@@ -568,7 +579,13 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Open CSV", str(exc))
             return
         if fmt is not None:
-            self.load_view(path, Selection(), new_file=True, fmt=fmt)
+            self.open_document(path, Selection(), fmt)
+
+    def open_document(self, path, selection, fmt):
+        if self.workspace is not None:
+            self.workspace.open_document(path, selection, fmt)
+        else:
+            self.load_view(path, selection, new_file=True, fmt=fmt)
 
     @staticmethod
     def dropped_csv(event):
@@ -821,7 +838,7 @@ class MainWindow(QMainWindow):
         if filename:
             try:
                 path, selection, fmt = load_session(Path(filename))
-                self.load_view(path, selection, new_file=True, fmt=fmt)
+                self.open_document(path, selection, fmt)
             except (OSError, ValueError) as exc:
                 QMessageBox.critical(self, "Open session", str(exc))
 
@@ -876,6 +893,9 @@ class MainWindow(QMainWindow):
                 )
         elif not self.dirty:
             return
+        if self.workspace and self.workspace.destination_busy(destination, except_document=self):
+            QMessageBox.warning(self, "Save CSV", "The destination is open or being written in another tab.")
+            return
         if self.page_job is not None:
             self.page_job[0].cancel()
             self.page_job[1].cancel()
@@ -909,6 +929,7 @@ class MainWindow(QMainWindow):
                 scratch.cleanup()
                 raise
 
+        self.write_destination = destination
         self.save_job = self.submit(save)
         self.poll.start()
         self.update_status()
@@ -1077,7 +1098,7 @@ class MainWindow(QMainWindow):
         return fields.value() if dialog.exec() else None
 
     def save_selection(self):
-        if self.path is None or self.export_job is not None:
+        if self.path is None or self.export_job is not None or self.save_job is not None:
             return
         output_format = self.configure_export_format()
         if output_format is None:
@@ -1092,6 +1113,10 @@ class MainWindow(QMainWindow):
         )
         if destination:
             destination = Path(destination)
+            if self.workspace and self.workspace.destination_busy(destination, except_document=self):
+                QMessageBox.warning(self, "Export CSV", "The destination is open or being written in another tab.")
+                return
+            self.write_destination = destination
             self.export_button.setEnabled(False)
             self.export_edits = self.model.edits.copy()
             snapshot, path, revision, selection, edits = (
@@ -1598,6 +1623,8 @@ class MainWindow(QMainWindow):
                 continue
             token, future = job
             setattr(self, name, None)
+            if name in ("export_job", "save_job"):
+                self.write_destination = None
             try:
                 result = future.result()
                 if name not in ("export_job", "save_job"):
@@ -1637,6 +1664,8 @@ class MainWindow(QMainWindow):
         self.update_status()
         if not self.cancel_button.isEnabled():
             self.poll.stop()
+        if self.workspace is not None and self.path is None and self.view_job is None:
+            self.workspace.discard_empty_tab(self)
 
     def update_edit_actions(self):
         self.copy_action.setEnabled(self.path is not None)
@@ -1717,11 +1746,16 @@ class MainWindow(QMainWindow):
             f" • Buffered: {len(self.model.rows):,}{progress}"
         )
 
+        if self.workspace is not None:
+            self.workspace.update_document_tab(self)
+
     def confirm_discard_edits(self):
         if not self.dirty and self.pending_history is None:
             return True
         return (
-            QMessageBox.question(self, "Unsaved edits", "Discard unsaved changes to the CSV?")
+            QMessageBox.question(
+                self, "Unsaved edits", f"Discard unsaved changes to {self.path.name if self.path else 'the CSV'}?"
+            )
             == QMessageBox.StandardButton.Yes
         )
 
@@ -1729,10 +1763,132 @@ class MainWindow(QMainWindow):
         if not self.confirm_discard_edits():
             event.ignore()
             return
+        self.shutdown_document()
+        super().closeEvent(event)
+
+    def shutdown_document(self):
         self.cancel_operations()
         self.poll.stop()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.result = None
         self.view_job = None
         self.page_job = None
+
+
+class WorkspaceWindow(QWidget):
+    """Keep each CSV's view, jobs and edit history alive in its own tab."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("CSV Workbench")
+        self.setAcceptDrops(True)
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.currentChanged.connect(self.update_title)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.tabs)
+        self.add_document_tab()
+
+    def add_document_tab(self):
+        document = MainWindow(workspace=self)
+        self.tabs.addTab(document, "New tab")
+        self.tabs.setCurrentWidget(document)
+        return document
+
+    def documents(self):
+        return [self.tabs.widget(index) for index in range(self.tabs.count())]
+
+    @staticmethod
+    def path_identity(path):
+        try:
+            return path.resolve()
+        except (OSError, RuntimeError):
+            return path.absolute()
+
+    def document_for_path(self, path):
+        path = self.path_identity(path)
+        for document in self.documents():
+            candidate = document.path
+            if candidate is None and document.view_job is not None:
+                candidate = document.view_request[0]
+            if candidate is not None and self.path_identity(candidate) == path:
+                return document
+        return None
+
+    def writing_document(self, path):
+        path = self.path_identity(path)
+        for document in self.documents():
+            if document.write_destination is not None and self.path_identity(document.write_destination) == path:
+                return document
+        return None
+
+    def destination_busy(self, path, *, except_document):
+        return any(
+            document is not None and document is not except_document
+            for document in (self.document_for_path(path), self.writing_document(path))
+        )
+
+    def open_document(self, path, selection, fmt):
+        document = self.document_for_path(path)
+        if document is not None:
+            self.tabs.setCurrentWidget(document)
+            return
+        if self.writing_document(path) is not None:
+            QMessageBox.warning(self, "Open CSV", "Wait for the write to finish before opening this file.")
+            return
+        document = self.tabs.currentWidget()
+        if document.path is not None or document.view_job is not None:
+            document = self.add_document_tab()
+        document.load_view(path, selection, new_file=True, fmt=fmt)
+
+    def update_document_tab(self, document):
+        index = self.tabs.indexOf(document)
+        if index < 0:
+            return
+        path = document.path
+        if path is None and document.view_job is not None:
+            path = document.view_request[0]
+        label = path.name if path is not None else "New tab"
+        if document.dirty or document.pending_history is not None:
+            label += " *"
+        self.tabs.setTabText(index, label.replace("&", "&&"))
+        self.tabs.setTabToolTip(index, str(path) if path is not None else "")
+        if self.tabs.currentWidget() is document:
+            self.update_title()
+
+    def update_title(self):
+        document = self.tabs.currentWidget()
+        path = document.path if document is not None else None
+        self.setWindowTitle(f"CSV Workbench — {path.name}" if path else "CSV Workbench")
+
+    def discard_empty_tab(self, document):
+        if self.tabs.count() > 1 and self.tabs.indexOf(document) >= 0:
+            self.close_tab(self.tabs.indexOf(document))
+
+    def close_tab(self, index):
+        document = self.tabs.widget(index)
+        if document is not None and document.close():
+            self.tabs.removeTab(index)
+            document.deleteLater()
+            if not self.tabs.count():
+                self.add_document_tab()
+
+    def dragEnterEvent(self, event):
+        self.tabs.currentWidget().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        self.tabs.currentWidget().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        self.tabs.currentWidget().dropEvent(event)
+
+    def closeEvent(self, event):
+        documents = self.documents()
+        if not all(document.confirm_discard_edits() for document in documents):
+            event.ignore()
+            return
+        for document in documents:
+            document.shutdown_document()
         super().closeEvent(event)

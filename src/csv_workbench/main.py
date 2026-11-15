@@ -5,14 +5,14 @@ from tempfile import TemporaryDirectory
 from PySide6.QtWidgets import QApplication
 
 from csv_workbench.core import Selection, export_csv, prepare_result, read_page
-from csv_workbench.ui import MainWindow
+from csv_workbench.ui import WorkspaceWindow
 
 
 def main() -> int:
     smoke = sys.argv[1:] == ["--smoke-test"]
     app = QApplication([sys.argv[0], "-platform", "offscreen"] if smoke else sys.argv)
     app.setApplicationName("CSV Workbench")
-    window = MainWindow()
+    window = WorkspaceWindow()
     window.resize(1100, 720)
     window.show()
     if smoke:
