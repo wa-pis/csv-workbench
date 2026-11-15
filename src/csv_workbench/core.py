@@ -440,12 +440,34 @@ def query_csv(path: Path, sql: str, *, fmt=CsvFormat(), cancel: Cancellation | N
         return page_result(cursor)
 
 
+def write_csv_rows(cursor, output, fmt, cancel, *, skip=0):
+    count = 0
+    with output.open("w", encoding=fmt.encoding or "utf-8", newline="") as handle:
+        writer = csv.writer(
+            handle,
+            delimiter=fmt.delimiter,
+            quotechar=fmt.quote,
+            quoting=csv.QUOTE_NOTNULL,
+            lineterminator="\r\n",
+        )
+        if fmt.header:
+            writer.writerow([column[0] for column in cursor.description[skip:]])
+        while batch := cursor.fetchmany(1024):
+            cancel.check()
+            for row in batch:
+                values = row[skip:]
+                writer.writerow(("",) if values == (None,) else values)
+            count += len(batch)
+    return count
+
+
 def export_csv(
     path: Path,
     destination: Path,
     selection: Selection,
     *,
     fmt=CsvFormat(),
+    output_format=CsvFormat(),
     cancel: Cancellation | None = None,
 ) -> int:
     cancel = cancel or Cancellation()
@@ -460,11 +482,16 @@ def export_csv(
         with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
             sql, params = selection_query(connection, decoded, selection, fmt)
             cancel.check()
-            # DuckDB binds the COPY destination before the inner query parameters.
-            count = connection.execute(
-                f"COPY ({sql}) TO ? (FORMAT CSV, HEADER true, COMPRESSION none)",
-                [str(output), *params],
-            ).fetchone()[0]
+            if output_format == CsvFormat():
+                # Keep the native streaming writer for the default format.
+                count = connection.execute(
+                    f"COPY ({sql}) TO ? (FORMAT CSV, HEADER true, COMPRESSION none)",
+                    [str(output), *params],
+                ).fetchone()[0]
+            else:
+                count = write_csv_rows(
+                    connection.execute(sql, params), output, output_format, cancel
+                )
         cancel.publish(output, destination)
     return count
 
@@ -485,6 +512,7 @@ def export_edited_csv(
     save=False,
     document=None,
     fmt=CsvFormat(),
+    output_format=CsvFormat(),
 ):
     cancel = cancel or Cancellation()
     source = path.resolve(strict=True)
@@ -506,24 +534,9 @@ def export_edited_csv(
         output = Path(scratch) / "edited.csv"
         with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
             sql, params = editable_query(connection, decoded, selection, edits, fmt)
-            cursor = connection.execute(sql, params)
-            count = 0
-            with output.open("w", encoding=(fmt.encoding if save else None) or "utf-8", newline="") as handle:
-                writer = csv.writer(
-                    handle,
-                    delimiter=fmt.delimiter if save else ",",
-                    quotechar=fmt.quote if save else '"',
-                    quoting=csv.QUOTE_NOTNULL,
-                    lineterminator="\r\n",
-                )
-                if not save or fmt.header:
-                    writer.writerow([column[0] for column in cursor.description[1:]])
-                while batch := cursor.fetchmany(1024):
-                    cancel.check()
-                    for row in batch:
-                        values = row[1:]
-                        writer.writerow(("",) if values == (None,) else values)
-                        count += 1
+            count = write_csv_rows(
+                connection.execute(sql, params), output, fmt if save else output_format, cancel, skip=1
+            )
         if save and destination.exists():
             output.chmod(destination.stat().st_mode & 0o777)
         check_source()

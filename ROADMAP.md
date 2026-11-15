@@ -37,4 +37,6 @@ v0.1: запланированные этапы закрыты. [GitHub Actions]
 
 Ручной выбор кодировки и символа кавычек: [`csv-encoding-and-quote`](openspec/changes/archive/2026-11-15-csv-encoding-and-quote/proposal.md) закрыт.
 
+Настройки формата экспорта CSV/TSV: [`configure-csv-export`](openspec/changes/archive/2026-11-15-configure-csv-export/proposal.md) закрыт.
+
 Roadmap задаёт порядок и критерии готовности. Каждый этап начинается с предложения, сценариев, дизайна и списка задач в `openspec/changes/`. После реализации и проверки изменение архивируется, а согласованное поведение попадает в `openspec/specs/`.

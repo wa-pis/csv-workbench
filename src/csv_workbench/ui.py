@@ -242,6 +242,50 @@ class CsvHeader(QHeaderView):
             self.filterRequested.emit(section)
 
 
+class CsvFormatFields:
+    def __init__(self, form, *, exporting=False):
+        delimiter = QComboBox()
+        for label, value in (("Comma (,)", ","), ("Semicolon (;)", ";"), ("Tab (TSV)", "\t")):
+            delimiter.addItem(label, value)
+        delimiter.addItem("Custom…")
+        custom = QLineEdit()
+        custom.setPlaceholderText("One ASCII character, e.g. |")
+        encoding = QComboBox()
+        for label, codec in CSV_ENCODINGS.items():
+            if exporting:
+                label = {"Auto": "UTF-8", "UTF-8": "UTF-8 with BOM"}.get(label, label)
+            encoding.addItem(label, codec)
+        quote = QLineEdit('"')
+        quote.setPlaceholderText("One ASCII character")
+        header = QCheckBox("Include column names" if exporting else "First record contains column names")
+        header.setChecked(True)
+        form.addRow("Delimiter", delimiter)
+        form.addRow("Custom delimiter", custom)
+        form.addRow("Encoding", encoding)
+        form.addRow("Quote character", quote)
+        form.addRow(header)
+        self.delimiter = delimiter
+        self.custom = custom
+        self.encoding = encoding
+        self.quote = quote
+        self.header = header
+
+        def show_custom():
+            form.setRowVisible(custom, delimiter.currentData() is None)
+
+        delimiter.currentIndexChanged.connect(show_custom)
+        show_custom()
+
+    def value(self):
+        value = self.delimiter.currentData()
+        return CsvFormat(
+            self.custom.text() if value is None else value,
+            self.header.isChecked(),
+            self.encoding.currentData(),
+            self.quote.text(),
+        )
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -415,28 +459,11 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle(f"File format — {path.name}")
         dialog.resize(680, 350)
         form = QFormLayout(dialog)
-        delimiter = QComboBox()
-        for label, value in (("Comma (,)", ","), ("Semicolon (;)", ";"), ("Tab (TSV)", "\t")):
-            delimiter.addItem(label, value)
-        delimiter.addItem("Custom…")
-        custom = QLineEdit()
-        custom.setPlaceholderText("One ASCII character, e.g. |")
-        encoding = QComboBox()
-        for label, codec in CSV_ENCODINGS.items():
-            encoding.addItem(label, codec)
-        quote = QLineEdit('"')
-        quote.setPlaceholderText("One ASCII character")
+        fields = CsvFormatFields(form)
         sample = None
         sample_encoding = object()
         manual_delimiter = False
         fallback = "\t" if path.suffix.lower() == ".tsv" else ","
-        header = QCheckBox("First record contains column names")
-        header.setChecked(True)
-        form.addRow("Delimiter", delimiter)
-        form.addRow("Custom delimiter", custom)
-        form.addRow("Encoding", encoding)
-        form.addRow("Quote character", quote)
-        form.addRow(header)
         table = QTableView(dialog)
         model = PageModel()
         model.setParent(table)
@@ -452,15 +479,6 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
 
-        def current_format():
-            value = delimiter.currentData()
-            return CsvFormat(
-                custom.text() if value is None else value,
-                header.isChecked(),
-                encoding.currentData(),
-                quote.text(),
-            )
-
         def choose_delimiter():
             nonlocal manual_delimiter
             manual_delimiter = True
@@ -468,20 +486,19 @@ class MainWindow(QMainWindow):
 
         def refresh():
             nonlocal sample, sample_encoding
-            form.setRowVisible(custom, delimiter.currentData() is None)
             open_button = buttons.button(QDialogButtonBox.StandardButton.Open)
             open_button.setEnabled(False)
             try:
-                codec = encoding.currentData()
+                codec = fields.encoding.currentData()
                 if codec != sample_encoding:
                     sample = read_format_sample(path, codec)
                     sample_encoding = codec
-                quote_char = quote.text()
+                quote_char = fields.quote.text()
                 if not manual_delimiter and len(quote_char) == 1 and " " <= quote_char <= "~":
                     suggested = detect_delimiter(sample, fallback, quote=quote_char)
-                    with QSignalBlocker(delimiter):
-                        delimiter.setCurrentIndex(delimiter.findData(suggested))
-                fmt = current_format()
+                    with QSignalBlocker(fields.delimiter):
+                        fields.delimiter.setCurrentIndex(fields.delimiter.findData(suggested))
+                fmt = fields.value()
                 headers, rows = preview_format(sample, fmt)
                 open_button.setEnabled(True)
                 width = max([len(headers), *(len(row) for row in rows)])
@@ -496,13 +513,13 @@ class MainWindow(QMainWindow):
                 model.replace([], [])
                 status.setText(str(exc))
 
-        delimiter.currentIndexChanged.connect(choose_delimiter)
-        encoding.currentIndexChanged.connect(refresh)
-        quote.textChanged.connect(refresh)
-        custom.textChanged.connect(refresh)
-        header.toggled.connect(refresh)
+        fields.delimiter.currentIndexChanged.connect(choose_delimiter)
+        fields.encoding.currentIndexChanged.connect(refresh)
+        fields.quote.textChanged.connect(refresh)
+        fields.custom.textChanged.connect(refresh)
+        fields.header.toggled.connect(refresh)
         refresh()
-        return current_format() if dialog.exec() else None
+        return fields.value() if dialog.exec() else None
 
     def open_session_file(self):
         filename, _ = QFileDialog.getOpenFileName(
@@ -733,16 +750,54 @@ class MainWindow(QMainWindow):
             }
         )
 
+    def configure_export_format(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("CSV / TSV export format")
+        form = QFormLayout(dialog)
+        fields = CsvFormatFields(form, exporting=True)
+        status = QLabel()
+        status.setWordWrap(True)
+        form.addRow(status)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        save = buttons.button(QDialogButtonBox.StandardButton.Save)
+
+        def validate():
+            try:
+                fields.value()
+            except ValueError as exc:
+                status.setText(str(exc))
+                save.setEnabled(False)
+            else:
+                status.clear()
+                save.setEnabled(True)
+
+        fields.delimiter.currentIndexChanged.connect(validate)
+        fields.custom.textChanged.connect(validate)
+        fields.quote.textChanged.connect(validate)
+        validate()
+        return fields.value() if dialog.exec() else None
+
     def save_selection(self):
         if self.path is None or self.export_job is not None:
             return
+        output_format = self.configure_export_format()
+        if output_format is None:
+            return
+        tsv = output_format.delimiter == "\t"
+        extension = ".tsv" if tsv else ".csv"
         destination, _ = QFileDialog.getSaveFileName(
             self,
             "Export CSV",
-            str(self.path.with_name(f"{self.path.stem}-selection.csv")),
-            "CSV (*.csv)",
+            str(self.path.with_name(f"{self.path.stem}-selection{extension}")),
+            "TSV (*.tsv)" if tsv else "CSV (*.csv)",
         )
         if destination:
+            destination = Path(destination)
             self.export_button.setEnabled(False)
             self.export_edits = self.model.edits.copy()
             snapshot, path, revision, selection, edits = (
@@ -759,19 +814,20 @@ class MainWindow(QMainWindow):
                     base = Path(snapshot.name) / "source.csv" if snapshot else path
                     return export_edited_csv(
                         base,
-                        Path(destination),
+                        destination,
                         edits,
                         revision,
                         selection,
                         document=path,
                         fmt=fmt,
+                        output_format=output_format,
                         cancel=cancel,
                     )
 
                 self.export_job = self.submit(export)
             else:
                 self.export_job = self.submit(
-                    export_csv, self.path, Path(destination), self.selection, fmt=fmt
+                    export_csv, path, destination, selection, fmt=fmt, output_format=output_format
                 )
             self.poll.start()
             self.update_status()

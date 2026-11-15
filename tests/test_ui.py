@@ -236,13 +236,15 @@ def test_column_header_actions_filter_and_sort_full_csv(tmp_path, monkeypatch):
 
 
 def test_edit_sorted_filtered_cell_updates_view_and_export(tmp_path, monkeypatch):
-    from csv_workbench.core import Selection, read_page
+    from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QLineEdit
+
+    from csv_workbench.core import CsvFormat, Selection, read_page
 
     app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
     source = tmp_path / "data.csv"
     original = "id,label,group\n1,b,yes\n2,a,yes\n3,c,no\n4,d,yes\n"
     source.write_text(original, encoding="utf-8")
-    output = tmp_path / "edited.csv"
+    output = tmp_path / "edited.tsv"
     selection = Selection((("group", "yes"),), "label", False, ("label", "group"))
     window = MainWindow()
 
@@ -261,11 +263,33 @@ def test_edit_sorted_filtered_cell_updates_view_and_export(tmp_path, monkeypatch
         finish()
         assert window.model.rows == [("d", "yes"), ("z", "yes")]
 
-        monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(output), ""))
+        def configure_export(dialog):
+            delimiter, encoding = dialog.findChildren(QComboBox)
+            _, quote = dialog.findChildren(QLineEdit)
+            include_header = dialog.findChild(QCheckBox)
+            save = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Save)
+            delimiter.setCurrentIndex(delimiter.findText("Custom…"))
+            assert not save.isEnabled()
+            delimiter.setCurrentIndex(delimiter.findData("\t"))
+            encoding.setCurrentIndex(encoding.findData("utf-16"))
+            quote.setText("'")
+            include_header.setChecked(False)
+            assert save.isEnabled()
+            return QDialog.DialogCode.Accepted
+
+        def choose_destination(_, title, suggestion, file_filter):
+            assert suggestion.endswith("-selection.tsv")
+            assert file_filter == "TSV (*.tsv)"
+            return str(output), file_filter
+
+        monkeypatch.setattr(QDialog, "exec", configure_export)
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", choose_destination)
         monkeypatch.setattr(QMessageBox, "information", lambda *_: None)
         window.save_selection()
         finish("export_job")
-        assert read_page(output, 0) == (["label", "group"], [("d", "yes"), ("z", "yes")], False)
+        fmt = CsvFormat("\t", False, "utf-16", "'")
+        assert read_page(output, 0, fmt=fmt)[1] == [("d", "yes"), ("z", "yes")]
+        assert output.read_text(encoding="utf-16").splitlines() == ["'d'\t'yes'", "'z'\t'yes'"]
         assert window.dirty
         window.undo_action.trigger()
         finish()
