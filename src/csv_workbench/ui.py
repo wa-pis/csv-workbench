@@ -15,6 +15,7 @@ from PySide6.QtCore import (
     QModelIndex,
     QPoint,
     QRect,
+    QSettings,
     QSignalBlocker,
     Qt,
     QTimer,
@@ -74,6 +75,7 @@ from csv_workbench.core import (
     save_csv,
     selection_sql,
 )
+from csv_workbench.presets import FormatPresets
 from csv_workbench.session import load_session, save_session
 
 MISSING = object()
@@ -273,8 +275,25 @@ class CsvFormatFields:
         def show_custom():
             form.setRowVisible(custom, delimiter.currentData() is None)
 
+        self.show_custom = show_custom
         delimiter.currentIndexChanged.connect(show_custom)
         show_custom()
+
+    def apply(self, fmt):
+        index = self.delimiter.findData(fmt.delimiter)
+        with (
+            QSignalBlocker(self.delimiter),
+            QSignalBlocker(self.custom),
+            QSignalBlocker(self.encoding),
+            QSignalBlocker(self.quote),
+            QSignalBlocker(self.header),
+        ):
+            self.custom.setText(fmt.delimiter if index < 0 else "")
+            self.delimiter.setCurrentIndex(index if index >= 0 else self.delimiter.findData(None))
+            self.encoding.setCurrentIndex(self.encoding.findData(fmt.encoding))
+            self.quote.setText(fmt.quote)
+            self.header.setChecked(fmt.header)
+        self.show_custom()
 
     def value(self):
         value = self.delimiter.currentData()
@@ -454,6 +473,50 @@ class MainWindow(QMainWindow):
             if fmt is not None:
                 self.load_view(path, Selection(), new_file=True, fmt=fmt)
 
+    def add_format_presets(self, form, fields, refresh, *, exporting=False):
+        dialog = form.parentWidget()
+        store = FormatPresets(QSettings("CSV Workbench", "CSV Workbench"), exporting=exporting)
+        combo = QComboBox()
+        combo.setObjectName("formatPresets")
+        save = QPushButton("Save Preset…")
+        row = QHBoxLayout()
+        row.addWidget(combo, 1)
+        row.addWidget(save)
+        form.insertRow(0, "Preset", row)
+
+        def populate(selected=None):
+            combo.clear()
+            combo.addItem("Choose a preset…")
+            for name, fmt in sorted(store.load().items(), key=lambda item: item[0].casefold()):
+                combo.addItem(name, fmt)
+                if name == selected:
+                    combo.setCurrentIndex(combo.count() - 1)
+
+        def apply_preset(index):
+            if fmt := combo.itemData(index):
+                fields.apply(fmt)
+                refresh()
+
+        def save_preset():
+            try:
+                fmt = fields.value()
+                name, accepted = QInputDialog.getText(dialog, "Save format preset", "Preset name:")
+                if not accepted:
+                    return
+                name = name.strip()
+                if name in store.load() and QMessageBox.question(
+                    dialog, "Replace preset", f"Replace the preset “{name}”?"
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+                store.save(name, fmt)
+                populate(name)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(dialog, "Format preset", str(exc))
+
+        populate()
+        combo.activated.connect(apply_preset)
+        save.clicked.connect(save_preset)
+
     def configure_format(self, path):
         dialog = QDialog(self)
         dialog.setWindowTitle(f"File format — {path.name}")
@@ -518,6 +581,7 @@ class MainWindow(QMainWindow):
         fields.quote.textChanged.connect(refresh)
         fields.custom.textChanged.connect(refresh)
         fields.header.toggled.connect(refresh)
+        self.add_format_presets(form, fields, choose_delimiter)
         refresh()
         return fields.value() if dialog.exec() else None
 
@@ -779,6 +843,7 @@ class MainWindow(QMainWindow):
         fields.delimiter.currentIndexChanged.connect(validate)
         fields.custom.textChanged.connect(validate)
         fields.quote.textChanged.connect(validate)
+        self.add_format_presets(form, fields, validate, exporting=True)
         validate()
         return fields.value() if dialog.exec() else None
 

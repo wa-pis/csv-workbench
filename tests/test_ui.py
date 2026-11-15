@@ -1,10 +1,22 @@
 from concurrent.futures import wait
 
-from PySide6.QtCore import QCoreApplication, QEvent, Qt
+import pytest
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from csv_workbench.ui import MainWindow
+
+
+@pytest.fixture
+def preset_settings(tmp_path, monkeypatch):
+    path = str(tmp_path / "format-settings.ini")
+
+    def settings(*_):
+        return QSettings(path, QSettings.Format.IniFormat)
+
+    monkeypatch.setattr("csv_workbench.ui.QSettings", settings)
+    return settings()
 
 
 def test_open_and_load_more(tmp_path, monkeypatch):
@@ -235,7 +247,7 @@ def test_column_header_actions_filter_and_sort_full_csv(tmp_path, monkeypatch):
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def test_edit_sorted_filtered_cell_updates_view_and_export(tmp_path, monkeypatch):
+def test_edit_sorted_filtered_cell_updates_view_and_export(tmp_path, monkeypatch, preset_settings):
     from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QLineEdit
 
     from csv_workbench.core import CsvFormat, Selection, read_page
@@ -264,7 +276,7 @@ def test_edit_sorted_filtered_cell_updates_view_and_export(tmp_path, monkeypatch
         assert window.model.rows == [("d", "yes"), ("z", "yes")]
 
         def configure_export(dialog):
-            delimiter, encoding = dialog.findChildren(QComboBox)
+            delimiter, encoding = dialog.findChildren(QComboBox)[:2]
             _, quote = dialog.findChildren(QLineEdit)
             include_header = dialog.findChild(QCheckBox)
             save = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Save)
@@ -402,7 +414,9 @@ def test_range_and_row_history_survives_save(tmp_path, monkeypatch):
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def test_open_format_dialog_updates_for_manual_encoding_quote_and_delimiter(tmp_path, monkeypatch):
+def test_open_format_dialog_updates_for_manual_encoding_quote_and_delimiter(
+    tmp_path, monkeypatch, preset_settings
+):
     from PySide6.QtWidgets import (
         QCheckBox,
         QComboBox,
@@ -420,7 +434,7 @@ def test_open_format_dialog_updates_for_manual_encoding_quote_and_delimiter(tmp_
     window = MainWindow()
 
     def configure(dialog):
-        delimiter, encoding = dialog.findChildren(QComboBox)
+        delimiter, encoding = dialog.findChildren(QComboBox)[:2]
         custom, quote = dialog.findChildren(QLineEdit)
         header = dialog.findChild(QCheckBox)
         model = dialog.findChild(QTableView).model()
@@ -450,6 +464,69 @@ def test_open_format_dialog_updates_for_manual_encoding_quote_and_delimiter(tmp_
         window.collect_reads()
         assert window.csv_format == CsvFormat("|", False, "utf-16-le", "'")
         assert window.model.rows == [("один;два", "2|3"), ("три;четыре", "4")]
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_format_dialogs_save_and_reapply_presets(tmp_path, monkeypatch, preset_settings):
+    from PySide6.QtWidgets import (
+        QCheckBox,
+        QComboBox,
+        QDialog,
+        QInputDialog,
+        QLineEdit,
+        QPushButton,
+        QTableView,
+    )
+
+    from csv_workbench.core import CsvFormat
+    from csv_workbench.presets import FormatPresets
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "report.txt"
+    source.write_bytes("001|'данные|здесь'\n".encode("cp1251"))
+    fmt = CsvFormat("|", False, "cp1251", "'")
+    FormatPresets(preset_settings).save("Report", fmt)
+
+    def use_open_preset(dialog):
+        combo = dialog.findChild(QComboBox, "formatPresets")
+        combo.setCurrentIndex(combo.findText("Report"))
+        combo.activated.emit(combo.currentIndex())
+        model = dialog.findChild(QTableView).model()
+        assert model.rows == [("001", "данные|здесь")]
+        return QDialog.DialogCode.Accepted
+
+    export_format = CsvFormat("\t", False, "utf-16", "^")
+
+    def save_and_load_export_preset(dialog):
+        delimiter, encoding, combo = dialog.findChildren(QComboBox)
+        _, quote = dialog.findChildren(QLineEdit)
+        header = dialog.findChild(QCheckBox)
+        assert combo.findText("Report") < 0
+        delimiter.setCurrentIndex(delimiter.findData("\t"))
+        encoding.setCurrentIndex(encoding.findData("utf-16"))
+        quote.setText("^")
+        header.setChecked(False)
+        next(b for b in dialog.findChildren(QPushButton) if b.text() == "Save Preset…").click()
+        delimiter.setCurrentIndex(delimiter.findData(","))
+        encoding.setCurrentIndex(0)
+        quote.setText('"')
+        header.setChecked(True)
+        combo.activated.emit(combo.currentIndex())
+        return QDialog.DialogCode.Accepted
+
+    window = MainWindow()
+    try:
+        monkeypatch.setattr(QDialog, "exec", use_open_preset)
+        assert window.configure_format(source) == fmt
+        monkeypatch.setattr(QInputDialog, "getText", lambda *_: ("TSV report", True))
+        monkeypatch.setattr(QDialog, "exec", save_and_load_export_preset)
+        assert window.configure_export_format() == export_format
+        assert FormatPresets(preset_settings, exporting=True).load() == {"TSV report": export_format}
     finally:
         window.close()
         window.executor.shutdown(wait=True)
