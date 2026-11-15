@@ -8,28 +8,71 @@ from tempfile import TemporaryDirectory
 from csv_workbench.core import CsvFormat, Selection
 
 
-def save_session(destination: Path, source: Path, selection: Selection, fmt=None) -> None:
-    source = source.resolve()
+def session_tab(source, selection, fmt):
+    return {"source": str(source.resolve()), "selection": asdict(selection), "format": asdict(fmt)}
+
+
+def write_session(destination, data, sources):
     if destination.suffix.lower() != ".csvsession":
         raise ValueError("Choose a .csvsession file.")
-    if destination.resolve() == source or (destination.exists() and destination.samefile(source)):
-        raise ValueError("Choose a destination other than the source CSV.")
-    data = {
-        "version": 1,
-        "source": str(source),
-        "selection": asdict(selection),
-        "format": asdict(fmt or CsvFormat()),
-    }
+    resolved = destination.resolve()
+    for source in sources:
+        if resolved == source.resolve() or (destination.exists() and destination.samefile(source)):
+            raise ValueError("Choose a destination other than the source CSV.")
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "session"
         output.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         output.replace(destination)
 
 
-def load_session(path: Path) -> tuple[Path, Selection, CsvFormat]:
+def save_session(destination: Path, source: Path, selection: Selection, fmt=None) -> None:
+    write_session(
+        destination, {"version": 1, **session_tab(source, selection, fmt or CsvFormat())}, [source]
+    )
+
+
+def save_workspace_session(destination, tabs, active):
+    if type(active) is not int or not 0 <= active < len(tabs):
+        raise ValueError("Invalid active tab in workspace session.")
+    write_session(
+        destination,
+        {"version": 2, "active": active, "tabs": [session_tab(*tab) for tab in tabs]},
+        [tab[0] for tab in tabs],
+    )
+
+
+def session_data(path):
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+    if not isinstance(data, dict) or type(data.get("version")) is not int:
         raise ValueError("Unsupported session format.")
+    return data
+
+
+def load_session(path: Path) -> tuple[Path, Selection, CsvFormat]:
+    data = session_data(path)
+    if data["version"] != 1:
+        raise ValueError("Unsupported session format.")
+    return parse_session_tab(data)
+
+
+def load_workspace_session(path):
+    data = session_data(path)
+    if data["version"] == 1:
+        return [parse_session_tab(data)], 0
+    if data["version"] != 2:
+        raise ValueError("Unsupported session format.")
+    tabs, active = data.get("tabs"), data.get("active")
+    if not isinstance(tabs, list) or type(active) is not int or not 0 <= active < len(tabs):
+        raise ValueError("Invalid tabs or active tab in workspace session.")
+    parsed = [parse_session_tab(tab) for tab in tabs]
+    if len({tab[0].resolve() for tab in parsed}) != len(parsed):
+        raise ValueError("Workspace session contains duplicate files.")
+    return parsed, active
+
+
+def parse_session_tab(data):
+    if not isinstance(data, dict):
+        raise ValueError("Invalid tab in workspace session.")  # noqa: TRY004
     source = data.get("source")
     if not isinstance(source, str) or not Path(source).is_absolute():
         raise ValueError("Session requires an absolute CSV path.")

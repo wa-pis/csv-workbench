@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QStyle,
@@ -84,7 +85,12 @@ from csv_workbench.recent import (
     remove_recent_file,
     set_file_pinned,
 )
-from csv_workbench.session import load_session, save_session
+from csv_workbench.session import (
+    load_session,
+    load_workspace_session,
+    save_session,
+    save_workspace_session,
+)
 
 MISSING = object()
 ROOT_INDEX = QModelIndex()
@@ -397,6 +403,9 @@ class MainWindow(QMainWindow):
         self.save_session_action.triggered.connect(self.save_session_file)
         self.save_session_action.setEnabled(False)
         if workspace is not None:
+            session_menu.addSeparator()
+            session_menu.addAction("Save workspace…", workspace.save_workspace_file)
+            session_menu.addAction("Restore workspace…", workspace.restore_workspace_file)
             self.menuBar().setNativeMenuBar(False)
             for action in (
                 self.save_action, self.save_as_action, self.undo_action, self.redo_action,
@@ -1495,7 +1504,9 @@ class MainWindow(QMainWindow):
                 self.count_job[0].cancel()
                 self.count_job[1].cancel()
             self.total_rows = None
-            self.count_job = self.submit(count_rows, path, fmt=fmt)
+            self.count_job = (
+                None if self.restoring_workspace else self.submit(count_rows, path, fmt=fmt)
+            )
             self.source_headers = (
                 source_headers
                 if source_headers is not None
@@ -1532,7 +1543,7 @@ class MainWindow(QMainWindow):
         self.table.scrollToTop()
         self.has_more = has_more
         self.setWindowTitle(f"CSV Workbench — {path.name}")
-        if new_file:
+        if new_file and not self.restoring_workspace:
             remember_file(self.settings, path, fmt)
 
     def load_at_edge(self, value: int):
@@ -1616,6 +1627,10 @@ class MainWindow(QMainWindow):
     def jobs(self):
         return tuple(getattr(self, name) for name in JOB_NAMES)
 
+    @property
+    def restoring_workspace(self):
+        return self.workspace is not None and self.workspace.restore_pending is self
+
     def collect_reads(self):
         for name in JOB_NAMES:
             job = getattr(self, name)
@@ -1625,6 +1640,7 @@ class MainWindow(QMainWindow):
             setattr(self, name, None)
             if name in ("export_job", "save_job"):
                 self.write_destination = None
+            restoring = name == "view_job" and self.restoring_workspace
             try:
                 result = future.result()
                 if name not in ("export_job", "save_job"):
@@ -1648,11 +1664,17 @@ class MainWindow(QMainWindow):
                 else:
                     QMessageBox.information(self, "Export CSV", f"Exported {result:,} rows.")
             except CancelledError:
+                if restoring:
+                    self.workspace.finish_restore("The workspace restore was cancelled.")
+                    return
                 if name == "view_job" and self.refreshing_edit:
                     self.rollback_edit()
                 if name == "count_job":
                     self.total_rows = "cancelled"
             except (duckdb.Error, OSError, ValueError) as exc:
+                if restoring:
+                    self.workspace.finish_restore(f"{self.view_request[0]}: {exc}")
+                    return
                 if name == "view_job" and self.refreshing_edit:
                     self.rollback_edit()
                 if name == "count_job":
@@ -1661,6 +1683,10 @@ class MainWindow(QMainWindow):
                     if name == "page_job":
                         self.has_more = False
                     QMessageBox.critical(self, "CSV Workbench", str(exc))
+            if restoring:
+                self.poll.stop()
+                self.workspace.restore_next_tab()
+                return
         self.update_status()
         if not self.cancel_button.isEnabled():
             self.poll.stop()
@@ -1784,8 +1810,11 @@ class WorkspaceWindow(QWidget):
         self.setAcceptDrops(True)
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.restore_pending = None
+        self.restore_progress = None
         self.tabs.tabCloseRequested.connect(self.close_tab)
-        self.tabs.currentChanged.connect(self.update_title)
+        self.tabs.currentChanged.connect(self.activate_document)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.tabs)
@@ -1843,6 +1872,106 @@ class WorkspaceWindow(QWidget):
             document = self.add_document_tab()
         document.load_view(path, selection, new_file=True, fmt=fmt)
 
+    def save_workspace_file(self):
+        documents = self.documents()
+        if any(document.view_job or document.save_job for document in documents):
+            QMessageBox.warning(self, "Save workspace", "Wait for the tabs to finish loading or saving.")
+            return
+        documents = [document for document in documents if document.path is not None]
+        if not documents:
+            return
+        active = self.tabs.currentWidget()
+        if active not in documents:
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save workspace", "workspace.csvsession", "Session (*.csvsession)"
+        )
+        if filename:
+            destination = Path(filename)
+            if not destination.suffix:
+                destination = destination.with_suffix(".csvsession")
+            try:
+                tabs = [(doc.path, doc.selection, doc.csv_format) for doc in documents]
+                save_workspace_session(destination, tabs, documents.index(active))
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(self, "Save workspace", str(exc))
+
+    def restore_workspace_file(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Restore workspace", "", "Session (*.csvsession)"
+        )
+        if filename:
+            try:
+                self.restore_workspace(*load_workspace_session(Path(filename)))
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(self, "Restore workspace", str(exc))
+
+    def restore_workspace(self, tabs, active):
+        if self.restore_progress is not None:
+            return
+        documents = self.documents()
+        if any(document.write_destination is not None for document in documents):
+            QMessageBox.warning(self, "Restore workspace", "Wait for saves and exports to finish.")
+            return
+        if not all(document.confirm_discard_edits() for document in documents):
+            return
+        self.restore_progress = QProgressDialog("Opening tabs…", "Cancel", 0, 0, self)
+        self.restore_progress.setWindowTitle("Restore workspace")
+        self.restore_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.restore_progress.canceled.connect(lambda: self.finish_restore(cancelled=True))
+        self.restore_progress.show()
+        self.restore_active = active
+        self.restore_queue = iter(tabs)
+        self.restored_tabs = []
+        self.restore_next_tab()
+
+    def restore_next_tab(self):
+        if self.restore_pending is not None:
+            self.restored_tabs.append(self.restore_pending)
+            self.restore_pending = None
+        entry = next(self.restore_queue, None)
+        if entry is None:
+            self.finish_restore()
+            return
+        path, selection, fmt = entry
+        self.restore_progress.setLabelText(f"Opening {path.name}…")
+        document = MainWindow(workspace=self)
+        document.setParent(self)
+        self.restore_pending = document
+        document.load_view(path, selection, new_file=True, fmt=fmt)
+
+    def finish_restore(self, error=None, *, cancelled=False):
+        if self.restore_progress is None:
+            return
+        progress, self.restore_progress = self.restore_progress, None
+        progress.hide()
+        progress.deleteLater()
+        if error or cancelled:
+            if self.restore_pending is not None:
+                self.restored_tabs.append(self.restore_pending)
+            self.restore_pending = None
+            for document in self.restored_tabs:
+                document.shutdown_document()
+                document.deleteLater()
+            self.restored_tabs = []
+            if error:
+                QMessageBox.critical(self, "Restore workspace", error)
+            return
+        old_documents = self.documents()
+        with QSignalBlocker(self.tabs):
+            self.tabs.clear()
+            for document in self.restored_tabs:
+                self.tabs.addTab(document, "")
+            self.tabs.setCurrentIndex(self.restore_active)
+        for document in old_documents:
+            document.shutdown_document()
+            document.deleteLater()
+        for document in reversed(self.restored_tabs):
+            remember_file(document.settings, document.path, document.csv_format)
+            document.update_status()
+        self.restored_tabs = []
+        self.activate_document()
+
     def update_document_tab(self, document):
         index = self.tabs.indexOf(document)
         if index < 0:
@@ -1857,6 +1986,17 @@ class WorkspaceWindow(QWidget):
         self.tabs.setTabToolTip(index, str(path) if path is not None else "")
         if self.tabs.currentWidget() is document:
             self.update_title()
+
+    def activate_document(self):
+        document = self.tabs.currentWidget()
+        if (
+            document is not None and document.path is not None
+            and document.total_rows is None and document.count_job is None
+        ):
+            document.count_job = document.submit(count_rows, document.path, fmt=document.csv_format)
+            document.poll.start()
+            document.update_status()
+        self.update_title()
 
     def update_title(self):
         document = self.tabs.currentWidget()
@@ -1885,6 +2025,7 @@ class WorkspaceWindow(QWidget):
         self.tabs.currentWidget().dropEvent(event)
 
     def closeEvent(self, event):
+        self.finish_restore(cancelled=True)
         documents = self.documents()
         if not all(document.confirm_discard_edits() for document in documents):
             event.ignore()

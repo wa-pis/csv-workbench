@@ -117,3 +117,63 @@ def test_failed_open_removes_only_the_new_tab(tmp_path, monkeypatch, workspace):
     pending.collect_reads()
     assert errors and workspace.documents() == [active]
     assert active.model.rows == [("1",)]
+
+
+def test_workspace_session_restores_tab_order_active_and_views(tmp_path, monkeypatch, workspace):
+    first = tmp_path / "first.csv"
+    first.write_text("id;label\n1;keep a\n2;keep z\n3;hide\n", encoding="utf-8")
+    second = tmp_path / "second.tsv"
+    second.write_text("id\tlabel\n9\tother\n", encoding="utf-8")
+    first_fmt, second_fmt = CsvFormat(";"), CsvFormat("\t")
+    selection = Selection((("label", "keep"),), "label", True, ("id", "label"))
+    for path, view, fmt in ((first, selection, first_fmt), (second, Selection(), second_fmt)):
+        workspace.open_document(path, view, fmt)
+        finish_view(workspace.tabs.currentWidget())
+    workspace.tabs.tabBar().moveTab(1, 0)
+    workspace.tabs.setCurrentIndex(1)
+    session = tmp_path / "workspace.csvsession"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(session), ""))
+    workspace.save_workspace_file()
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (str(session), ""))
+    old = workspace.documents()
+    workspace.restore_workspace_file()
+    assert workspace.documents() == old
+    while workspace.restore_pending is not None:
+        finish_view(workspace.restore_pending)
+    second_doc, first_doc = workspace.documents()
+    assert (second_doc.path, first_doc.path) == (second.resolve(), first.resolve())
+    assert workspace.tabs.currentWidget() is first_doc
+    assert first_doc.selection == selection
+    assert first_doc.csv_format == first_fmt and second_doc.csv_format == second_fmt
+    assert first_doc.model.rows == [("2", "keep z"), ("1", "keep a")]
+    assert first_doc.model.editable
+    assert second_doc.model.rows == [("9", "other")]
+
+
+def test_failed_workspace_restore_keeps_current_tabs_and_edits(tmp_path, monkeypatch, workspace):
+    from concurrent.futures import wait
+
+    path = tmp_path / "existing.csv"
+    path.write_text("id\n1\n", encoding="utf-8")
+    workspace.open_document(path, Selection(), CsvFormat())
+    current = workspace.tabs.currentWidget()
+    finish_view(current)
+    assert current.model.setData(current.model.index(0, 0), "2")
+    assert current.dirty
+    tabs = [(path, Selection(), CsvFormat()), (tmp_path / "missing.csv", Selection(), CsvFormat())]
+    monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.No)
+    workspace.restore_workspace(tabs, 0)
+    assert workspace.restore_pending is None
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+    errors = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args[-1]))
+    workspace.restore_workspace(tabs, 0)
+    finish_view(workspace.restore_pending)
+    pending = workspace.restore_pending
+    wait([pending.view_job[1]], timeout=5)
+    pending.collect_reads()
+    assert workspace.restore_pending is None and errors and "missing.csv" in errors[0]
+    assert workspace.documents() == [current]
+    assert current.model.data(current.model.index(0, 0)) == "2" and current.dirty

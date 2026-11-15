@@ -31,3 +31,45 @@ def test_session_cannot_overwrite_source(tmp_path):
     with pytest.raises(ValueError, match="other than the source"):
         save_session(source, source, Selection())
     assert source.read_text(encoding="utf-8") == "id\n001\n"
+
+
+def test_workspace_session_round_trips_order_and_active_tab(tmp_path):
+    from csv_workbench.session import load_workspace_session, save_workspace_session
+
+    first = tmp_path / "input.csv"
+    second = tmp_path / "input.tsv"
+    path = tmp_path / "workspace.csvsession"
+    selection = Selection(
+        (("city", "Москва"), ("flag", "yes")), "city", True, ("city",), True, (("id", False),)
+    )
+    tabs = [
+        (second, selection, CsvFormat("\t", False, "cp1251", "'")),
+        (first, Selection(), CsvFormat(";")),
+    ]
+    save_workspace_session(path, tabs, 1)
+    assert load_workspace_session(path) == (
+        [(source.resolve(), view, fmt) for source, view, fmt in tabs],
+        1,
+    )
+
+    legacy = tmp_path / "legacy.csvsession"
+    save_session(legacy, first, selection)
+    assert load_workspace_session(legacy) == ([(first.resolve(), selection, CsvFormat())], 0)
+
+
+@pytest.mark.parametrize("invalid", ["active", "duplicate", "tab"])
+def test_workspace_session_rejects_invalid_documents(tmp_path, invalid):
+    from csv_workbench.session import load_workspace_session, save_workspace_session
+
+    path = tmp_path / "workspace.csvsession"
+    save_workspace_session(path, [(tmp_path / "source.csv", Selection(), CsvFormat())], 0)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if invalid == "active":
+        data["active"] = True
+    elif invalid == "duplicate":
+        data["tabs"].append(data["tabs"][0])
+    else:
+        data["tabs"].append(None)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_workspace_session(path)
