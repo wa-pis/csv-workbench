@@ -656,3 +656,74 @@ def test_manage_recent_files_controls_update_menu(tmp_path, monkeypatch, preset_
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.parametrize("accept", [True, False])
+def test_drop_tsv_opens_format_preview_before_loading(tmp_path, monkeypatch, accept):
+    from PySide6.QtCore import QMimeData, QPointF, QUrl
+    from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+    from PySide6.QtWidgets import QDialog, QTableView
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    path = tmp_path / "report.TSV"
+    path.write_text("id\tname\n001\tчай\n", encoding="utf-8")
+    window = MainWindow()
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(path))])
+    actions = Qt.DropAction.MoveAction | Qt.DropAction.CopyAction
+    start = QDragEnterEvent(QPointF(), actions, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    move = QDragMoveEvent(QPointF(), actions, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    drop = QDropEvent(QPointF(), actions, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+
+    def preview(dialog):
+        model = dialog.findChild(QTableView).model()
+        assert window.path is None
+        assert model.headers == ["id", "name"]
+        assert model.rows == [("001", "чай")]
+        return QDialog.DialogCode.Accepted if accept else QDialog.DialogCode.Rejected
+
+    try:
+        monkeypatch.setattr(QDialog, "exec", preview)
+        assert window.acceptDrops()
+        QApplication.sendEvent(window.table.viewport(), start)
+        QApplication.sendEvent(window.table.viewport(), move)
+        QApplication.sendEvent(window.table.viewport(), drop)
+        assert start.isAccepted() and move.isAccepted() and drop.isAccepted()
+        assert drop.dropAction() == Qt.DropAction.CopyAction
+        app.processEvents()
+        if not accept:
+            assert window.path is None and window.view_job is None
+            return
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.path == path
+        assert window.csv_format.delimiter == "\t"
+        assert window.model.rows == [("001", "чай")]
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.parametrize("kind", ["multiple", "remote", "directory", "unsupported", "move_only"])
+def test_drop_ignores_unsupported_payloads(tmp_path, kind):
+    from PySide6.QtCore import QMimeData, QPointF, QUrl
+    from PySide6.QtGui import QDropEvent
+
+    path = tmp_path / ("report.txt" if kind == "unsupported" else "report.csv")
+    if kind == "directory":
+        path.mkdir()
+    else:
+        path.touch()
+    urls = [QUrl.fromLocalFile(str(path))]
+    if kind == "multiple":
+        urls *= 2
+    if kind == "remote":
+        urls = [QUrl("https://example.com/report.csv")]
+    mime = QMimeData()
+    mime.setUrls(urls)
+    actions = Qt.DropAction.MoveAction if kind == "move_only" else Qt.DropAction.CopyAction
+    drop = QDropEvent(QPointF(), actions, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    assert MainWindow.dropped_csv(drop) is None

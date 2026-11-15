@@ -348,6 +348,7 @@ class MainWindow(QMainWindow):
         self.refreshing_edit = False
         root = QWidget()
         self.setCentralWidget(root)
+        self.setAcceptDrops(True)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -558,14 +559,48 @@ class MainWindow(QMainWindow):
             self, "Open CSV / TSV", "", "Delimited files (*.csv *.tsv);;All files (*)"
         )
         if name:
-            path = Path(name)
-            try:
-                fmt = self.configure_format(path)
-            except (OSError, ValueError) as exc:
-                QMessageBox.critical(self, "Open CSV", str(exc))
-                return
-            if fmt is not None:
-                self.load_view(path, Selection(), new_file=True, fmt=fmt)
+            self.open_with_format(Path(name))
+
+    def open_with_format(self, path):
+        try:
+            fmt = self.configure_format(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Open CSV", str(exc))
+            return
+        if fmt is not None:
+            self.load_view(path, Selection(), new_file=True, fmt=fmt)
+
+    @staticmethod
+    def dropped_csv(event):
+        urls = event.mimeData().urls()
+        if (
+            len(urls) == 1
+            and urls[0].isLocalFile()
+            and event.possibleActions() & Qt.DropAction.CopyAction
+        ):
+            path = Path(urls[0].toLocalFile())
+            if path.suffix.lower() in {".csv", ".tsv"} and path.is_file():
+                return path
+        return None
+
+    def dragEnterEvent(self, event):
+        if self.dropped_csv(event) is None:
+            event.ignore()
+        else:
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        if (path := self.dropped_csv(event)) is None:
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        # Open the modal dialog after Qt finishes handling the drop.
+        QTimer.singleShot(0, self, lambda: self.open_with_format(path))
 
     def add_format_presets(self, form, fields, refresh, *, exporting=False):
         dialog = form.parentWidget()
