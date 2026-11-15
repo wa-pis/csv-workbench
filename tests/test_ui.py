@@ -566,7 +566,7 @@ def test_format_dialogs_save_and_reapply_presets(tmp_path, monkeypatch, preset_s
 
 def test_open_recent_restores_saved_format_and_handles_missing_files(tmp_path, monkeypatch, preset_settings):
     from csv_workbench.core import CsvFormat, Selection
-    from csv_workbench.recent import recent_files
+    from csv_workbench.recent import RecentFile, recent_files
 
     app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
     source = tmp_path / "R&D.tsv"
@@ -597,7 +597,7 @@ def test_open_recent_restores_saved_format_and_handles_missing_files(tmp_path, m
         open_recent(source)
         assert window.csv_format == fmt
         assert window.model.rows == [("001", "чай\tкофе")]
-        assert recent_files(preset_settings)[0] == (source, fmt)
+        assert recent_files(preset_settings)[0] == RecentFile(source, fmt)
         if window.count_job:
             window.count_job[1].result(timeout=5)
             window.collect_reads()
@@ -606,7 +606,50 @@ def test_open_recent_restores_saved_format_and_handles_missing_files(tmp_path, m
         open_recent(source)
         assert window.path == other
         assert window.model.rows == [("002",)]
-        assert errors and recent_files(preset_settings)[0][0] == other
+        assert errors and recent_files(preset_settings)[0].path == other
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_manage_recent_files_controls_update_menu(tmp_path, monkeypatch, preset_settings):
+    from PySide6.QtWidgets import QDialog, QListWidget, QPushButton
+
+    from csv_workbench.core import CsvFormat
+    from csv_workbench.recent import remember_file
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    first, second, third = (tmp_path / name for name in ("first.csv", "second.csv", "third.tsv"))
+    for path in (first, second, third):
+        remember_file(preset_settings, path, CsvFormat())
+    window = MainWindow()
+
+    def manage(dialog):
+        files = dialog.findChild(QListWidget)
+        buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
+        files.setCurrentRow(2)
+        buttons["Pin"].click()
+        assert files.item(0).text() == f"★ {first}"
+        assert buttons["Pin"].text() == "Unpin"
+        files.setCurrentRow(1)
+        buttons["Remove"].click()
+        assert files.count() == 2
+        assert files.item(1).text() == str(second)
+        buttons["Clear Unpinned"].click()
+        assert files.count() == 1
+        assert not buttons["Clear Unpinned"].isEnabled()
+        return QDialog.DialogCode.Accepted
+
+    try:
+        monkeypatch.setattr(QDialog, "exec", manage)
+        window.populate_recent_files()
+        window.recent_menu.actions()[-1].trigger()
+        window.populate_recent_files()
+        assert window.recent_menu.actions()[0].text() == f"★ {first}"
+        assert not any(str(path) in action.text() for path in (second, third) for action in window.recent_menu.actions())
     finally:
         window.close()
         window.executor.shutdown(wait=True)

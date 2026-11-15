@@ -76,7 +76,13 @@ from csv_workbench.core import (
     selection_sql,
 )
 from csv_workbench.presets import FormatPresets, export_format_presets, import_format_presets
-from csv_workbench.recent import recent_files, remember_file
+from csv_workbench.recent import (
+    clear_recent_files,
+    recent_files,
+    remember_file,
+    remove_recent_file,
+    set_file_pinned,
+)
 from csv_workbench.session import load_session, save_session
 
 MISSING = object()
@@ -469,14 +475,83 @@ class MainWindow(QMainWindow):
         entries = recent_files(self.settings)
         if not entries:
             self.recent_menu.addAction("No recent files").setEnabled(False)
-        for path, fmt in entries:
-            label = str(path).replace("&", "&&").replace("\n", " ").replace("\t", " ")
+        for entry in entries:
+            label = str(entry.path).replace("&", "&&").replace("\n", " ").replace("\t", " ")
+            if entry.pinned:
+                label = f"★ {label}"
             self.recent_menu.addAction(
                 label,
-                lambda checked=False, path=path, fmt=fmt: self.load_view(
-                    path, Selection(), new_file=True, fmt=fmt
+                lambda checked=False, entry=entry: self.load_view(
+                    entry.path, Selection(), new_file=True, fmt=entry.format
                 ),
             )
+
+        self.recent_menu.addSeparator()
+        self.recent_menu.addAction("Manage Recent Files…", self.manage_recent_files)
+
+    def manage_recent_files(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manage recent files")
+        dialog.resize(720, 350)
+        layout = QVBoxLayout(dialog)
+        files = QListWidget()
+        layout.addWidget(files)
+        controls = QHBoxLayout()
+        layout.addLayout(controls)
+        pin = QPushButton("Pin")
+        remove = QPushButton("Remove")
+        clear = QPushButton("Clear Unpinned")
+        close = QPushButton("Close")
+        for button in (pin, remove, clear, close):
+            controls.addWidget(button)
+
+        entries = []
+
+        def selected():
+            index = files.currentRow()
+            return entries[index] if 0 <= index < len(entries) else None
+
+        def update_controls():
+            entry = selected()
+            pin.setText("Unpin" if entry and entry.pinned else "Pin")
+            pin.setEnabled(entry is not None)
+            remove.setEnabled(entry is not None)
+            clear.setEnabled(any(not item.pinned for item in entries))
+
+        def reload(path=None):
+            entries[:] = recent_files(self.settings)
+            with QSignalBlocker(files):
+                files.clear()
+                for entry in entries:
+                    label = f"★ {entry.path}" if entry.pinned else str(entry.path)
+                    files.addItem(label)
+                index = next((i for i, entry in enumerate(entries) if entry.path == path), 0)
+                if entries:
+                    files.setCurrentRow(index)
+            update_controls()
+
+        def toggle_pin():
+            if entry := selected():
+                set_file_pinned(self.settings, entry.path, not entry.pinned)
+                reload(entry.path)
+
+        def remove_file():
+            if entry := selected():
+                remove_recent_file(self.settings, entry.path)
+                reload()
+
+        def clear_history():
+            entry = selected()
+            clear_recent_files(self.settings)
+            reload(entry.path if entry else None)
+
+        files.currentRowChanged.connect(update_controls)
+        pin.clicked.connect(toggle_pin)
+        remove.clicked.connect(remove_file)
+        clear.clicked.connect(clear_history)
+        close.clicked.connect(dialog.accept)
+        reload()
+        dialog.exec()
 
     def open_file(self):
         name, _ = QFileDialog.getOpenFileName(
