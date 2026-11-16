@@ -18,6 +18,7 @@ def workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
     documents = window.documents()
     window.close()
+    window.heavy_executor.shutdown(wait=True)
     for document in documents:
         document.executor.shutdown(wait=True)
     window.deleteLater()
@@ -177,3 +178,66 @@ def test_failed_workspace_restore_keeps_current_tabs_and_edits(tmp_path, monkeyp
     assert workspace.restore_pending is None and errors and "missing.csv" in errors[0]
     assert workspace.documents() == [current]
     assert current.model.data(current.model.index(0, 0)) == "2" and current.dirty
+
+
+def test_heavy_jobs_queue_across_tabs_and_cached_reads_bypass_queue(tmp_path, workspace):
+    from concurrent.futures import CancelledError
+    from tempfile import TemporaryDirectory
+    from threading import Event
+
+    from PySide6.QtCore import QTimer
+
+    for name in ("first.csv", "second.csv"):
+        path = tmp_path / name
+        path.write_text("id\n1\n", encoding="utf-8")
+        workspace.open_document(path, Selection(), CsvFormat())
+        document = workspace.tabs.currentWidget()
+        finish_view(document)
+        document.count_job[1].result(timeout=5)
+        document.collect_reads()
+    first, second = workspace.documents()
+    workspace.tabs.setCurrentWidget(first)
+    started, release, queued_started = Event(), Event(), Event()
+    ticks = []
+
+    def sorting(*, cancel):
+        with TemporaryDirectory(dir=tmp_path):
+            started.set()
+            while not release.wait(0.01):
+                cancel.check()
+            cancel.check()
+
+    def unique(*, cancel):
+        queued_started.set()
+
+    first.query_job = first.submit(sorting)
+    try:
+        assert started.wait(5)
+        workspace.tabs.setCurrentWidget(second)
+        second.query_job = second.submit(unique)
+        second.update_status()
+        assert "Queued: Running SQL" in second.status.text()
+        assert not second.query_job[1].running()
+        QTimer.singleShot(0, lambda: ticks.append(workspace.tabs.currentWidget()))
+        QApplication.processEvents()
+        assert ticks == [second]
+
+        _, cached = second.submit(lambda *, cancel: "cached page", heavy=False)
+        assert cached.result(timeout=5) == "cached page"
+        second.cancel_operations()
+        with pytest.raises(CancelledError):
+            second.query_job[1].result(timeout=5)
+        second.collect_reads()
+        assert not queued_started.is_set() and not first.query_job[0].cancelled
+        assert any(path.is_dir() for path in tmp_path.iterdir())
+
+        _, next_job = second.submit(lambda *, cancel: "next")
+        first.cancel_operations()
+        with pytest.raises(CancelledError):
+            first.query_job[1].result(timeout=5)
+        assert next_job.result(timeout=5) == "next"
+        first.collect_reads()
+        assert not any(path.is_dir() for path in tmp_path.iterdir())
+        assert workspace.documents() == [first, second]
+    finally:
+        release.set()

@@ -290,15 +290,17 @@ def filter_clause(selection, identifier):
     )
 
 
+def csv_columns(connection, pattern, fmt):
+    # A parameterized relation may materialize the full CSV just to get its schema.
+    cursor = connection.execute(f"SELECT * FROM {fmt.source} LIMIT 0", [pattern])
+    return [column[0] for column in cursor.description]
+
+
 def selection_query(
     connection, path: Path, selection: Selection, fmt=CsvFormat()
 ) -> tuple[str, list[str]]:
     pattern = csv_pattern(path)
-    columns = (
-        connection.sql(f"SELECT * FROM {fmt.source}", params=[pattern]).columns
-        if selection != Selection()
-        else []
-    )
+    columns = csv_columns(connection, pattern, fmt) if selection != Selection() else []
     sql, values = selection_sql(columns, selection, source=fmt.source)
     return sql, [pattern, *values]
 
@@ -340,7 +342,7 @@ def selection_sql(
 
 def editable_query(connection, source, selection, edits, fmt=CsvFormat()):
     pattern = csv_pattern(source)
-    columns = connection.sql(f"SELECT * FROM {fmt.source}", params=[pattern]).columns
+    columns = csv_columns(connection, pattern, fmt)
     name = "__csv_source_row"
     folded = {column.casefold() for column in columns}
     while name.casefold() in folded:

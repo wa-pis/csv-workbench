@@ -869,17 +869,18 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError) as exc:
                 QMessageBox.critical(self, "Save session", str(exc))
 
-    def submit(self, operation, *args, **kwargs):
+    def submit(self, operation, *args, heavy=True, **kwargs):
         token = Cancellation()
-        future = self.executor.submit(operation, *args, cancel=token, **kwargs)
+        executor = self.workspace.heavy_executor if heavy and self.workspace else self.executor
+        future = executor.submit(operation, *args, cancel=token, **kwargs)
         return token, future
 
     def cancel_operations(self):
         for job in self.jobs():
             if job is not None:
                 token, future = job
-                token.cancel()
                 future.cancel()
+                token.cancel()
         self.update_status()
 
     def save_document(self, *, as_copy=False):
@@ -1584,7 +1585,8 @@ class MainWindow(QMainWindow):
 
             self.page_job = self.submit(read_current_page)
         else:
-            self.page_job = self.submit(self.result.page, offset)
+            # Cached pages only read the existing result and can bypass the scan queue.
+            self.page_job = self.submit(self.result.page, offset, heavy=False)
         self.poll.start()
         self.update_status()
 
@@ -1705,6 +1707,14 @@ class MainWindow(QMainWindow):
             action.setEnabled(self.model.editable)
 
     def update_status(self):
+        def progress_for(job, label):
+            if job is None:
+                return ""
+            token, future = job
+            if not token.cancelled and not future.running() and not future.done():
+                return f" • Queued: {label}"
+            return f" • {label}…"
+
         jobs = self.jobs()
         available = self.path is not None and not (
             self.view_job or self.save_job or self.export_job
@@ -1752,19 +1762,21 @@ class MainWindow(QMainWindow):
         total = self.total_rows
         if isinstance(total, int):
             total = f"{total:,}"
-        progress = " • Loading more…" if self.page_job is not None else ""
-        if self.view_job is not None:
-            progress += " • Reading CSV…"
+        progress = "".join(
+            progress_for(job, label)
+            for job, label in (
+                (self.page_job, "Loading more"),
+                (self.view_job, "Reading CSV"),
+                (self.count_job, "Counting rows"),
+                (self.export_job, "Exporting CSV"),
+                (self.query_job, "Running SQL"),
+                (self.save_job, "Saving CSV"),
+            )
+        )
         if any(job is not None and job[0].cancelled for job in jobs):
             progress += " • Cancelling…"
-        if self.export_job is not None:
-            progress += " • Exporting CSV…"
-        if self.query_job is not None:
-            progress += " • Running SQL…"
         if self.distinct is not None:
             progress += f" • Unique: {self.distinct}"
-        if self.save_job is not None:
-            progress += " • Saving CSV…"
         if self.dirty:
             progress += " • Unsaved edits"
         self.status.setText(
@@ -1808,6 +1820,7 @@ class WorkspaceWindow(QWidget):
         super().__init__()
         self.setWindowTitle("CSV Workbench")
         self.setAcceptDrops(True)
+        self.heavy_executor = ThreadPoolExecutor(max_workers=1)
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
@@ -2032,4 +2045,5 @@ class WorkspaceWindow(QWidget):
             return
         for document in documents:
             document.shutdown_document()
+        self.heavy_executor.shutdown(wait=False, cancel_futures=True)
         super().closeEvent(event)
