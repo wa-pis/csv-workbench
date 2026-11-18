@@ -50,6 +50,8 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionButton,
     QTableView,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QToolTip,
     QVBoxLayout,
@@ -505,6 +507,7 @@ class MainWindow(QMainWindow):
         self.find_action = edit_menu.addAction("Find…", self.open_find)
         self.find_action.setShortcuts(QKeySequence.StandardKey.Find)
         self.find_action.setEnabled(False)
+        self.record_action = edit_menu.addAction("Record View…", self.show_record)
         self.value_action = edit_menu.addAction("Open in Value Editor…", self.edit_cell_value)
         self.value_action.setShortcuts(["Shift+Return", "Shift+Enter"])
         self.value_action.setEnabled(False)
@@ -593,6 +596,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.find_bar)
 
         self.table = CsvTable(self.model)
+        self.table.selectionModel().currentChanged.connect(self.update_edit_actions)
         header = CsvHeader(self.table)
         self.table.setHorizontalHeader(header)
         header.setSectionsClickable(True)
@@ -1240,6 +1244,34 @@ class MainWindow(QMainWindow):
 
     def record_edit(self, key, before, after):
         self.refresh_after_edit(("edit", [(key, before, after)]))
+
+    def show_record(self):
+        current = self.table.currentIndex()
+        if not self.record_action.isEnabled() or not current.isValid():
+            return
+        row = current.row()
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Record View — Row {self.model.offset + row + 1:,}")
+        dialog.resize(700, 460)
+        layout = QVBoxLayout(dialog)
+        header = self.table.horizontalHeader()
+        fields = QTableWidget(header.count(), 2, dialog)
+        fields.setHorizontalHeaderLabels(["Field", "Value"])
+        fields.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        fields.verticalHeader().hide()
+        fields.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        fields.horizontalHeader().setStretchLastSection(True)
+        fields.setColumnWidth(0, 200)
+        for i in range(header.count()):
+            column = header.logicalIndex(i)
+            value = self.model.index(row, column).data()
+            fields.setItem(i, 0, QTableWidgetItem(self.model.headers[column]))
+            fields.setItem(i, 1, QTableWidgetItem(value))
+        layout.addWidget(fields)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def edit_cell_value(self):
         current = self.table.currentIndex()
@@ -2185,6 +2217,10 @@ class MainWindow(QMainWindow):
 
     def update_edit_actions(self):
         self.copy_action.setEnabled(self.path is not None)
+        self.record_action.setEnabled(
+            self.path is not None and self.distinct is None and self.view_job is None
+            and self.table.currentIndex().isValid()
+        )
         for action in (
             self.value_action,
             self.paste_action,

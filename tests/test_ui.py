@@ -1150,3 +1150,53 @@ def test_pinned_columns_stay_left_and_restore_from_session(tmp_path, monkeypatch
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_record_view_uses_current_row_and_live_visible_values(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QTableWidget
+
+    from csv_workbench.core import Selection
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "records.csv"
+    source.write_text("id,note,hidden\n1,first,a\n2,second,b\n", encoding="utf-8")
+    window = MainWindow()
+
+    opened = []
+
+    class InspectDialog(QDialog):
+        def exec(self):
+            opened.append(True)
+            assert self.windowTitle() == "Record View — Row 2"
+            table = self.findChild(QTableWidget)
+            assert not table.editTriggers()
+            assert table.rowCount() == 2
+            assert [
+                (table.item(row, 0).text(), table.item(row, 1).text())
+                for row in range(table.rowCount())
+            ] == [("note", "unsaved\nsecond line"), ("id", "2")]
+
+    monkeypatch.setattr("csv_workbench.ui.QDialog", InspectDialog)
+    try:
+        assert not window.record_action.isEnabled()
+        window.load_view(
+            source, Selection(visible_columns=("id", "note"), pinned_columns=("note",)),
+            new_file=True,
+        )
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        cell = window.model.index(1, 1)
+        window.model.edits[window.model.cell_key(cell)] = "unsaved\nsecond line"
+        window.table.setCurrentIndex(cell)
+        assert window.record_action.isEnabled()
+        window.record_action.trigger()
+        assert opened == [True]
+        assert window.table.currentIndex() == cell
+        assert window.view_job is window.page_job is None
+    finally:
+        monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
