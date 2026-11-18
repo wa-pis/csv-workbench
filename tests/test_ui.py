@@ -1392,3 +1392,75 @@ def test_json_export_action_writes_unloaded_rows(tmp_path, monkeypatch):
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_compare_command_pages_through_saved_file_differences(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QPushButton, QTableView
+
+    from csv_workbench.core import CsvFormat, Selection
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    left, right = tmp_path / "before.csv", tmp_path / "after.csv"
+    left.write_text("id,note\n" + "".join(f"{i:04},old\n" for i in range(201)))
+    right.write_text("id;note\n" + "".join(f"{i:04};new\n" for i in range(201)))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (str(right), ""))
+    monkeypatch.setattr(MainWindow, "configure_format", lambda *_: CsvFormat(";"))
+    monkeypatch.setattr(QInputDialog, "getItem", lambda *_: ("id", True))
+    inspected = []
+
+    class InspectDialog(QDialog):
+        def exec(self):
+            table = self.findChild(QTableView)
+            assert not table.model().editable
+            assert table.model().rows[0] == ("Changed", "0000", "old", "new")
+            next_button = next(b for b in self.findChildren(QPushButton) if b.text() == "Next")
+            previous = next(b for b in self.findChildren(QPushButton) if b.text() == "Previous")
+            next_button.click()
+            for _ in range(500):
+                QTest.qWait(10)
+                if table.model().offset == 200:
+                    break
+            assert table.model().rows == [("Changed", "0200", "old", "new")]
+            assert previous.isEnabled() and not next_button.isEnabled()
+            previous.click()
+            for _ in range(500):
+                QTest.qWait(10)
+                if table.model().offset == 0:
+                    break
+            assert table.model().rowCount() == 200
+            assert not previous.isEnabled() and next_button.isEnabled()
+            inspected.append(True)
+            next_button.click()
+            self.reject()
+            assert page_tokens[-1].cancelled
+            return 0
+
+    monkeypatch.setattr("csv_workbench.ui.QDialog", InspectDialog)
+    window = MainWindow()
+    page_tokens = []
+    original_submit = window.submit
+
+    def submit(operation, *args, **kwargs):
+        job = original_submit(operation, *args, **kwargs)
+        if not kwargs.get("heavy", True):
+            page_tokens.append(job[0])
+        return job
+
+    monkeypatch.setattr(window, "submit", submit)
+    try:
+        window.load_view(left, Selection((("note", "absent"),)), new_file=True)
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.model.rowCount() == 0
+        window.compare_action.trigger()
+        window.compare_job[1].result(timeout=5)
+        window.collect_reads()
+        assert inspected == [True]
+        assert window.model.rowCount() == 0
+        assert left.read_text().splitlines()[1] == "0000,old"
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

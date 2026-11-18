@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from csv_workbench.compare import compare_csv
 from csv_workbench.core import (
     CSV_ENCODINGS,
     DELETED_COLUMN,
@@ -104,7 +105,7 @@ from csv_workbench.text_formats import clipboard_text
 MISSING = object()
 ROOT_INDEX = QModelIndex()
 BUFFER_ROWS = PAGE_SIZE * 3
-JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job")
+JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job", "compare_job")
 FIND_COLORS = {
     Qt.ItemDataRole.BackgroundRole: QBrush(QColor("#ffe38a")),
     Qt.ItemDataRole.ForegroundRole: QBrush(QColor("#242424")),
@@ -458,6 +459,7 @@ class MainWindow(QMainWindow):
         self.view_job = None
         self.query_job = None
         self.text_job = None
+        self.compare_job = None
         self.sql_text = "SELECT * FROM csv_data"
         self.poll = QTimer(self, interval=30)
         self.poll.timeout.connect(self.collect_reads)
@@ -501,6 +503,7 @@ class MainWindow(QMainWindow):
         )
         self.save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
         edit_menu = self.menuBar().addMenu("Edit")
+        self.compare_action = file_menu.addAction("Compare Saved CSV…", self.compare_saved_csv)
         self.text_export_actions = []
         for fmt in ("JSON", "Markdown"):
             action = file_menu.addAction(
@@ -1600,6 +1603,112 @@ class MainWindow(QMainWindow):
             self.poll.start()
             self.update_status()
 
+    def compare_saved_csv(self):
+        if self.path is None or self.compare_job is not None:
+            return
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Compare saved files (filters and unsaved edits are ignored)", "",
+            "CSV/TSV (*.csv *.tsv);;All files (*)",
+        )
+        if not filename:
+            return
+        right = Path(filename)
+        fmt = self.configure_format(right)
+        if fmt is None:
+            return
+        key, accepted = QInputDialog.getItem(
+            self, "Compare saved files", "Unique nonempty key column:",
+            self.source_headers, 0, False,
+        )
+        if not accepted:
+            return
+        self.compare_sources = self.path, right
+        self.compare_job = self.submit(
+            compare_csv, self.path, right, key, left_format=self.csv_format, right_format=fmt,
+        )
+        self.poll.start()
+        self.update_status()
+
+    def show_comparison(self, result, counts, page):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Saved CSV differences")
+        before, after = self.compare_sources
+        dialog.resize(960, 600)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            f"Before: {before.name} → After: {after.name}\n"
+            "Saved files only; table filters and unsaved edits are ignored.\n"
+            + " • ".join(f"{name}: {counts.get(name, 0):,}"
+                         for name in ("Added", "Removed", "Changed"))
+        ))
+        table = QTableView(dialog)
+        model = PageModel()
+        model.setParent(table)
+        table.setModel(model)
+        layout.addWidget(table)
+        navigation = QHBoxLayout()
+        previous = QPushButton("Previous")
+        following = QPushButton("Next")
+        position = QLabel()
+        navigation.addWidget(previous)
+        navigation.addWidget(following)
+        navigation.addWidget(position)
+        layout.addLayout(navigation)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        job = None
+        offset = 0
+        timer = QTimer(dialog, interval=30)
+
+        def apply_page(data):
+            headers, rows, more = data
+            model.replace(headers, rows, offset)
+            previous.setEnabled(offset > 0)
+            following.setEnabled(more)
+            position.setText(f"Rows {offset + 1 if rows else 0:,}–{offset + len(rows):,}")
+
+        def collect():
+            nonlocal job
+            if job is None or not job[1].done():
+                return
+            token, future = job
+            job = None
+            timer.stop()
+            try:
+                data = future.result()
+                token.check()
+                apply_page(data)
+            except CancelledError:
+                dialog.reject()
+            except (duckdb.Error, OSError, ValueError) as exc:
+                QMessageBox.critical(dialog, "Comparison page", str(exc))
+                dialog.reject()
+
+        def load_page(step):
+            nonlocal job, offset
+            if job:
+                return
+            offset += step * PAGE_SIZE
+            previous.setEnabled(False)
+            following.setEnabled(False)
+            job = self.submit(result.page, offset, heavy=False)
+            timer.start()
+
+        def stop():
+            timer.stop()
+            if job:
+                job[0].cancel()
+                job[1].cancel()
+
+        timer.timeout.connect(collect)
+        previous.clicked.connect(lambda: load_page(-1))
+        following.clicked.connect(lambda: load_page(1))
+        dialog.finished.connect(stop)
+        apply_page(page)
+        dialog.exec()
+        dialog.deleteLater()
+
     def preview_sql(self):
         sql, values = selection_sql(
             self.source_headers, self.selection, source=self.csv_format.source
@@ -2287,6 +2396,8 @@ class MainWindow(QMainWindow):
                         + ("Preview limited to the first 128 Ki characters." if truncated
                            else "Complete source text.")
                     )
+                elif name == "compare_job":
+                    self.show_comparison(*result)
                 elif name == "query_job":
                     self.show_query_result(*result)
                 elif name == "save_job":
@@ -2372,6 +2483,7 @@ class MainWindow(QMainWindow):
         self.go_to_row_action.setEnabled(available and self.page_job is None and self.model.rowCount() > 0)
         self.find_action.setEnabled(self.path is not None)
         self.view_mode.setEnabled(available)
+        self.compare_action.setEnabled(available and self.compare_job is None and self.distinct is None)
         can_manage_columns = available and self.distinct is None
         self.columns_action.setEnabled(can_manage_columns)
         self.table.horizontalHeader().setSectionsMovable(can_manage_columns)
@@ -2436,6 +2548,7 @@ class MainWindow(QMainWindow):
                 (self.count_job, "Counting rows"),
                 (self.export_job, "Exporting CSV"),
                 (self.query_job, "Running SQL"),
+                (self.compare_job, "Comparing saved CSVs"),
                 (self.save_job, "Saving CSV"),
             )
         )
