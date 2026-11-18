@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
+    QStackedWidget,
     QStyle,
     QStyleOptionButton,
     QTableView,
@@ -101,7 +102,7 @@ from csv_workbench.session import (
 MISSING = object()
 ROOT_INDEX = QModelIndex()
 BUFFER_ROWS = PAGE_SIZE * 3
-JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job")
+JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job")
 FIND_COLORS = {
     Qt.ItemDataRole.BackgroundRole: QBrush(QColor("#ffe38a")),
     Qt.ItemDataRole.ForegroundRole: QBrush(QColor("#242424")),
@@ -454,6 +455,7 @@ class MainWindow(QMainWindow):
         self.write_destination = None
         self.view_job = None
         self.query_job = None
+        self.text_job = None
         self.sql_text = "SELECT * FROM csv_data"
         self.poll = QTimer(self, interval=30)
         self.poll.timeout.connect(self.collect_reads)
@@ -559,6 +561,11 @@ class MainWindow(QMainWindow):
         self.unique_button.setEnabled(False)
         self.unique_button.clicked.connect(self.edit_unique)
         toolbar.addWidget(self.unique_button)
+        self.view_mode = QComboBox()
+        self.view_mode.addItems(["Table", "Text"])
+        self.view_mode.setEnabled(False)
+        self.view_mode.currentIndexChanged.connect(self.switch_view_mode)
+        toolbar.addWidget(self.view_mode)
         toolbar.addStretch()
         self.export_button = QPushButton("Export CSV…")
         self.export_button.setEnabled(False)
@@ -621,7 +628,19 @@ class MainWindow(QMainWindow):
             view_header.filterRequested.connect(
                 lambda section, h=view_header: self.open_column_menu(section, h)
             )
-        layout.addWidget(self.table, 1)
+        self.views = QStackedWidget()
+        self.views.addWidget(self.table)
+        text_panel = QWidget()
+        text_layout = QVBoxLayout(text_panel)
+        self.text_notice = QLabel()
+        self.text_notice.setWordWrap(True)
+        self.source_text = QPlainTextEdit()
+        self.source_text.setReadOnly(True)
+        self.source_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        text_layout.addWidget(self.text_notice)
+        text_layout.addWidget(self.source_text)
+        self.views.addWidget(text_panel)
+        layout.addWidget(self.views, 1)
 
         self.table.verticalScrollBar().valueChanged.connect(self.load_at_edge)
         for key, standard, last in (
@@ -1246,6 +1265,31 @@ class MainWindow(QMainWindow):
 
     def record_edit(self, key, before, after):
         self.refresh_after_edit(("edit", [(key, before, after)]))
+
+    def switch_view_mode(self, mode):
+        if self.text_job:
+            token, future = self.text_job
+            token.cancel()
+            future.cancel()
+            self.text_job = None
+        self.views.setCurrentIndex(mode)
+        self.source_text.clear()
+        if not mode or self.path is None:
+            return
+        self.text_notice.setText(
+            "Saved source text only. Filters and unsaved table edits are not shown. Loading…"
+        )
+        path, encoding = self.path, self.csv_format.encoding
+
+        def read_text(*, cancel):
+            cancel.check()
+            sample = read_format_sample(path, encoding)
+            cancel.check()
+            return sample
+
+        self.text_job = self.submit(read_text, heavy=False)
+        self.poll.start()
+        self.update_status()
 
     def transpose_selection(self):
         if not self.transpose_action.isEnabled():
@@ -1893,6 +1937,7 @@ class MainWindow(QMainWindow):
         self.update_status()
 
     def apply_view(self, revision, page, result, source_headers):
+        self.view_mode.setCurrentIndex(0)
         path, selection, new_file, distinct, identified, fmt = self.view_request
         headers, rows, has_more = page
         if self.page_job is not None:
@@ -2207,6 +2252,14 @@ class MainWindow(QMainWindow):
                     self.apply_page(*result)
                 elif name == "find_job":
                     self.apply_find(result)
+                elif name == "text_job":
+                    text, truncated = result
+                    self.source_text.setPlainText(text)
+                    self.text_notice.setText(
+                        "Saved source text only. Filters and unsaved table edits are not shown. "
+                        + ("Preview limited to the first 128 Ki characters." if truncated
+                           else "Complete source text.")
+                    )
                 elif name == "query_job":
                     self.show_query_result(*result)
                 elif name == "save_job":
@@ -2225,6 +2278,8 @@ class MainWindow(QMainWindow):
                     return
                 if name == "view_job" and self.refreshing_edit:
                     self.rollback_edit()
+                if name == "text_job":
+                    self.text_notice.setText("Saved source preview cancelled. Select Table, then Text to retry.")
                 if name == "count_job":
                     self.total_rows = "cancelled"
                 if name == "page_job" and self.page_target_column is not None:
@@ -2288,6 +2343,7 @@ class MainWindow(QMainWindow):
         self.save_as_action.setEnabled(available)
         self.go_to_row_action.setEnabled(available and self.page_job is None and self.model.rowCount() > 0)
         self.find_action.setEnabled(self.path is not None)
+        self.view_mode.setEnabled(available)
         can_manage_columns = available and self.distinct is None
         self.columns_action.setEnabled(can_manage_columns)
         self.table.horizontalHeader().setSectionsMovable(can_manage_columns)

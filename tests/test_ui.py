@@ -1258,3 +1258,57 @@ def test_transpose_selection_is_bounded_and_uses_live_values(tmp_path, monkeypat
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_text_preview_reads_saved_encoded_source_and_preserves_table(tmp_path):
+    from csv_workbench.core import CsvFormat, Selection
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "source.csv"
+    raw = 'id;note\r\n1;"Привет; мир"\r\n'
+    source.write_bytes(raw.encode("cp1251"))
+    window = MainWindow()
+    try:
+        window.load_view(source, Selection(), new_file=True,
+                         fmt=CsvFormat(";", encoding="cp1251"))
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        cell = window.model.index(0, 1)
+        key = window.model.cell_key(cell)
+        window.model.edits[key] = "unsaved"
+        window.table.setCurrentIndex(cell)
+        window.view_mode.setCurrentIndex(1)
+        assert window.source_text.isReadOnly()
+        window.text_job[1].result(timeout=5)
+        window.collect_reads()
+        # QPlainTextEdit normalizes line endings for display.
+        assert window.source_text.toPlainText() == raw.replace("\r\n", "\n")
+        assert "unsaved table edits" in window.text_notice.text()
+        assert "Complete source text" in window.text_notice.text()
+        assert window.views.currentIndex() == 1
+        window.view_mode.setCurrentIndex(0)
+        assert window.table.currentIndex() == cell
+        assert window.model.cell_value(cell) == "unsaved"
+        assert window.views.currentIndex() == 0
+
+        source.write_bytes(("x" * (128 * 1024 + 1)).encode("cp1251"))
+        window.view_mode.setCurrentIndex(1)
+        window.text_job[1].result(timeout=5)
+        window.collect_reads()
+        assert len(window.source_text.toPlainText()) == 128 * 1024
+        assert "limited" in window.text_notice.text()
+
+        window.view_mode.setCurrentIndex(0)
+        window.view_mode.setCurrentIndex(1)
+        token, _future = window.text_job
+        window.view_mode.setCurrentIndex(0)
+        assert token.cancelled
+        assert window.text_job is None
+        window.collect_reads()
+        assert window.views.currentIndex() == 0
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
