@@ -1200,3 +1200,61 @@ def test_record_view_uses_current_row_and_live_visible_values(tmp_path, monkeypa
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_transpose_selection_is_bounded_and_uses_live_values(tmp_path, monkeypatch):
+    from PySide6.QtCore import QItemSelection, QItemSelectionModel
+    from PySide6.QtWidgets import QDialog, QTableWidget
+
+    from csv_workbench.core import Selection
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "transpose.csv"
+    columns = [f"c{i}" for i in range(51)]
+    source.write_text(",".join(columns) + "\n" + (",".join(columns) + "\n") * 200)
+    window = MainWindow()
+    opened, warnings = [], []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
+
+    class InspectDialog(QDialog):
+        def exec(self):
+            table = self.findChild(QTableWidget)
+            opened.append(True)
+            assert table.rowCount() == table.columnCount() == 2
+            assert not table.editTriggers()
+            assert [table.verticalHeaderItem(i).text() for i in range(2)] == ["c1", "c0"]
+            assert [table.horizontalHeaderItem(i).text() for i in range(2)] == ["101", "102"]
+            assert table.item(0, 0).text() == "edited\nvalue"
+            assert table.item(1, 1).text() == "c0"
+
+    monkeypatch.setattr("csv_workbench.ui.QDialog", InspectDialog)
+    try:
+        window.load_view(source, Selection(pinned_columns=("c1",)), new_file=True)
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        window.model.offset = 100
+        cell = window.model.index(0, 1)
+        window.model.edits[window.model.cell_key(cell)] = "edited\nvalue"
+        selection = window.table.selectionModel()
+        flags = QItemSelectionModel.SelectionFlag
+        selection.select(QItemSelection(window.model.index(0, 0), window.model.index(1, 1)),
+                         flags.ClearAndSelect)
+        window.transpose_action.trigger()
+        assert opened == [True]
+        assert window.page_job is None
+        selection.select(QItemSelection(window.model.index(0, 0), window.model.index(199, 50)),
+                         flags.ClearAndSelect)
+        window.transpose_action.trigger()
+        selection.select(QItemSelection(window.model.index(0, 0), window.model.index(0, 0)),
+                         flags.ClearAndSelect)
+        selection.select(QItemSelection(window.model.index(2, 0), window.model.index(2, 0)),
+                         flags.Select)
+        window.transpose_action.trigger()
+        assert len(warnings) == 2
+        assert opened == [True]
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

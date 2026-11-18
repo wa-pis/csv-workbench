@@ -23,9 +23,10 @@
 
 [`csv-record-view`](openspec/changes/archive/2026-11-18-csv-record-view/proposal.md) закрыт. Карточка показывает видимые поля текущей строки с несохранёнными правками.
 
+[`transpose-csv-range`](openspec/changes/archive/2026-11-18-transpose-csv-range/proposal.md) закрыт. Просмотр транспонированного прямоугольного диапазона до 10 000 ячеек с текущими правками без подгрузки CSV.
+
 Следующие кандидаты:
 
-- **Широкие таблицы:** транспонирование ограниченной выборки. Ориентир — [режимы просмотра DataGrip](https://www.jetbrains.com/help/datagrip/tables-view-data.html).
 - **Исходный текст:** переключатель Text/Table, как в [редакторе DSV IntelliJ IDEA](https://www.jetbrains.com/help/idea/editing-csv-and-tsv-files.html). Начать с чтения; редактирование текста требует явного правила синхронизации с несохранёнными правками таблицы.
 - **Копирование и дополнительные форматы:** выбираемый формат буфера обмена, затем экспорт JSON и Markdown. Для полной выборки большого файла — потоковый экспорт на диск; копирование в буфер требует ограничения размера. Ориентир — [Data Extractors](https://www.jetbrains.com/help/datagrip/data-extractors.html).
 - **Сравнение двух файлов:** по выбранному ключу показать добавленные, удалённые и изменённые строки. Взять за ориентир [Compare Data](https://www.jetbrains.com/help/datagrip/compare-data.html), адаптировав его к локальным CSV и явно обрабатывая дубликаты ключа.

@@ -507,6 +507,7 @@ class MainWindow(QMainWindow):
         self.find_action = edit_menu.addAction("Find…", self.open_find)
         self.find_action.setShortcuts(QKeySequence.StandardKey.Find)
         self.find_action.setEnabled(False)
+        self.transpose_action = edit_menu.addAction("Transpose Selection…", self.transpose_selection)
         self.record_action = edit_menu.addAction("Record View…", self.show_record)
         self.value_action = edit_menu.addAction("Open in Value Editor…", self.edit_cell_value)
         self.value_action.setShortcuts(["Shift+Return", "Shift+Enter"])
@@ -597,6 +598,7 @@ class MainWindow(QMainWindow):
 
         self.table = CsvTable(self.model)
         self.table.selectionModel().currentChanged.connect(self.update_edit_actions)
+        self.table.selectionModel().selectionChanged.connect(self.update_edit_actions)
         header = CsvHeader(self.table)
         self.table.setHorizontalHeader(header)
         header.setSectionsClickable(True)
@@ -1244,6 +1246,40 @@ class MainWindow(QMainWindow):
 
     def record_edit(self, key, before, after):
         self.refresh_after_edit(("edit", [(key, before, after)]))
+
+    def transpose_selection(self):
+        if not self.transpose_action.isEnabled():
+            return
+        ranges = self.table.selectionModel().selection()
+        if len(ranges) != 1 or ranges[0].width() * ranges[0].height() > 10_000:
+            QMessageBox.warning(
+                self, "Transpose Selection",
+                "Select one rectangular range containing at most 10,000 cells.",
+            )
+            return
+        selected = ranges[0]
+        header = self.table.horizontalHeader()
+        columns = [header.logicalIndex(i) for i in range(header.count())
+                   if selected.left() <= header.logicalIndex(i) <= selected.right()]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Transpose Selection — buffered rows only")
+        dialog.resize(800, 480)
+        layout = QVBoxLayout(dialog)
+        fields = QTableWidget(len(columns), selected.height(), dialog)
+        fields.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        fields.setVerticalHeaderLabels([self.model.headers[col] for col in columns])
+        fields.setHorizontalHeaderLabels([
+            str(self.model.offset + row + 1)
+            for row in range(selected.top(), selected.bottom() + 1)
+        ])
+        for i, col in enumerate(columns):
+            for j, row in enumerate(range(selected.top(), selected.bottom() + 1)):
+                fields.setItem(i, j, QTableWidgetItem(self.model.index(row, col).data()))
+        layout.addWidget(fields)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def show_record(self):
         current = self.table.currentIndex()
@@ -2217,6 +2253,10 @@ class MainWindow(QMainWindow):
 
     def update_edit_actions(self):
         self.copy_action.setEnabled(self.path is not None)
+        self.transpose_action.setEnabled(
+            self.path is not None and self.distinct is None and self.view_job is None
+            and self.table.selectionModel().hasSelection()
+        )
         self.record_action.setEnabled(
             self.path is not None and self.distinct is None and self.view_job is None
             and self.table.currentIndex().isValid()
