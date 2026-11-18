@@ -83,6 +83,8 @@ def parse_session_tab(data):
     columns = selection.get("visible_columns")
     sort = selection.get("sort_column")
     extra = selection.get("extra_sort", [])
+    column_order = selection.get("column_order", [])
+    exact_filters = selection.get("exact_filters", [])
     descending = selection.get("descending")
     match_any = selection.get("match_any")
     if (
@@ -114,6 +116,18 @@ def parse_session_tab(data):
         or len({key[0] for key in extra} | {sort}) != len(extra) + 1
         or not isinstance(descending, bool)
         or not isinstance(match_any, bool)
+        or not isinstance(column_order, list)
+        or not all(isinstance(name, str) for name in column_order)
+        or len(set(column_order)) != len(column_order)
+        or not isinstance(exact_filters, list)
+        or any(
+            not isinstance(rule, list)
+            or len(rule) != 3
+            or not isinstance(rule[0], str)
+            or rule[1] not in ("equals", "not_equals")
+            or (rule[2] is not None and not isinstance(rule[2], str))
+            for rule in exact_filters
+        )
     ):
         raise ValueError("Invalid session selection.")
     settings = data.get("format", {})
@@ -134,6 +148,8 @@ def parse_session_tab(data):
             tuple(columns) if columns is not None else None,
             match_any,
             tuple((column, direction) for column, direction in extra),
+            tuple(column_order),
+            tuple(tuple(rule) for rule in exact_filters),
         ),
         fmt,
     )

@@ -131,6 +131,15 @@ class Selection:
     visible_columns: tuple[str, ...] | None = None
     match_any: bool = False
     extra_sort: tuple[tuple[str, bool], ...] = ()
+    column_order: tuple[str, ...] = ()
+    exact_filters: tuple[tuple[str, str, str | None], ...] = ()
+
+    def ordered_columns(self, columns):
+        if len(set(self.column_order)) != len(self.column_order):
+            raise ValueError("Duplicate column in layout.")
+        if missing := set(self.column_order).difference(columns):
+            raise ValueError(f"Unknown CSV column: {min(missing)}")
+        return list(dict.fromkeys((*self.column_order, *columns)))
 
     @property
     def sort_keys(self):
@@ -155,6 +164,12 @@ class Selection:
     @property
     def conditions(self):
         return tuple((column, value) for column, value in self.filters if value)
+
+    @property
+    def filter_columns(self):
+        return {column for column, _ in self.conditions} | {
+            column for column, _, _ in self.exact_filters
+        }
 
 
 class Cancellation:
@@ -283,10 +298,17 @@ def filter_clause(selection, identifier):
     predicates = [
         f"contains(lower({identifier(column)}), lower(?))" for column, _ in selection.conditions
     ]
+    values = [value for _, value in selection.conditions]
+    operators = {"equals": "IS NOT DISTINCT FROM", "not_equals": "IS DISTINCT FROM"}
+    for column, operator, value in selection.exact_filters:
+        if operator not in operators:
+            raise ValueError(f"Unknown filter operation: {operator}")
+        predicates.append(f"{identifier(column)} {operators[operator]} ?")
+        values.append(value)
     joiner = " OR " if selection.match_any else " AND "
     return (
         " WHERE " + joiner.join(predicates) if predicates else "",
-        [value for _, value in selection.conditions],
+        values,
     )
 
 
@@ -298,7 +320,7 @@ def csv_columns(connection, pattern, fmt):
 
 def selection_query(
     connection, path: Path, selection: Selection, fmt=CsvFormat()
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str | None]]:
     pattern = csv_pattern(path)
     columns = csv_columns(connection, pattern, fmt) if selection != Selection() else []
     sql, values = selection_sql(columns, selection, source=fmt.source)
@@ -315,7 +337,7 @@ def sort_clause(selection, identifier, tie_breaker="row_number() OVER ()"):
 
 def selection_sql(
     columns: list[str], selection: Selection, *, source=CSV_SOURCE, row_id=None
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str | None]]:
     projection, where, order = "*", "", ""
     values = []
     if selection != Selection():
@@ -330,8 +352,10 @@ def selection_sql(
                 raise ValueError("Select at least one visible column.")
             for name in selection.visible_columns:
                 identifier(name)
+        if selection.visible_columns is not None or selection.column_order:
             projection = ", ".join(
-                identifier(name) for name in columns if name in selection.visible_columns
+                identifier(name) for name in selection.ordered_columns(columns)
+                if selection.visible_columns is None or name in selection.visible_columns
             )
         where, values = filter_clause(selection, identifier)
         order = sort_clause(selection, identifier, row_id or "row_number() OVER ()")
@@ -722,11 +746,12 @@ def stage_selection(path, selection, distinct, directory, cancel, fmt=CsvFormat(
             first_frame.columns = [f"column{i:0{digits}d}" for i in range(first_frame.width)]
         names = first_frame.columns
         required = set(names if visible is None else visible)
-        required.update(column for column, _ in selection.conditions)
+        required.update(selection.filter_columns)
         required.update(sort)
         if missing := required.difference(names):
             raise ValueError(f"Unknown CSV column: {min(missing)}")
-        output_columns = [name for name in names if visible is None or name in visible]
+        ordered = selection.ordered_columns(names) if distinct is None else names
+        output_columns = [name for name in ordered if visible is None or name in visible]
         staged_columns = [name for name in names if name in required]
 
         result_columns = list(dict.fromkeys(output_columns + sort))

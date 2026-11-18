@@ -509,6 +509,184 @@ def test_edit_sorted_filtered_cell_updates_view_and_export(tmp_path, monkeypatch
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
+def test_cell_menu_filters_empty_value_and_removes_rule_individually(tmp_path, monkeypatch):
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QDialogButtonBox, QLabel, QMenu, QPushButton
+
+    from csv_workbench.core import Selection
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "values.csv"
+    source.write_text(
+        "id,value,tag\n1,,keep\n"
+        + "".join(f"{i},NULL,keep\n" for i in range(2, 205))
+        + "205,,keep\n206,,skip\n",
+        encoding="utf-8",
+    )
+
+    class CellMenu(QMenu):
+        def exec(self, point):
+            return self.actions()[0].menu().actions()[0]
+
+    monkeypatch.setattr("csv_workbench.ui.QMenu", CellMenu)
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+
+    def finish():
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+
+    try:
+        selection = Selection(filters=(("tag", "keep"),))
+        window.load_view(source, selection, new_file=True)
+        finish()
+        index = window.model.index(0, 1)
+        window.cell_filter_menu(window.table.visualRect(index).center())
+        finish()
+        assert window.selection.exact_filters == (("value", "equals", None),)
+        assert window.model.rows == [("1", None, "keep"), ("205", None, "keep")]
+
+        removed = []
+
+        def remove_exact():
+            dialog = app.activeModalWidget()
+            label = next((v for v in dialog.findChildren(QLabel) if v.text() == "value = NULL"), None)
+            if label is not None:
+                label.parentWidget().findChild(QPushButton).click()
+                removed.append(True)
+            dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Apply).click()
+
+        QTimer.singleShot(0, remove_exact)
+        window.edit_selection()
+        finish()
+        assert removed == [True]
+        assert window.selection == selection
+        assert window.model.rowCount() == 200
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_column_layout_survives_session_and_preserves_source_order(tmp_path, monkeypatch):
+    from csv_workbench.core import CsvFormat, Selection, read_page
+    from csv_workbench.session import load_session, save_session
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "layout.csv"
+    source.write_text("id,label,note\n1,a,b\n", encoding="utf-8")
+    output = tmp_path / "export.csv"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(output), ""))
+    monkeypatch.setattr(MainWindow, "configure_export_format", lambda _: CsvFormat())
+    monkeypatch.setattr(QMessageBox, "information", lambda *_: None)
+    monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+    window = MainWindow()
+
+    def finish(name="view_job"):
+        getattr(window, name)[1].result(timeout=5)
+        window.collect_reads()
+
+    try:
+        window.load_view(source, Selection(), new_file=True)
+        finish()
+        window.table.horizontalHeader().moveSection(2, 0)
+        app.processEvents()
+        finish()
+        assert window.model.headers == ["note", "id", "label"]
+        window.set_visible_columns(("note", "id"))
+        finish()
+        assert window.model.headers == ["note", "id"]
+
+        session = tmp_path / "layout.csvsession"
+        save_session(session, source, window.selection)
+        path, selection, fmt = load_session(session)
+        window.load_view(path, selection, new_file=True, fmt=fmt)
+        finish()
+        assert window.model.headers == ["note", "id"]
+        window.set_visible_columns(("note", "id", "label"))
+        finish()
+        assert window.model.headers == ["note", "id", "label"]
+
+        window.model.setData(window.model.index(0, 0), "edited")
+        finish()
+        window.save_selection()
+        finish("export_job")
+        assert read_page(output, 0)[:2] == (["note", "id", "label"], [("edited", "1", "a")])
+        window.save_action.trigger()
+        finish("save_job")
+        assert read_page(source, 0)[:2] == (["id", "label", "note"], [("1", "a", "edited")])
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_value_editor_preserves_multiline_text_in_save_and_export(tmp_path, monkeypatch):
+    from csv_workbench.core import CsvFormat, Selection, read_page
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "value.csv"
+    source.write_text("id,note\n1,old\n2,keep\n", encoding="utf-8")
+    output = tmp_path / "export.csv"
+    value = 'first\nsecond, "quoted"'
+    answers = iter([(value, False), (value, True)])
+
+    def open_editor(*args):
+        assert args[-1] == "old"
+        return next(answers)
+
+    monkeypatch.setattr(QInputDialog, "getMultiLineText", open_editor)
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(output), ""))
+    monkeypatch.setattr(MainWindow, "configure_export_format", lambda _: CsvFormat())
+    monkeypatch.setattr(QMessageBox, "information", lambda *_: None)
+    monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+    window = MainWindow()
+    window.show()
+    window.activateWindow()
+    app.processEvents()
+
+    def finish(name):
+        getattr(window, name)[1].result(timeout=5)
+        window.collect_reads()
+
+    try:
+        window.load_view(source, Selection(), new_file=True)
+        finish("view_job")
+        index = window.model.index(0, 1)
+        window.table.setCurrentIndex(index)
+        window.table.setFocus()
+        QTest.keyClick(window.table, Qt.Key.Key_Return, Qt.KeyboardModifier.ShiftModifier)
+        assert index.data() == "old"
+        assert not window.history
+
+        window.value_action.trigger()
+        assert index.data() == value
+        assert window.history_pos == len(window.history) == 1
+        window.undo_action.trigger()
+        assert index.data() == "old"
+        window.redo_action.trigger()
+        assert index.data() == value
+
+        window.save_selection()
+        finish("export_job")
+        assert read_page(output, 0)[1] == [("1", value), ("2", "keep")]
+        assert read_page(source, 0)[1][0] == ("1", "old")
+        window.save_action.trigger()
+        finish("save_job")
+        assert read_page(source, 0)[1] == [("1", value), ("2", "keep")]
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
 def test_range_and_row_history_survives_save(tmp_path, monkeypatch):
     from PySide6.QtCore import QItemSelection, QItemSelectionModel
 

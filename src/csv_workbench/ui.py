@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QEvent,
     QModelIndex,
+    QPersistentModelIndex,
     QPoint,
     QRect,
     QSettings,
@@ -159,12 +160,15 @@ class PageModel(QAbstractTableModel):
         highlight = self.find_text and role in FIND_COLORS
         if not highlight and role not in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             return None
-        value = self.edits.get(self.cell_key(index), self.rows[index.row()][index.column()])
+        value = self.cell_value(index)
         if highlight:
             return FIND_COLORS[role] if value is not None and self.find_text in search_lower(str(value)) else None
         if role == Qt.ItemDataRole.EditRole:
             return "" if value is None else str(value)
         return "NULL" if value is None else str(value)
+
+    def cell_value(self, index):
+        return self.edits.get(self.cell_key(index), self.rows[index.row()][index.column()])
 
     def flags(self, index):
         flags = super().flags(index)
@@ -420,6 +424,11 @@ class MainWindow(QMainWindow):
         self.find_action = edit_menu.addAction("Find…", self.open_find)
         self.find_action.setShortcuts(QKeySequence.StandardKey.Find)
         self.find_action.setEnabled(False)
+        self.value_action = edit_menu.addAction("Open in Value Editor…", self.edit_cell_value)
+        self.value_action.setShortcuts(["Shift+Return", "Shift+Enter"])
+        self.value_action.setEnabled(False)
+        self.columns_action = edit_menu.addAction("Manage Columns…", self.manage_columns)
+        self.columns_action.setEnabled(False)
         for action in (self.save_action, self.save_as_action, self.undo_action, self.redo_action):
             action.setEnabled(False)
         self.copy_action = edit_menu.addAction("Copy range", self.copy_range)
@@ -445,7 +454,7 @@ class MainWindow(QMainWindow):
             for action in (
                 open_action, self.save_action, self.save_as_action, self.undo_action, self.redo_action,
                 self.copy_action, self.paste_action, self.clear_action, self.go_to_row_action,
-                self.find_action,
+                self.find_action, self.value_action,
             ):
                 self.addAction(action)
                 action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -506,10 +515,16 @@ class MainWindow(QMainWindow):
         self.table.setModel(self.model)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.cell_filter_menu)
         self.table.verticalHeader().setDefaultSectionSize(23)
         header = CsvHeader(self.table)
         self.table.setHorizontalHeader(header)
         header.setSectionsClickable(True)
+        header.setSectionsMovable(True)
+        header.sectionMoved.connect(lambda *_: QTimer.singleShot(0, self.apply_column_drag))
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(self.column_layout_menu)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setStretchLastSection(True)
         header.sortRequested.connect(self.cycle_column_sort)
@@ -547,7 +562,7 @@ class MainWindow(QMainWindow):
         add_filter = menu.addAction("Add contains filter…")
         clear_filter = menu.addAction("Clear filters for this column")
         remaining = tuple(pair for pair in current.filters if pair[0] != column)
-        clear_filter.setEnabled(any(name == column for name, _ in current.conditions))
+        clear_filter.setEnabled(column in current.filter_columns)
         header = self.table.horizontalHeader()
         action = menu.exec(
             header.mapToGlobal(QPoint(header.sectionViewportPosition(section), header.height()))
@@ -558,10 +573,106 @@ class MainWindow(QMainWindow):
                 return
             selection = replace(current, filters=(*current.filters, (column, value)))
         elif action == clear_filter:
-            selection = replace(current, filters=remaining)
+            selection = replace(
+                current, filters=remaining,
+                exact_filters=tuple(rule for rule in current.exact_filters if rule[0] != column),
+            )
         else:
             return
         self.load_view(self.path, selection)
+
+    def cell_filter_menu(self, point):
+        index = self.table.indexAt(point)
+        if not index.isValid() or not self.columns_action.isEnabled():
+            return
+        menu = QMenu(self)
+        filters = menu.addMenu("Filter by")
+        equals = filters.addAction("Equals this value")
+        not_equals = filters.addAction("Does not equal this value")
+        cell = QPersistentModelIndex(index)
+        action = menu.exec(self.table.viewport().mapToGlobal(point))
+        if action in (equals, not_equals) and cell.isValid():
+            self.quick_filter(QModelIndex(cell), "equals" if action == equals else "not_equals")
+
+    def quick_filter(self, index, operator):
+        rule = (self.model.headers[index.column()], operator, self.model.cell_value(index))
+        if rule not in self.selection.exact_filters:
+            self.load_view(self.path, replace(
+                self.selection, exact_filters=(*self.selection.exact_filters, rule),
+            ))
+
+    def column_layout_menu(self, point):
+        if not self.columns_action.isEnabled():
+            return
+        header = self.table.horizontalHeader()
+        section = header.logicalIndexAt(point)
+        menu = QMenu(self)
+        hide = menu.addAction("Hide Column")
+        hide.setEnabled(section >= 0 and self.model.columnCount() > 1)
+        menu.addAction(self.columns_action)
+        if menu.exec(header.mapToGlobal(point)) == hide:
+            self.set_visible_columns(name for i, name in enumerate(self.model.headers) if i != section)
+
+    def set_visible_columns(self, columns):
+        visible = tuple(columns)
+        if visible:
+            self.load_view(self.path, replace(
+                self.selection,
+                visible_columns=visible if len(visible) != len(self.source_headers) else None,
+            ))
+
+    def manage_columns(self):
+        if not self.columns_action.isEnabled():
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manage Columns")
+        layout = QVBoxLayout(dialog)
+        search = QLineEdit(placeholderText="Find columns")
+        layout.addWidget(search)
+        fields = QListWidget()
+        layout.addWidget(fields)
+        for name in self.selection.ordered_columns(self.source_headers):
+            item = QListWidgetItem(name, fields)
+            item.setCheckState(Qt.CheckState.Checked if name in self.model.headers else Qt.CheckState.Unchecked)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        def selected():
+            return [fields.item(i).text() for i in range(fields.count())
+                    if fields.item(i).checkState() == Qt.CheckState.Checked]
+
+        def filter_columns(value):
+            for i in range(fields.count()):
+                item = fields.item(i)
+                item.setHidden(value.casefold() not in item.text().casefold())
+
+        search.textChanged.connect(filter_columns)
+        fields.itemChanged.connect(lambda: buttons.button(QDialogButtonBox.StandardButton.Ok)
+                                   .setEnabled(bool(selected())))
+        search.setFocus()
+        if dialog.exec():
+            self.set_visible_columns(selected())
+
+    def apply_column_drag(self):
+        header = self.table.horizontalHeader()
+        visible = self.model.headers
+        if header.count() != len(visible):
+            return
+        order = [visible[header.logicalIndex(i)] for i in range(header.count())]
+        if order == visible:
+            return
+        with QSignalBlocker(header):
+            for i in range(header.count()):
+                header.moveSection(header.visualIndex(i), i)
+        if self.columns_action.isEnabled():
+            reordered = iter(order)
+            layout = tuple(next(reordered) if name in visible else name
+                           for name in self.selection.ordered_columns(self.source_headers))
+            self.load_view(self.path, replace(self.selection, column_order=layout))
 
     def populate_recent_files(self):
         self.recent_menu.clear()
@@ -1024,6 +1135,16 @@ class MainWindow(QMainWindow):
     def record_edit(self, key, before, after):
         self.refresh_after_edit(("edit", [(key, before, after)]))
 
+    def edit_cell_value(self):
+        current = self.table.currentIndex()
+        if not self.model.editable or not current.isValid():
+            return
+        cell = QPersistentModelIndex(current)
+        value = current.data(Qt.ItemDataRole.EditRole)
+        edited, accepted = QInputDialog.getMultiLineText(self, "Value Editor", "Cell value:", value)
+        if accepted and cell.isValid():
+            self.model.setData(QModelIndex(cell), edited)
+
     def move_history(self, step):
         target = self.history_pos + step
         if not self.model.editable or not 0 <= target <= len(self.history):
@@ -1377,7 +1498,33 @@ class MainWindow(QMainWindow):
 
             remove.clicked.connect(remove_condition)
 
-        for column, value in current.conditions or ((None, ""),):
+        exact_rules = list(current.exact_filters)
+
+        def add_exact_row(rule):
+            column, operator, value = rule
+            row = QWidget()
+            widgets = QHBoxLayout(row)
+            comparison = "=" if operator == "equals" else "≠"
+            description = f"{column} {comparison} {repr(value) if value is not None else 'NULL'}"
+            label = QLabel(description[:120])
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setToolTip(description)
+            widgets.addWidget(label, 1)
+            remove = QPushButton("Remove")
+            widgets.addWidget(remove)
+            filter_rows.addWidget(row)
+
+            def remove_rule():
+                exact_rules.remove(rule)
+                filter_rows.removeWidget(row)
+                row.hide()
+                row.deleteLater()
+
+            remove.clicked.connect(remove_rule)
+
+        for rule in exact_rules:
+            add_exact_row(rule)
+        for column, value in current.conditions or (() if exact_rules else ((None, ""),)):
             add_condition(column, value)
         add = QPushButton("Add condition")
         add.clicked.connect(lambda: add_condition())
@@ -1430,6 +1577,8 @@ class MainWindow(QMainWindow):
                 if (sort_column.currentData(), direction.currentIndex() == 1)
                 == (current.sort_column, current.descending)
                 else (),
+                column_order=current.column_order,
+                exact_filters=tuple(exact_rules),
             )
             self.load_view(self.path, selection)
             dialog.accept()
@@ -1523,7 +1672,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("The source CSV changed. Reopen it before editing.")
             base = Path(snapshot.name) / "source.csv" if snapshot else path
             source_headers = None
-            if new_file and selection.visible_columns is not None:
+            if new_file and (selection.visible_columns is not None or selection.column_order):
                 source_headers = read_page(path, 0, cancel=cancel, fmt=fmt)[0]
             if distinct is not None and (edits or snapshot):
                 result = prepare_editable_result(
@@ -1604,7 +1753,7 @@ class MainWindow(QMainWindow):
         self.result, self.distinct = result, distinct
         self.has_more = False
         self.model.filtered_columns = (
-            {name for name, _ in selection.conditions} if distinct is None else set()
+            selection.filter_columns if distinct is None else set()
         )
         ids = []
         self.identified = identified
@@ -1612,6 +1761,9 @@ class MainWindow(QMainWindow):
             headers, rows, ids = self.split_row_ids(headers, rows)
         self.model.replace(headers, rows, row_ids=ids)
         header = self.table.horizontalHeader()
+        with QSignalBlocker(header):
+            for i in range(header.count()):
+                header.moveSection(header.visualIndex(i), i)
         header.controls_enabled = distinct is None
         header.sort_keys = selection.sort_keys
         header.filtered = self.model.filtered_columns
@@ -1928,6 +2080,7 @@ class MainWindow(QMainWindow):
     def update_edit_actions(self):
         self.copy_action.setEnabled(self.path is not None)
         for action in (
+            self.value_action,
             self.paste_action,
             self.clear_action,
             self.add_row_action,
@@ -1953,6 +2106,9 @@ class MainWindow(QMainWindow):
         self.save_as_action.setEnabled(available)
         self.go_to_row_action.setEnabled(available and self.page_job is None and self.model.rowCount() > 0)
         self.find_action.setEnabled(self.path is not None)
+        can_manage_columns = available and self.distinct is None
+        self.columns_action.setEnabled(can_manage_columns)
+        self.table.horizontalHeader().setSectionsMovable(can_manage_columns)
         can_find = (
             available and not self.find_bar.isHidden() and bool(self.model.rowCount())
             and bool(self.find_input.text()) and self.find_job is None and self.page_job is None

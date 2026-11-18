@@ -87,3 +87,43 @@ def test_staging_writes_only_matching_rows_and_needed_columns(tmp_path):
         assert [column[0] for column in result.description] == ["id"]
         assert result.fetchall() == [("001",)]
     assert not (tmp_path / "input-block.parquet").exists()
+
+
+@pytest.mark.parametrize(
+    ("operator", "value", "match_any", "ids", "counts"),
+    [
+        ("equals", None, False, ["0201"], [("keep", 1)]),
+        ("not_equals", None, False, ["0202", "0203", "0204"], [("keep", 3)]),
+        ("equals", "NULL", False, ["0202"], [("keep", 1)]),
+        ("equals", "a", False, ["0203"], [("keep", 1)]),
+        ("not_equals", "a", False, ["0201", "0202", "0204"], [("keep", 3)]),
+        ("equals", None, True, ["0201", "0202", "0203", "0204", "0205"],
+         [("keep", 4), ("other", 1)]),
+    ],
+)
+def test_exact_filter_in_view_unique_export_and_session(
+    tmp_path, operator, value, match_any, ids, counts,
+):
+    from csv_workbench.session import load_session, save_session
+
+    source = tmp_path / "rows.csv"
+    source.write_text(
+        "id,text,tag\n" + "".join(f"{i:04},prefix,skip\n" for i in range(201))
+        + "0201,,keep\n0202,NULL,keep\n0203,a,keep\n0204,A,keep\n0205,,other\n",
+        encoding="utf-8",
+    )
+    selection = Selection(
+        filters=(("tag", "keep"),), visible_columns=("id",), match_any=match_any,
+        exact_filters=(("text", operator, value),),
+    )
+    expected = (["id"], [(value,) for value in ids], False)
+    assert read_page(source, 0, selection) == expected
+    result = prepare_result(source, selection, distinct="tag")
+    with result.scratch:
+        assert result.page(0) == (["Value", "Frequency"], counts, False)
+    destination = tmp_path / "out.csv"
+    assert export_csv(source, destination, selection) == len(ids)
+    assert read_page(destination, 0) == expected
+    session = tmp_path / "view.csvsession"
+    save_session(session, source, selection)
+    assert load_session(session)[1] == selection
