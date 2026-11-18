@@ -12,6 +12,7 @@ from csv_workbench.ui import MainWindow
 
 @pytest.fixture(autouse=True)
 def preset_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(MainWindow, "recovery_root", property(lambda _: tmp_path / "recovery"))
     path = str(tmp_path / "format-settings.ini")
 
     def settings(*_):

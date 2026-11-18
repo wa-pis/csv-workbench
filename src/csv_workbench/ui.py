@@ -19,6 +19,7 @@ from PySide6.QtCore import (
     QRect,
     QSettings,
     QSignalBlocker,
+    QStandardPaths,
     Qt,
     QTimer,
     Signal,
@@ -94,6 +95,12 @@ from csv_workbench.recent import (
     remove_recent_file,
     set_file_pinned,
 )
+from csv_workbench.recovery import (
+    MISSING,
+    RecoveryJournal,
+    checkpoint_data,
+    read_checkpoint,
+)
 from csv_workbench.session import (
     load_session,
     load_workspace_session,
@@ -102,7 +109,6 @@ from csv_workbench.session import (
 )
 from csv_workbench.text_formats import clipboard_text
 
-MISSING = object()
 ROOT_INDEX = QModelIndex()
 BUFFER_ROWS = PAGE_SIZE * 3
 JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job", "compare_job")
@@ -466,6 +472,12 @@ class MainWindow(QMainWindow):
         self.source_headers: list[str] = []
         self.selection = Selection()
         self.csv_format = CsvFormat()
+        self.recovery_journal = None
+        self.recovery_future = None
+        self.recovery_request = None
+        self.recovery_pending = False
+        self.recovery_poll = QTimer(self, interval=100)
+        self.recovery_poll.timeout.connect(self.check_recovery)
         self.model = PageModel()
         self.history = []
         self.history_pos = self.clean_pos = 0
@@ -753,6 +765,7 @@ class MainWindow(QMainWindow):
             pins = tuple(column for column in pins if column != name) if pinned else (*pins, name)
             self.selection = replace(self.selection, pinned_columns=pins)
             self.table.set_pins(pins)
+            self.checkpoint_recovery()
         elif action == hide:
             self.set_visible_columns(name for i, name in enumerate(self.model.headers) if i != section)
 
@@ -1272,6 +1285,48 @@ class MainWindow(QMainWindow):
         self.save_job = self.submit(save)
         self.poll.start()
         self.update_status()
+
+    @property
+    def recovery_root(self):
+        return Path(QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppLocalDataLocation
+        )) / "recovery"
+
+    def checkpoint_recovery(self):
+        if self.path is None or self.recovery_pending:
+            return
+        try:
+            if not self.dirty:
+                if self.recovery_journal:
+                    self.recovery_future = self.recovery_journal.clear()
+                else:
+                    return
+            else:
+                if self.recovery_journal is None:
+                    self.recovery_journal = RecoveryJournal(self.recovery_root)
+                data = checkpoint_data(
+                    self.path, self.selection, self.csv_format, self.revision,
+                    self.source_headers, self.model.edits, self.history,
+                    self.history_pos, self.clean_pos, self.next_row_id,
+                )
+                self.recovery_future = self.recovery_journal.write(data, self.source_snapshot)
+            self.recovery_poll.start()
+        except OSError as exc:
+            QMessageBox.warning(self, "Recovery unavailable", str(exc))
+
+    def check_recovery(self):
+        future = self.recovery_future
+        if future is None or not future.done():
+            return
+        self.recovery_future = None
+        self.recovery_poll.stop()
+        try:
+            future.result()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(
+                self, "Recovery unavailable",
+                f"Unsaved edits are still in memory, but could not be checkpointed: {exc}",
+            )
 
     @property
     def dirty(self):
@@ -1980,6 +2035,7 @@ class MainWindow(QMainWindow):
         else:
             self.applied_edits = self.model.edits.copy()
             self.commit_history()
+            self.checkpoint_recovery()
             if self.model.rowCount():
                 self.model.dataChanged.emit(
                     self.model.index(0, 0),
@@ -2004,6 +2060,7 @@ class MainWindow(QMainWindow):
         singletons=False,
         refreshing_edit=False,
         fmt=None,
+        recovery=None,
     ):
         if (
             self.view_job is not None
@@ -2014,15 +2071,51 @@ class MainWindow(QMainWindow):
             return
 
         self.reset_find()
+        self.recovery_request = recovery
         fmt = fmt or (CsvFormat() if new_file else self.csv_format)
         edits = {} if new_file else self.model.edits.copy()
         snapshot = None if new_file else self.source_snapshot
         identified = distinct is None and (
             selection != Selection() or self.structural(edits) or snapshot is not None
+            or recovery is not None
         )
 
         def read_view(*, cancel):
             revision = file_revision(path)
+            if recovery is not None:
+                if revision != recovery.revision:
+                    raise ValueError("The source CSV changed; recovery was not applied.")
+                recovered_snapshot = None
+                try:
+                    if recovery.base is not None:
+                        recovered_snapshot = TemporaryDirectory(prefix="csv-history-")
+                        base = Path(recovered_snapshot.name) / "source.csv"
+                        with recovery.base.open("rb") as source, base.open("wb") as output:
+                            while chunk := source.read(1024 * 1024):
+                                cancel.check()
+                                output.write(chunk)
+                    else:
+                        base = path
+                    source_headers = read_page(base, 0, cancel=cancel, fmt=fmt)[0]
+                    if source_headers != recovery.headers:
+                        raise ValueError("CSV columns do not match the recovery checkpoint.")
+                    if selection.sort_column:
+                        result = prepare_editable_result(
+                            base, selection, recovery.edits, cancel=cancel, fmt=fmt,
+                        )
+                        page = result.page(0, cancel=cancel)
+                    else:
+                        result = None
+                        page = read_editable_page(
+                            base, 0, selection, recovery.edits, cancel=cancel, fmt=fmt,
+                        )
+                    if file_revision(path) != revision:
+                        raise ValueError("The source CSV changed during recovery.")
+                    return revision, page, result, source_headers, recovered_snapshot
+                except BaseException:
+                    if recovered_snapshot is not None:
+                        recovered_snapshot.cleanup()
+                    raise
             if not new_file and revision != self.revision:
                 raise ValueError("The source CSV changed. Reopen it before editing.")
             base = Path(snapshot.name) / "source.csv" if snapshot else path
@@ -2072,7 +2165,7 @@ class MainWindow(QMainWindow):
         self.poll.start()
         self.update_status()
 
-    def apply_view(self, revision, page, result, source_headers):
+    def apply_view(self, revision, page, result, source_headers, recovered_snapshot=None):
         self.view_mode.setCurrentIndex(0)
         path, selection, new_file, distinct, identified, fmt = self.view_request
         headers, rows, has_more = page
@@ -2103,7 +2196,17 @@ class MainWindow(QMainWindow):
             self.model.edits.clear()
             self.history.clear()
             self.history_pos = self.clean_pos = 0
+        if self.recovery_request is not None:
+            state = self.recovery_request
+            self.source_snapshot = recovered_snapshot
+            self.model.edits = state.edits.copy()
+            self.history = state.history
+            self.history_pos, self.clean_pos = state.position, state.clean
+            self.next_row_id = state.next_row
+            self.recovery_pending = False
+            self.recovery_request = None
         self.commit_history()
+        self.checkpoint_recovery()
         self.applied_edits = self.model.edits.copy()
         self.model.source_columns = self.source_headers
         self.result, self.distinct = result, distinct
@@ -2407,6 +2510,7 @@ class MainWindow(QMainWindow):
                         remember_file(self.settings, self.path, self.csv_format)
                     self.file_size = self.revision[2]
                     self.clean_pos = self.history_pos
+                    self.checkpoint_recovery()
                     self.setWindowTitle(f"CSV Workbench — {self.path.name}")
                 else:
                     QMessageBox.information(self, "Export CSV", f"Exported {result:,} rows.")
@@ -2584,6 +2688,10 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def shutdown_document(self):
+        self.recovery_poll.stop()
+        if self.recovery_journal is not None:
+            self.recovery_journal.close(discard=not self.recovery_pending)
+            self.recovery_journal = None
         self.cancel_operations()
         self.poll.stop()
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -2628,6 +2736,50 @@ class WorkspaceWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.tabs)
         self.add_document_tab()
+
+    def offer_recovery(self):
+        root = self.tabs.currentWidget().recovery_root
+        if not root.exists():
+            return
+        for directory in sorted(root.iterdir()):
+            if not directory.is_dir() or not (directory / "state.json").exists():
+                continue
+            journal = None
+            try:
+                journal = RecoveryJournal(root, directory=directory)
+                state = read_checkpoint(directory)
+            except BlockingIOError:
+                continue
+            except (OSError, ValueError) as exc:
+                if journal is not None:
+                    journal.close(discard=False)
+                QMessageBox.warning(
+                    self, "Recovery not applied",
+                    f"{directory}: {exc}\nThe checkpoint has been kept.",
+                )
+                continue
+            answer = QMessageBox.question(
+                self, "Recover unsaved edits",
+                f"Restore unsaved edits for {state.source}?\n"
+                "Yes: restore. No: discard checkpoint. Cancel: keep for later.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                journal.close(discard=answer == QMessageBox.StandardButton.No)
+                continue
+            if self.document_for_path(state.source) is not None:
+                journal.close(discard=False)
+                continue
+            document = self.tabs.currentWidget()
+            if document.path is not None or document.view_job is not None:
+                document = self.add_document_tab()
+            document.recovery_journal = journal
+            document.recovery_pending = True
+            document.load_view(
+                state.source, state.selection, new_file=True, fmt=state.fmt, recovery=state,
+            )
 
     def switch_tab(self, direction):
         if self.tabs.count():

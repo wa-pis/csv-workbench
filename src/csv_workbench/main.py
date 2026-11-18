@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from csv_workbench.core import Selection, export_csv, prepare_result, read_page
@@ -37,6 +38,7 @@ def main() -> int:
                 return 1
         window.close()
         return 0
+    QTimer.singleShot(0, window.offer_recovery)
     return app.exec()
 
 

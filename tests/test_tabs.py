@@ -15,6 +15,7 @@ def workspace(tmp_path, monkeypatch):
         "csv_workbench.ui.QSettings",
         lambda *_: QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
     )
+    monkeypatch.setattr(MainWindow, "recovery_root", property(lambda _: tmp_path / "recovery"))
     window = WorkspaceWindow()
     yield window
     monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
@@ -270,3 +271,206 @@ def test_heavy_jobs_queue_across_tabs_and_cached_reads_bypass_queue(tmp_path, wo
         assert workspace.documents() == [first, second]
     finally:
         release.set()
+
+
+def release_checkpoint_and_close(workspace, document, monkeypatch):
+    document.recovery_future.result(timeout=5)
+    journal = document.recovery_journal
+    journal.close(discard=False).result(timeout=5)
+    document.recovery_journal = None
+    monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+    workspace.close_tab(workspace.tabs.indexOf(document))
+    return journal.directory
+
+
+def test_startup_restores_edits_history_view_and_keeps_csv_unchanged(tmp_path, monkeypatch, workspace):
+    source = tmp_path / "recover.csv"
+    original = "id;note\n1;keep a\n2;keep b\n3;hidden\n"
+    source.write_text(original)
+    selection = Selection((("note", "keep"),), "id", True,
+                          visible_columns=("note",), pinned_columns=("note",))
+    workspace.open_document(source, selection, CsvFormat(";"))
+    document = workspace.tabs.currentWidget()
+    finish_view(document)
+    document.model.setData(document.model.index(0, 0), "keep edited\nline")
+    finish_view(document)
+    directory = release_checkpoint_and_close(workspace, document, monkeypatch)
+    assert (directory / "state.json").exists()
+
+    workspace.offer_recovery()
+    restored = workspace.tabs.currentWidget()
+    finish_view(restored)
+    assert restored.dirty
+    assert restored.selection.pinned_columns == ("note",)
+    assert restored.csv_format.delimiter == ";"
+    assert restored.model.rows == [("keep edited\nline",), ("keep a",)]
+    assert restored.history_pos == 1
+    assert source.read_text() == original
+    restored.undo_action.trigger()
+    finish_view(restored)
+    assert restored.model.rows == [("keep b",), ("keep a",)]
+    assert not restored.dirty
+    restored.recovery_future.result(timeout=5)
+    assert not (directory / "state.json").exists()
+    restored.redo_action.trigger()
+    finish_view(restored)
+    assert restored.dirty
+    restored.save_action.trigger()
+    restored.save_job[1].result(timeout=5)
+    restored.collect_reads()
+    restored.recovery_future.result(timeout=5)
+    assert not restored.dirty
+    assert not (directory / "state.json").exists()
+    assert "keep edited" in source.read_text()
+
+
+def test_recovery_preserves_structural_base_after_save_and_undo(tmp_path, monkeypatch, workspace):
+    from csv_workbench.core import read_page
+
+    source = tmp_path / "structural.csv"
+    source.write_text("id,note\n1,a\n2,b\n")
+    workspace.open_document(source, Selection(), CsvFormat())
+    document = workspace.tabs.currentWidget()
+    finish_view(document)
+    document.table.setCurrentIndex(document.model.index(0, 0))
+    document.delete_rows()
+    finish_view(document)
+    document.save_action.trigger()
+    document.save_job[1].result(timeout=5)
+    document.collect_reads()
+    assert read_page(source, 0)[1] == [("2", "b")]
+    document.undo_action.trigger()
+    finish_view(document)
+    assert document.dirty and document.model.rows == [("1", "a"), ("2", "b")]
+    directory = release_checkpoint_and_close(workspace, document, monkeypatch)
+    assert (directory / "base.csv").exists()
+
+    workspace.offer_recovery()
+    restored = workspace.tabs.currentWidget()
+    finish_view(restored)
+    assert restored.model.rows == [("1", "a"), ("2", "b")]
+    assert restored.dirty and restored.source_snapshot is not None
+    assert read_page(source, 0)[1] == [("2", "b")]
+    restored.redo_action.trigger()
+    finish_view(restored)
+    assert restored.model.rows == [("2", "b")]
+    assert not restored.dirty
+
+
+@pytest.mark.parametrize("choice,retained", [
+    (QMessageBox.StandardButton.Cancel, True),
+    (QMessageBox.StandardButton.No, False),
+])
+def test_recovery_prompt_later_or_discard(tmp_path, monkeypatch, workspace, choice, retained):
+    source = tmp_path / "prompt.csv"
+    source.write_text("id\n1\n")
+    workspace.open_document(source, Selection(), CsvFormat())
+    document = workspace.tabs.currentWidget()
+    finish_view(document)
+    document.model.setData(document.model.index(0, 0), "2")
+    directory = release_checkpoint_and_close(workspace, document, monkeypatch)
+    monkeypatch.setattr(QMessageBox, "question", lambda *_: choice)
+    workspace.offer_recovery()
+    # Wait for the queued close/cleanup to release its lock.
+    import time
+
+    for _ in range(100):
+        if not (directory / "owner.lock").exists():
+            break
+        time.sleep(0.01)
+    assert (directory / "state.json").exists() == retained
+    assert workspace.tabs.currentWidget().path is None
+    assert source.read_text() == "id\n1\n"
+
+
+def test_recovery_restores_added_rows_and_batch_undo(tmp_path, monkeypatch, workspace):
+    source = tmp_path / "added.csv"
+    source.write_text("id,note\n1,a\n")
+    workspace.open_document(source, Selection(), CsvFormat())
+    document = workspace.tabs.currentWidget()
+    finish_view(document)
+    document.add_rows()
+    finish_view(document)
+    document.model.setData(document.model.index(1, 1), "added\nline")
+    finish_view(document)
+    release_checkpoint_and_close(workspace, document, monkeypatch)
+    workspace.offer_recovery()
+    restored = workspace.tabs.currentWidget()
+    finish_view(restored)
+    assert restored.model.rows == [("1", "a"), (None, "added\nline")]
+    restored.undo_action.trigger()
+    finish_view(restored)
+    assert restored.model.rows == [("1", "a"), (None, None)]
+    restored.undo_action.trigger()
+    finish_view(restored)
+    assert restored.model.rows == [("1", "a")]
+    restored.redo_action.trigger()
+    finish_view(restored)
+    assert restored.model.rows == [("1", "a"), (None, None)]
+
+
+def test_checkpoint_write_failure_is_reported_without_losing_edits(tmp_path, monkeypatch, workspace):
+    source = tmp_path / "failure.csv"
+    source.write_text("id\n1\n")
+    workspace.open_document(source, Selection(), CsvFormat())
+    document = workspace.tabs.currentWidget()
+    finish_view(document)
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
+
+    def fail(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("csv_workbench.recovery.RecoveryJournal.atomic_write", fail)
+    document.model.setData(document.model.index(0, 0), "edited")
+    from concurrent.futures import wait
+
+    wait([document.recovery_future], timeout=5)
+    document.check_recovery()
+    assert len(warnings) == 1 and "disk full" in warnings[0]
+    assert document.dirty and document.model.cell_value(document.model.index(0, 0)) == "edited"
+    assert source.read_text() == "id\n1\n"
+
+
+def test_startup_keeps_checkpoint_if_source_changed(tmp_path, monkeypatch, workspace):
+    source = tmp_path / "changed.csv"
+    source.write_text("id\n1\n")
+    workspace.open_document(source, Selection(), CsvFormat())
+    document = workspace.tabs.currentWidget()
+    finish_view(document)
+    document.model.setData(document.model.index(0, 0), "edited")
+    directory = release_checkpoint_and_close(workspace, document, monkeypatch)
+    source.write_text("id\nexternal\n")
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
+    workspace.offer_recovery()
+    assert len(warnings) == 1 and "changed" in warnings[0]
+    assert (directory / "state.json").exists()
+    assert workspace.tabs.currentWidget().path is None
+    assert source.read_text() == "id\nexternal\n"
+
+
+def test_startup_restores_multiple_tabs_and_skips_live_owners(tmp_path, monkeypatch, workspace):
+    sources = [tmp_path / "a.csv", tmp_path / "b.csv"]
+    for number, source in enumerate(sources):
+        source.write_text(f"id\n{number}\n")
+        workspace.open_document(source, Selection(), CsvFormat())
+        document = workspace.tabs.currentWidget()
+        finish_view(document)
+        document.model.setData(document.model.index(0, 0), f"edited {number}")
+        release_checkpoint_and_close(workspace, document, monkeypatch)
+    workspace.offer_recovery()
+    restored = workspace.documents()
+    assert len(restored) == 2
+    for document in restored:
+        finish_view(document)
+    assert {doc.path.name: doc.model.rows for doc in restored} == {
+        "a.csv": [("edited 0",)], "b.csv": [("edited 1",)],
+    }
+    for doc in restored:
+        doc.recovery_future.result(timeout=5)
+    prompts = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *_: prompts.append(True))
+    workspace.offer_recovery()
+    assert prompts == []
+    assert workspace.documents() == restored
