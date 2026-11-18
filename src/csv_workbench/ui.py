@@ -71,6 +71,7 @@ from csv_workbench.core import (
     detect_delimiter,
     export_csv,
     export_edited_csv,
+    export_text,
     file_revision,
     find_csv_cell,
     prepare_editable_result,
@@ -500,6 +501,12 @@ class MainWindow(QMainWindow):
         )
         self.save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
         edit_menu = self.menuBar().addMenu("Edit")
+        self.text_export_actions = []
+        for fmt in ("JSON", "Markdown"):
+            action = file_menu.addAction(
+                f"Export {fmt}…", lambda fmt=fmt: self.save_selection(fmt)
+            )
+            self.text_export_actions.append(action)
         self.undo_action = edit_menu.addAction("Undo", lambda: self.move_history(-1))
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.redo_action = edit_menu.addAction("Redo", lambda: self.move_history(1))
@@ -1534,19 +1541,19 @@ class MainWindow(QMainWindow):
         validate()
         return fields.value() if dialog.exec() else None
 
-    def save_selection(self):
+    def save_selection(self, text_format=None):
         if self.path is None or self.export_job is not None or self.save_job is not None:
             return
-        output_format = self.configure_export_format()
+        output_format = CsvFormat() if text_format else self.configure_export_format()
         if output_format is None:
             return
         tsv = output_format.delimiter == "\t"
-        extension = ".tsv" if tsv else ".csv"
+        extension = (".json" if text_format == "JSON" else ".md") if text_format else (".tsv" if tsv else ".csv")
         destination, _ = QFileDialog.getSaveFileName(
             self,
             "Export CSV",
             str(self.path.with_name(f"{self.path.stem}-selection{extension}")),
-            "TSV (*.tsv)" if tsv else "CSV (*.csv)",
+            f"{text_format} (*{extension})" if text_format else ("TSV (*.tsv)" if tsv else "CSV (*.csv)"),
         )
         if destination:
             destination = Path(destination)
@@ -1564,10 +1571,15 @@ class MainWindow(QMainWindow):
                 self.export_edits,
             )
             fmt = self.csv_format
-            if edits or snapshot:
+            if edits or snapshot or text_format:
 
                 def export(*, cancel):
                     base = Path(snapshot.name) / "source.csv" if snapshot else path
+                    if text_format:
+                        return export_text(
+                            base, destination, selection, text_format,
+                            edits=edits, revision=revision, document=path, fmt=fmt, cancel=cancel,
+                        )
                     return export_edited_csv(
                         base,
                         destination,
@@ -2410,6 +2422,8 @@ class MainWindow(QMainWindow):
             and self.save_job is None
             and self.distinct is None
         )
+        for action in self.text_export_actions:
+            action.setEnabled(self.export_button.isEnabled())
         total = self.total_rows
         if isinstance(total, int):
             total = f"{total:,}"

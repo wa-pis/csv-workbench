@@ -13,6 +13,8 @@ from threading import Lock
 
 import duckdb
 
+from csv_workbench.text_formats import formatted_chunks
+
 PAGE_SIZE = 200
 NEW_ROW = 1 << 62
 DELETED_COLUMN = -1
@@ -516,6 +518,58 @@ def export_csv(
                 count = write_csv_rows(
                     connection.execute(sql, params), output, output_format, cancel
                 )
+        cancel.publish(output, destination)
+    return count
+
+
+def export_text(
+    path, destination, selection, text_format, *, edits=None, document=None,
+    revision=None, fmt=CsvFormat(), cancel=None,
+):
+    cancel = cancel or Cancellation()
+    cancel.check()
+    if text_format not in ("JSON", "Markdown"):
+        raise ValueError("Choose JSON or Markdown.")
+    source = path.resolve(strict=True)
+    document = document or source
+    revision = revision or file_revision(document)
+    destination = destination.absolute()
+    if destination.resolve() == document.resolve() or (
+        destination.exists() and destination.samefile(document)
+    ):
+        raise ValueError("Choose a destination other than the source CSV.")
+
+    def check_source():
+        if file_revision(document) != revision:
+            raise ValueError("The source CSV changed. Reopen it before exporting.")
+
+    check_source()
+    count = 0
+    with TemporaryDirectory(dir=destination.parent) as scratch:
+        output = Path(scratch) / "export"
+        with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
+            if edits or source != document.resolve():
+                sql, params = editable_query(connection, decoded, selection, edits or {}, fmt)
+                skip = 1
+            else:
+                sql, params = selection_query(connection, decoded, selection, fmt)
+                skip = 0
+            cursor = connection.execute(sql, params)
+            headers = [column[0] for column in cursor.description[skip:]]
+
+            def rows():
+                nonlocal count
+                while batch := cursor.fetchmany(1024):
+                    cancel.check()
+                    for row in batch:
+                        count += 1
+                        yield row[skip:]
+
+            with output.open("w", encoding="utf-8", newline="") as handle:
+                for chunk in formatted_chunks(headers, rows(), text_format):
+                    cancel.check()
+                    handle.write(chunk)
+        check_source()
         cancel.publish(output, destination)
     return count
 

@@ -29,9 +29,10 @@
 
 [`csv-clipboard-formats`](openspec/changes/archive/2026-11-18-csv-clipboard-formats/proposal.md) закрыт. Copy As поддерживает TSV, CSV, JSON и Markdown с текущими правками; лимиты 10 000 ячеек и 4 МиБ.
 
+[`export-json-markdown`](openspec/changes/archive/2026-11-18-export-json-markdown/proposal.md) закрыт. Потоковый экспорт всей выборки в JSON и Markdown, включая неподгруженные строки и правки; отмена сохраняет прежний файл.
+
 Следующие кандидаты:
 
-- **Копирование и дополнительные форматы:** потоковый экспорт JSON и Markdown. Для полной выборки большого файла — потоковый экспорт на диск; копирование в буфер требует ограничения размера. Ориентир — [Data Extractors](https://www.jetbrains.com/help/datagrip/data-extractors.html).
 - **Сравнение двух файлов:** по выбранному ключу показать добавленные, удалённые и изменённые строки. Взять за ориентир [Compare Data](https://www.jetbrains.com/help/datagrip/compare-data.html), адаптировав его к локальным CSV и явно обрабатывая дубликаты ключа.
 
 Подключения к СУБД, импорт в базу и функции самой IDE вне этого плана.

@@ -1359,3 +1359,36 @@ def test_copy_as_uses_visible_order_edits_and_preserves_clipboard_on_limit(tmp_p
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_json_export_action_writes_unloaded_rows(tmp_path, monkeypatch):
+    import json
+
+    from csv_workbench.core import Selection
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "source.csv"
+    source.write_text("id\n" + "".join(f"{i:04}\n" for i in range(1201)))
+    output = tmp_path / "output.json"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(output), ""))
+    monkeypatch.setattr(QMessageBox, "information", lambda *_: None)
+    window = MainWindow()
+    try:
+        window.load_view(source, Selection(sort_column="id", descending=True), new_file=True)
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.model.rowCount() == 200
+        window.text_export_actions[0].trigger()
+        window.export_job[1].result(timeout=5)
+        window.collect_reads()
+        rows = json.loads(output.read_text())
+        assert len(rows) == 1201
+        assert rows[0] == {"id": "1200"}
+        assert rows[-1] == {"id": "0000"}
+        assert window.model.rowCount() == 200
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

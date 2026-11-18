@@ -116,3 +116,91 @@ def test_empty_export_without_header(tmp_path):
         source, destination, selection, output_format=CsvFormat("\t", False, "utf-16")
     ) == 0
     assert destination.read_bytes() == b""
+
+
+@pytest.mark.parametrize("text_format", ["JSON", "Markdown"])
+@pytest.mark.parametrize("edited", [False, True])
+def test_text_export_includes_full_sorted_filtered_selection(tmp_path, text_format, edited):
+    import json
+
+    from csv_workbench.core import export_text, file_revision
+
+    source = tmp_path / "source.csv"
+    source.write_text("id,note,group\n" + "".join(
+        f'{i:04},"Привет | {i}",yes\n' for i in range(1201)
+    ) + "9999,excluded,no\n", encoding="utf-8")
+    destination = tmp_path / "output"
+    selection = Selection(
+        (("group", "yes"),), "id", True, ("id", "note"),
+        column_order=("note", "id"),
+    )
+    edits = {(1200, 1): "edited\n| value"} if edited else {}
+    assert export_text(
+        source, destination, selection, text_format, edits=edits, revision=file_revision(source),
+    ) == 1201
+    if text_format == "JSON":
+        records = json.loads(destination.read_text(encoding="utf-8"))
+        assert len(records) == 1201
+        assert list(records[0]) == ["note", "id"]
+        assert records[0] == {"note": "edited\n| value" if edited else "Привет | 1200", "id": "1200"}
+        assert records[-1]["id"] == "0000"
+    else:
+        lines = destination.read_text(encoding="utf-8").splitlines()
+        assert lines[:2] == ["| note | id |", "| --- | --- |"]
+        assert len(lines) == 1203
+        assert lines[2] == ("| edited<br>\\| value | 1200 |" if edited
+                            else "| Привет \\| 1200 | 1200 |")
+        assert lines[-1] == "| Привет \\| 0 | 0000 |"
+
+
+@pytest.mark.parametrize("text_format", ["JSON", "Markdown"])
+def test_empty_text_export(tmp_path, text_format):
+    from csv_workbench.core import export_text
+
+    source = tmp_path / "source.csv"
+    source.write_text("id\n1\n")
+    output = tmp_path / "output"
+    assert export_text(source, output, Selection((("id", "absent"),)), text_format) == 0
+    assert output.read_text() == ("[]\n" if text_format == "JSON" else "| id |\n| --- |\n")
+
+
+@pytest.mark.parametrize("failure", ["cancel", "changed", "writer"])
+def test_text_export_failure_is_atomic(tmp_path, monkeypatch, failure):
+    from concurrent.futures import CancelledError
+
+    from csv_workbench.core import Cancellation, export_text
+    from csv_workbench.text_formats import formatted_chunks
+
+    source = tmp_path / "source.csv"
+    source.write_text("id\n1\n")
+    output = tmp_path / "output"
+    output.write_text("previous")
+    token = Cancellation()
+
+    def interrupted(*args):
+        yield from formatted_chunks(*args)
+        if failure == "cancel":
+            token.cancel()
+        elif failure == "changed":
+            source.write_text("id\n2\n")
+        else:
+            raise OSError("write failed")
+
+    monkeypatch.setattr("csv_workbench.core.formatted_chunks", interrupted)
+    with pytest.raises((CancelledError, ValueError, OSError)):
+        export_text(source, output, Selection(), "JSON", cancel=token)
+    assert output.read_text() == "previous"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["output", "source.csv"]
+
+
+def test_text_export_rejects_source_and_hardlink(tmp_path):
+    from csv_workbench.core import export_text
+
+    source = tmp_path / "source.csv"
+    source.write_text("id\n1\n")
+    alias = tmp_path / "alias"
+    alias.hardlink_to(source)
+    for destination in (source, alias):
+        with pytest.raises(ValueError, match="other than the source"):
+            export_text(source, destination, Selection(), "JSON")
+    assert source.read_text() == "id\n1\n"
