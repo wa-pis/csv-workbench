@@ -1312,3 +1312,50 @@ def test_text_preview_reads_saved_encoded_source_and_preserves_table(tmp_path):
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_copy_as_uses_visible_order_edits_and_preserves_clipboard_on_limit(tmp_path, monkeypatch):
+    import json
+
+    from PySide6.QtCore import QItemSelection, QItemSelectionModel
+
+    from csv_workbench.core import Selection
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "copy.csv"
+    source.write_text("id,note\n1,original\n")
+    window = MainWindow()
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
+    try:
+        window.load_view(source, Selection(pinned_columns=("note",)), new_file=True)
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        cell = window.model.index(0, 1)
+        window.model.edits[window.model.cell_key(cell)] = "edited"
+        selection = window.table.selectionModel()
+        selection.select(QItemSelection(window.model.index(0, 0), cell),
+                         QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        next(action for action in window.copy_as_menu.actions()
+             if action.text() == "JSON").trigger()
+        assert app.clipboard().text().index("note") < app.clipboard().text().index("id")
+        assert json.loads(app.clipboard().text()) == [{"note": "edited", "id": "1"}]
+        window.copy_action.trigger()
+        assert app.clipboard().text() == "edited\t1\r\n"
+        app.clipboard().setText("keep")
+        window.model.edits[window.model.cell_key(cell)] = "я" * (2 * 1024 * 1024)
+        window.copy_range()
+        assert app.clipboard().text() == "keep"
+        assert len(warnings) == 1
+        window.model.replace([str(i) for i in range(101)], [tuple(["x"] * 101)] * 100)
+        selection.select(QItemSelection(window.model.index(0, 0), window.model.index(99, 100)),
+                         QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        window.copy_range()
+        assert app.clipboard().text() == "keep"
+        assert len(warnings) == 2
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

@@ -98,6 +98,7 @@ from csv_workbench.session import (
     save_session,
     save_workspace_session,
 )
+from csv_workbench.text_formats import clipboard_text
 
 MISSING = object()
 ROOT_INDEX = QModelIndex()
@@ -520,6 +521,9 @@ class MainWindow(QMainWindow):
             action.setEnabled(False)
         self.copy_action = edit_menu.addAction("Copy range", self.copy_range)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
+        self.copy_as_menu = edit_menu.addMenu("Copy As")
+        for fmt in ("TSV", "CSV", "JSON", "Markdown"):
+            self.copy_as_menu.addAction(fmt, lambda fmt=fmt: self.copy_range(fmt))
         self.paste_action = edit_menu.addAction("Paste range", self.paste_range)
         self.paste_action.setShortcut(QKeySequence.StandardKey.Paste)
         self.clear_action = edit_menu.addAction("Clear cells", self.clear_cells)
@@ -1408,19 +1412,30 @@ class MainWindow(QMainWindow):
                 self.set_patch(key, value)
             self.refresh_after_edit(("edit", changes))
 
-    def copy_range(self):
-        indexes = self.table.selectedIndexes()
-        if not indexes:
+    def copy_range(self, fmt="TSV"):
+        ranges = self.table.selectionModel().selection()
+        if not ranges:
+            return
+        top, bottom = min(r.top() for r in ranges), max(r.bottom() for r in ranges)
+        left, right = min(r.left() for r in ranges), max(r.right() for r in ranges)
+        if (bottom - top + 1) * (right - left + 1) > 10_000:
+            QMessageBox.warning(self, "Copy range", "Copy is limited to 10,000 cells.")
             return
         values = {
-            (i.row(), i.column()): self.model.data(i, Qt.ItemDataRole.EditRole) for i in indexes
+            (i.row(), i.column()): self.model.cell_value(i)
+            for i in self.table.selectedIndexes()
         }
-        output = io.StringIO(newline="")
-        writer = csv.writer(output, delimiter="\t")
-        columns = range(min(c for _, c in values), max(c for _, c in values) + 1)
-        for row in range(min(r for r, _ in values), max(r for r, _ in values) + 1):
-            writer.writerow(values.get((row, col), "") for col in columns)
-        QApplication.clipboard().setText(output.getvalue())
+        header = self.table.horizontalHeader()
+        columns = [header.logicalIndex(i) for i in range(header.count())
+                   if left <= header.logicalIndex(i) <= right]
+        rows = ([values.get((row, col), "") for col in columns]
+                for row in range(top, bottom + 1))
+        try:
+            text = clipboard_text([self.model.headers[col] for col in columns], rows, fmt)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Copy range", str(exc))
+            return
+        QApplication.clipboard().setText(text)
 
     def paste_range(self):
         anchor = self.table.currentIndex()
@@ -2308,6 +2323,7 @@ class MainWindow(QMainWindow):
 
     def update_edit_actions(self):
         self.copy_action.setEnabled(self.path is not None)
+        self.copy_as_menu.setEnabled(self.path is not None)
         self.transpose_action.setEnabled(
             self.path is not None and self.distinct is None and self.view_job is None
             and self.table.selectionModel().hasSelection()
