@@ -1067,3 +1067,86 @@ def test_drop_ignores_unsupported_payloads(tmp_path, kind):
     actions = Qt.DropAction.MoveAction if kind == "move_only" else Qt.DropAction.CopyAction
     drop = QDropEvent(QPointF(), actions, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
     assert MainWindow.dropped_csv(drop) is None
+
+
+def test_pinned_columns_stay_left_and_restore_from_session(tmp_path, monkeypatch):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QMenu
+
+    from csv_workbench.core import CsvFormat, Selection, read_page
+    from csv_workbench.session import load_session, save_session
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "wide.csv"
+    columns = [f"col{i}" for i in range(12)]
+    source.write_text(",".join(columns) + "\n" + ("1," * 11 + "1\n") * 80, encoding="utf-8")
+    output = tmp_path / "export.csv"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_: (str(output), ""))
+    monkeypatch.setattr(MainWindow, "configure_export_format", lambda _: CsvFormat())
+    monkeypatch.setattr(QMessageBox, "information", lambda *_: None)
+    window = MainWindow()
+    window.resize(640, 360)
+    window.show()
+
+    def finish():
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        app.processEvents()
+
+    def choose(label, header, index):
+        class ChoosingMenu(QMenu):
+            def exec(self, *_):
+                return next(item for item in self.actions() if item.text() == label)
+
+        monkeypatch.setattr("csv_workbench.ui.QMenu", ChoosingMenu)
+        window.column_layout_menu(QPoint(header.sectionViewportPosition(index) + 5, 5), header)
+        app.processEvents()
+
+    try:
+        window.load_view(source, Selection(), new_file=True)
+        finish()
+        table = window.table
+        frozen = table.pinned
+        choose("Pin Column Left", table.horizontalHeader(), 2)
+        choose("Pin Column Left", table.horizontalHeader(), 3)
+        assert frozen.isVisible()
+        assert frozen.model() is table.model()
+        assert frozen.selectionModel() is table.selectionModel()
+        assert window.model.headers == columns
+        assert not frozen.isColumnHidden(2) and not frozen.isColumnHidden(3)
+        assert frozen.isColumnHidden(0)
+        start = frozen.visualRect(window.model.index(0, 2)).left()
+        before = table.visualRect(window.model.index(0, 4)).left()
+        table.horizontalScrollBar().setValue(table.horizontalScrollBar().maximum())
+        table.verticalScrollBar().setValue(100)
+        assert table.visualRect(window.model.index(0, 4)).left() < before
+        assert frozen.visualRect(window.model.index(0, 2)).left() == start
+        assert frozen.rowAt(0) == table.rowAt(0) > 0
+        frozen.verticalScrollBar().setValue(200)
+        assert table.verticalScrollBar().value() == 200
+        table.scrollTo(window.model.index(10, 0))
+        assert table.visualRect(window.model.index(10, 0)).left() >= frozen.width()
+
+        window.save_selection()
+        window.export_job[1].result(timeout=5)
+        window.collect_reads()
+        assert read_page(output, 0)[0] == columns
+
+        session = tmp_path / "pins.csvsession"
+        save_session(session, source, window.selection)
+        path, selection, fmt = load_session(session)
+        assert selection.pinned_columns == ("col2", "col3")
+        window.load_view(path, selection, new_file=True, fmt=fmt)
+        finish()
+        assert table.pinned_sections == (2, 3)
+        choose("Unpin Column", frozen.horizontalHeader(), 2)
+        assert table.pinned_sections == (3,)
+        choose("Unpin Column", frozen.horizontalHeader(), 3)
+        assert not frozen.isVisible()
+        assert window.model.headers == columns
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

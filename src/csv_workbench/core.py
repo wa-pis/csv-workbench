@@ -6,7 +6,7 @@ import io
 import re
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Lock
@@ -133,6 +133,9 @@ class Selection:
     extra_sort: tuple[tuple[str, bool], ...] = ()
     column_order: tuple[str, ...] = ()
     exact_filters: tuple[tuple[str, str, str | None], ...] = ()
+
+    # View metadata must not switch the CSV query or paging path.
+    pinned_columns: tuple[str, ...] = field(default=(), compare=False)
 
     def ordered_columns(self, columns):
         if len(set(self.column_order)) != len(self.column_order):

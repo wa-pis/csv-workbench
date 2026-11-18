@@ -287,6 +287,87 @@ class CsvHeader(QHeaderView):
             self.filterRequested.emit(section)
 
 
+class CsvTable(QTableView):
+    def __init__(self, model):
+        super().__init__()
+        self.setModel(model)
+        self.pinned = QTableView(self)
+        self.pinned.setModel(model)
+        self.pinned.setSelectionModel(self.selectionModel())
+        self.pinned.setHorizontalHeader(CsvHeader(self.pinned))
+        self.pinned.verticalHeader().hide()
+        self.pinned.setFrameShape(QTableView.Shape.NoFrame)
+        self.pinned.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.pinned.clicked.connect(lambda _: self.setFocus())
+        self.pinned.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.pinned.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        for view in (self, self.pinned):
+            view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            view.verticalHeader().setDefaultSectionSize(23)
+            view.setAlternatingRowColors(True)
+            view.setShowGrid(False)
+        self.pinned.hide()
+        self.pinned_sections = ()
+        self.verticalScrollBar().valueChanged.connect(self.pinned.verticalScrollBar().setValue)
+        self.pinned.verticalScrollBar().valueChanged.connect(self.sync_pinned_scroll)
+        self.verticalHeader().sectionResized.connect(
+            lambda row, _, size: self.pinned.setRowHeight(row, size)
+        )
+        self.pinned.horizontalHeader().sectionResized.connect(
+            lambda col, _, size: self.setColumnWidth(col, size)
+        )
+
+    def sync_pinned_scroll(self, value):
+        if self.pinned.isVisible():
+            self.verticalScrollBar().setValue(value)
+
+    def set_pins(self, names):
+        header = self.horizontalHeader()
+        pinned_header = self.pinned.horizontalHeader()
+        sections = tuple(i for i, name in enumerate(self.model().headers) if name in names)
+        self.pinned_sections = sections
+        order = (*sections, *(i for i in range(header.count()) if i not in sections))
+        with QSignalBlocker(header), QSignalBlocker(pinned_header):
+            for visual, logical in enumerate(order):
+                header.moveSection(header.visualIndex(logical), visual)
+                self.pinned.setColumnHidden(logical, logical not in sections)
+                if logical in sections:
+                    self.pinned.setColumnWidth(logical, header.sectionSize(logical))
+        self.pinned.setVisible(bool(sections))
+        self.place_pins()
+
+    def place_pins(self):
+        if not self.pinned_sections:
+            return
+        header = self.horizontalHeader()
+        viewport = self.viewport().geometry()
+        reserve = 80 if len(self.pinned_sections) < header.count() else 0
+        width = min(
+            self.pinned.horizontalHeader().length(), max(0, viewport.width() - reserve)
+        )
+        self.pinned.setGeometry(viewport.x(), header.y(), width, viewport.height() + header.height())
+        self.pinned.raise_()
+        with QSignalBlocker(self.pinned.verticalScrollBar()):
+            self.pinned.verticalScrollBar().setValue(self.verticalScrollBar().value())
+
+    def updateGeometries(self):
+        super().updateGeometries()
+        if hasattr(self, "pinned_sections"):
+            self.place_pins()
+
+    def scrollTo(self, index, hint=QAbstractItemView.ScrollHint.EnsureVisible):
+        bar = self.horizontalScrollBar()
+        offset = bar.value()
+        super().scrollTo(index, hint)
+        if not index.isValid() or not getattr(self, "pinned_sections", ()):
+            return
+        if index.column() in self.pinned_sections:
+            bar.setValue(offset)
+        elif (left := self.visualRect(index).left()) < self.pinned.width():
+            bar.setValue(bar.value() + left - self.pinned.width())
+
+
 class CsvFormatFields:
     def __init__(self, form, *, exporting=False):
         delimiter = QComboBox()
@@ -511,27 +592,31 @@ class MainWindow(QMainWindow):
         self.find_bar.hide()
         layout.addWidget(self.find_bar)
 
-        self.table = QTableView()
-        self.table.setModel(self.model)
-        self.table.setAlternatingRowColors(True)
-        self.table.setShowGrid(False)
-        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self.cell_filter_menu)
-        self.table.verticalHeader().setDefaultSectionSize(23)
+        self.table = CsvTable(self.model)
         header = CsvHeader(self.table)
         self.table.setHorizontalHeader(header)
         header.setSectionsClickable(True)
         header.setSectionsMovable(True)
         header.sectionMoved.connect(lambda *_: QTimer.singleShot(0, self.apply_column_drag))
-        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        header.customContextMenuRequested.connect(self.column_layout_menu)
-        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        header.sectionResized.connect(self.sync_pin_width)
         header.setStretchLastSection(True)
-        header.sortRequested.connect(self.cycle_column_sort)
-        header.filterRequested.connect(self.open_column_menu)
+        for view in (self.table, self.table.pinned):
+            view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            view.customContextMenuRequested.connect(
+                lambda point, view=view: self.cell_filter_menu(point, view)
+            )
+            view_header = view.horizontalHeader()
+            view_header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            view_header.customContextMenuRequested.connect(
+                lambda point, h=view_header: self.column_layout_menu(point, h)
+            )
+            view_header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            view_header.sortRequested.connect(self.cycle_column_sort)
+            view_header.filterRequested.connect(
+                lambda section, h=view_header: self.open_column_menu(section, h)
+            )
         layout.addWidget(self.table, 1)
 
-        self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.table.verticalScrollBar().valueChanged.connect(self.load_at_edge)
         for key, standard, last in (
             (Qt.Key.Key_Home, QKeySequence.StandardKey.MoveToStartOfDocument, False),
@@ -553,7 +638,7 @@ class MainWindow(QMainWindow):
                 self.path, self.selection.cycle_sort(self.model.headers[section], append=append)
             )
 
-    def open_column_menu(self, section):
+    def open_column_menu(self, section, header=None):
         if self.path is None or self.view_job is not None or self.distinct is not None:
             return
         column = self.model.headers[section]
@@ -563,7 +648,7 @@ class MainWindow(QMainWindow):
         clear_filter = menu.addAction("Clear filters for this column")
         remaining = tuple(pair for pair in current.filters if pair[0] != column)
         clear_filter.setEnabled(column in current.filter_columns)
-        header = self.table.horizontalHeader()
+        header = header or self.table.horizontalHeader()
         action = menu.exec(
             header.mapToGlobal(QPoint(header.sectionViewportPosition(section), header.height()))
         )
@@ -581,8 +666,9 @@ class MainWindow(QMainWindow):
             return
         self.load_view(self.path, selection)
 
-    def cell_filter_menu(self, point):
-        index = self.table.indexAt(point)
+    def cell_filter_menu(self, point, table=None):
+        table = table or self.table
+        index = table.indexAt(point)
         if not index.isValid() or not self.columns_action.isEnabled():
             return
         menu = QMenu(self)
@@ -590,7 +676,7 @@ class MainWindow(QMainWindow):
         equals = filters.addAction("Equals this value")
         not_equals = filters.addAction("Does not equal this value")
         cell = QPersistentModelIndex(index)
-        action = menu.exec(self.table.viewport().mapToGlobal(point))
+        action = menu.exec(table.viewport().mapToGlobal(point))
         if action in (equals, not_equals) and cell.isValid():
             self.quick_filter(QModelIndex(cell), "equals" if action == equals else "not_equals")
 
@@ -601,16 +687,34 @@ class MainWindow(QMainWindow):
                 self.selection, exact_filters=(*self.selection.exact_filters, rule),
             ))
 
-    def column_layout_menu(self, point):
+    def sync_pin_width(self, section, _, width):
+        if section in self.table.pinned_sections and width:
+            header = self.table.pinned.horizontalHeader()
+            with QSignalBlocker(header):
+                self.table.pinned.setColumnWidth(section, width)
+            self.table.place_pins()
+
+    def column_layout_menu(self, point, header=None):
         if not self.columns_action.isEnabled():
             return
-        header = self.table.horizontalHeader()
+        header = header or self.table.horizontalHeader()
         section = header.logicalIndexAt(point)
         menu = QMenu(self)
+        pin = None
+        if section >= 0:
+            name = self.model.headers[section]
+            pinned = name in self.selection.pinned_columns
+            pin = menu.addAction("Unpin Column" if pinned else "Pin Column Left")
         hide = menu.addAction("Hide Column")
         hide.setEnabled(section >= 0 and self.model.columnCount() > 1)
         menu.addAction(self.columns_action)
-        if menu.exec(header.mapToGlobal(point)) == hide:
+        action = menu.exec(header.viewport().mapToGlobal(point))
+        if pin is not None and action == pin:
+            pins = self.selection.pinned_columns
+            pins = tuple(column for column in pins if column != name) if pinned else (*pins, name)
+            self.selection = replace(self.selection, pinned_columns=pins)
+            self.table.set_pins(pins)
+        elif action == hide:
             self.set_visible_columns(name for i, name in enumerate(self.model.headers) if i != section)
 
     def set_visible_columns(self, columns):
@@ -662,17 +766,19 @@ class MainWindow(QMainWindow):
         visible = self.model.headers
         if header.count() != len(visible):
             return
-        order = [visible[header.logicalIndex(i)] for i in range(header.count())]
-        if order == visible:
+        pins = set(self.selection.pinned_columns)
+        logical = [header.logicalIndex(i) for i in range(header.count())]
+        prefix = self.table.pinned_sections
+        if logical == [*prefix, *(i for i in range(header.count()) if i not in prefix)]:
             return
-        with QSignalBlocker(header):
-            for i in range(header.count()):
-                header.moveSection(header.visualIndex(i), i)
+        order = [visible[i] for i in logical if visible[i] not in pins]
+        self.table.set_pins(self.selection.pinned_columns if self.distinct is None else ())
         if self.columns_action.isEnabled():
             reordered = iter(order)
-            layout = tuple(next(reordered) if name in visible else name
+            layout = tuple(next(reordered) if name in visible and name not in pins else name
                            for name in self.selection.ordered_columns(self.source_headers))
-            self.load_view(self.path, replace(self.selection, column_order=layout))
+            if layout != tuple(self.selection.ordered_columns(self.source_headers)):
+                self.load_view(self.path, replace(self.selection, column_order=layout))
 
     def populate_recent_files(self):
         self.recent_menu.clear()
@@ -1579,12 +1685,13 @@ class MainWindow(QMainWindow):
                 else (),
                 column_order=current.column_order,
                 exact_filters=tuple(exact_rules),
+                pinned_columns=current.pinned_columns,
             )
             self.load_view(self.path, selection)
             dialog.accept()
 
         def reset():
-            self.load_view(self.path, Selection())
+            self.load_view(self.path, Selection(pinned_columns=current.pinned_columns))
             dialog.accept()
 
         buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(apply)
@@ -1760,14 +1867,13 @@ class MainWindow(QMainWindow):
         if identified:
             headers, rows, ids = self.split_row_ids(headers, rows)
         self.model.replace(headers, rows, row_ids=ids)
-        header = self.table.horizontalHeader()
-        with QSignalBlocker(header):
-            for i in range(header.count()):
-                header.moveSection(header.visualIndex(i), i)
-        header.controls_enabled = distinct is None
-        header.sort_keys = selection.sort_keys
-        header.filtered = self.model.filtered_columns
-        header.viewport().update()
+        self.table.set_pins(selection.pinned_columns if distinct is None else ())
+        for view in (self.table, self.table.pinned):
+            header = view.horizontalHeader()
+            header.controls_enabled = distinct is None
+            header.sort_keys = selection.sort_keys
+            header.filtered = self.model.filtered_columns
+            header.viewport().update()
         self.table.scrollToTop()
         self.has_more = has_more
         self.setWindowTitle(f"CSV Workbench — {path.name}")

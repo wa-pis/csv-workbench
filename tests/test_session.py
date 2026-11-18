@@ -73,3 +73,26 @@ def test_workspace_session_rejects_invalid_documents(tmp_path, invalid):
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError):
         load_workspace_session(path)
+
+
+def test_workspace_pins_are_per_tab_and_legacy_sessions_have_no_pins(tmp_path):
+    from csv_workbench.session import load_workspace_session, save_workspace_session
+
+    workspace = tmp_path / "workspace.csvsession"
+    first, second = tmp_path / "a.csv", tmp_path / "b.csv"
+    save_workspace_session(workspace, [
+        (first, Selection(pinned_columns=("id", "city")), CsvFormat()),
+        (second, Selection(pinned_columns=("name",)), CsvFormat()),
+    ], 0)
+    tabs, _ = load_workspace_session(workspace)
+    assert [selection.pinned_columns for _, selection, _ in tabs] == [("id", "city"), ("name",)]
+
+    data = json.loads(workspace.read_text(encoding="utf-8"))
+    data["tabs"][0]["selection"].pop("pinned_columns")
+    workspace.write_text(json.dumps(data), encoding="utf-8")
+    tabs, _ = load_workspace_session(workspace)
+    assert tabs[0][1].pinned_columns == ()
+    data["tabs"][0]["selection"]["pinned_columns"] = ["id", "id"]
+    workspace.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid session selection"):
+        load_workspace_session(workspace)

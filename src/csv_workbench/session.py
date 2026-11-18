@@ -84,6 +84,7 @@ def parse_session_tab(data):
     sort = selection.get("sort_column")
     extra = selection.get("extra_sort", [])
     column_order = selection.get("column_order", [])
+    pinned = selection.get("pinned_columns", [])
     exact_filters = selection.get("exact_filters", [])
     descending = selection.get("descending")
     match_any = selection.get("match_any")
@@ -119,6 +120,9 @@ def parse_session_tab(data):
         or not isinstance(column_order, list)
         or not all(isinstance(name, str) for name in column_order)
         or len(set(column_order)) != len(column_order)
+        or not isinstance(pinned, list)
+        or not all(isinstance(name, str) for name in pinned)
+        or len(set(pinned)) != len(pinned)
         or not isinstance(exact_filters, list)
         or any(
             not isinstance(rule, list)
@@ -150,6 +154,7 @@ def parse_session_tab(data):
             tuple((column, direction) for column, direction in extra),
             tuple(column_order),
             tuple(tuple(rule) for rule in exact_filters),
+            tuple(pinned),
         ),
         fmt,
     )
