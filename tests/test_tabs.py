@@ -1,5 +1,7 @@
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings
+from PySide6.QtGui import QKeySequence
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from csv_workbench.core import CsvFormat, Selection
@@ -29,6 +31,33 @@ def workspace(tmp_path, monkeypatch):
 def finish_view(document):
     document.view_job[1].result(timeout=5)
     document.collect_reads()
+
+
+def test_workspace_keyboard_shortcuts(monkeypatch, workspace):
+    opened = []
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (opened.append(True) or "", ""))
+    workspace.show()
+    workspace.activateWindow()
+    QApplication.processEvents()
+
+    def press(key):
+        table = workspace.tabs.currentWidget().table
+        table.setFocus()
+        QTest.keySequence(table, QKeySequence(key))
+
+    keys = QKeySequence.StandardKey
+    first = workspace.tabs.currentWidget()
+    press(keys.AddTab)
+    second = workspace.tabs.currentWidget()
+    assert second is not first
+    press(keys.NextChild)
+    assert workspace.tabs.currentWidget() is first
+    press(keys.PreviousChild)
+    assert workspace.tabs.currentWidget() is second
+    press(keys.Open)
+    assert opened == [True]
+    press(keys.Close)
+    assert workspace.documents() == [first]
 
 
 def test_tabs_keep_selection_and_unsaved_edits(tmp_path, monkeypatch, workspace):

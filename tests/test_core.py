@@ -44,6 +44,7 @@ def test_filter_and_sort_before_pagination(tmp_path):
     assert rows == [(f"{i:05}",) for i in range(201, 1, -1)]
     assert has_next
     assert read_page(path, 200, selection) == (headers, [("00001",)], False)
+    assert read_page(path, None, selection) == (headers, rows + [("00001",)], False, 0)
     assert read_page(path, 0)[0] == ["id", "label"]
     assert read_page(path, 0)[1][0] == ("00001", "MaTcH%_")
 

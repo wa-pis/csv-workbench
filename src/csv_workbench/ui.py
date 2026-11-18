@@ -3,6 +3,7 @@
 import csv
 import io
 import json
+import sys
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -21,7 +22,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -117,6 +118,21 @@ class PageModel(QAbstractTableModel):
         self.headers, self.rows, self.offset = headers, rows, offset
         self.row_ids = list(row_ids)
         self.endResetModel()
+
+    def insert_buffer_rows(self, index, rows, ids, offset):
+        self.beginInsertRows(ROOT_INDEX, index, index + len(rows) - 1)
+        self.rows[index:index] = rows
+        if ids:
+            self.row_ids[index:index] = ids
+        self.offset = offset
+        self.endInsertRows()
+
+    def remove_buffer_rows(self, index, count, offset):
+        self.beginRemoveRows(ROOT_INDEX, index, index + count - 1)
+        del self.rows[index:index + count]
+        del self.row_ids[index:index + count]
+        self.offset = offset
+        self.endRemoveRows()
 
     def cell_key(self, index):
         row, col = index.row(), index.column()
@@ -370,6 +386,8 @@ class MainWindow(QMainWindow):
         self.open_button.clicked.connect(self.open_file)
         toolbar.addWidget(self.open_button)
         file_menu = self.menuBar().addMenu("File")
+        open_action = file_menu.addAction("Open CSV…", self.open_file)
+        open_action.setShortcuts(QKeySequence.StandardKey.Open)
         self.settings = QSettings("CSV Workbench", "CSV Workbench")
         self.recent_menu = file_menu.addMenu("Open Recent")
         self.recent_menu.aboutToShow.connect(self.populate_recent_files)
@@ -384,7 +402,7 @@ class MainWindow(QMainWindow):
         self.undo_action = edit_menu.addAction("Undo", lambda: self.move_history(-1))
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.redo_action = edit_menu.addAction("Redo", lambda: self.move_history(1))
-        self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self.redo_action.setShortcuts(QKeySequence.StandardKey.Redo)
         for action in (self.save_action, self.save_as_action, self.undo_action, self.redo_action):
             action.setEnabled(False)
         self.copy_action = edit_menu.addAction("Copy range", self.copy_range)
@@ -408,7 +426,7 @@ class MainWindow(QMainWindow):
             session_menu.addAction("Restore workspace…", workspace.restore_workspace_file)
             self.menuBar().setNativeMenuBar(False)
             for action in (
-                self.save_action, self.save_as_action, self.undo_action, self.redo_action,
+                open_action, self.save_action, self.save_as_action, self.undo_action, self.redo_action,
                 self.copy_action, self.paste_action, self.clear_action,
             ):
                 self.addAction(action)
@@ -456,6 +474,16 @@ class MainWindow(QMainWindow):
 
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.table.verticalScrollBar().valueChanged.connect(self.load_at_edge)
+        for key, standard, last in (
+            (Qt.Key.Key_Home, QKeySequence.StandardKey.MoveToStartOfDocument, False),
+            (Qt.Key.Key_End, QKeySequence.StandardKey.MoveToEndOfDocument, True),
+        ):
+            shortcut = QShortcut(self.table)
+            keys = QKeySequence.keyBindings(standard)
+            plain = QKeySequence(key)
+            shortcut.setKeys(keys if plain in keys else [plain, *keys])
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(lambda last=last: self.go_to_edge(last))
         self.status = QLabel("Open a CSV file to begin")
         self.statusBar().addWidget(self.status, 1)
         self.update_edit_actions()
@@ -1558,7 +1586,30 @@ class MainWindow(QMainWindow):
             offset = start - PAGE_SIZE
         else:
             return
+        self.load_page(offset)
+
+    def go_to_edge(self, last):
+        if self.path is None or self.view_job or self.page_job or self.save_job:
+            return
+        needs_page = self.has_more if last else self.model.offset > 0
+        if needs_page:
+            self.load_page(None if last else 0, jump=True)
+        else:
+            self.show_edge_row(last)
+
+    def show_edge_row(self, last):
+        if self.model.rowCount():
+            row = self.model.rowCount() - 1 if last else 0
+            column = max(0, self.table.currentIndex().column())
+            self.table.setCurrentIndex(self.model.index(row, column))
+            if last:
+                self.table.scrollToBottom()
+            else:
+                self.table.scrollToTop()
+
+    def load_page(self, offset, *, jump=False):
         self.page_offset = offset
+        self.page_jump = jump
         if self.result is None:
             path, revision, selection = self.path, self.revision, self.selection
             edits = self.model.edits.copy()
@@ -1594,34 +1645,40 @@ class MainWindow(QMainWindow):
     def split_row_ids(headers, rows):
         return headers[1:], [row[1:] for row in rows], [row[0] for row in rows]
 
-    def apply_page(self, headers, rows, has_more):
+    def apply_page(self, headers, rows, has_more, tail_offset=None):
         ids = []
         if self.identified:
             headers, rows, ids = self.split_row_ids(headers, rows)
         if headers != self.model.headers or not rows:
             raise ValueError("CSV changed. Reopen the file to refresh it.")
+        if self.page_jump:
+            self.adjusting = True
+            self.has_more = has_more
+            self.model.replace(headers, rows, tail_offset or 0, ids)
+            self.show_edge_row(tail_offset is not None)
+            self.adjusting = False
+            return
         start = self.model.offset
         bar = self.table.verticalScrollBar()
         height = self.table.verticalHeader().defaultSectionSize()
         position = bar.value()
+        size = len(self.model.rows)
+        overflow = max(0, size + len(rows) - BUFFER_ROWS)
+        self.adjusting = True
         if self.page_offset < start:
-            combined = rows + self.model.rows
-            trimmed = len(combined) > BUFFER_ROWS
-            start = self.page_offset
+            if overflow:
+                self.model.remove_buffer_rows(size - overflow, overflow, start)
+            self.model.insert_buffer_rows(0, rows, ids, self.page_offset)
             position += len(rows) * height
-            self.has_more = self.has_more or trimmed
-            combined = combined[:BUFFER_ROWS]
-            ids = (ids + self.model.row_ids)[:BUFFER_ROWS]
+            self.has_more = self.has_more or bool(overflow)
         else:
-            combined = self.model.rows + rows
-            removed = PAGE_SIZE if len(combined) > BUFFER_ROWS else 0
-            start += removed
+            # Keep the buffer aligned to page boundaries for backward reads.
+            removed = PAGE_SIZE if overflow else 0
+            if removed:
+                self.model.remove_buffer_rows(0, removed, start + removed)
+            self.model.insert_buffer_rows(size - removed, rows, ids, start + removed)
             position -= removed * height
             self.has_more = has_more
-            combined = combined[removed:]
-            ids = (self.model.row_ids + ids)[removed:]
-        self.adjusting = True
-        self.model.replace(headers, combined, start, ids)
         self.table.doItemsLayout()
         bar.setValue(position)
         self.adjusting = False
@@ -1828,10 +1885,30 @@ class WorkspaceWindow(QWidget):
         self.restore_progress = None
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.currentChanged.connect(self.activate_document)
+        for key, callback in (
+            (QKeySequence.StandardKey.AddTab, self.add_document_tab),
+            (QKeySequence.StandardKey.Close, lambda: self.close_tab(self.tabs.currentIndex())),
+            (QKeySequence.StandardKey.NextChild, lambda: self.switch_tab(1)),
+            (QKeySequence.StandardKey.PreviousChild, lambda: self.switch_tab(-1)),
+        ):
+            shortcut = QShortcut(self)
+            keys = QKeySequence.keyBindings(key)
+            if sys.platform == "darwin":
+                # Qt's Meta modifier is the physical Control key on macOS.
+                if key == QKeySequence.StandardKey.NextChild:
+                    keys.append(QKeySequence("Meta+Tab"))
+                elif key == QKeySequence.StandardKey.PreviousChild:
+                    keys.extend((QKeySequence("Meta+Shift+Tab"), QKeySequence("Meta+Shift+Backtab")))
+            shortcut.setKeys(keys)
+            shortcut.activated.connect(callback)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.tabs)
         self.add_document_tab()
+
+    def switch_tab(self, direction):
+        if self.tabs.count():
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + direction) % self.tabs.count())
 
     def add_document_tab(self):
         document = MainWindow(workspace=self)
@@ -2022,11 +2099,15 @@ class WorkspaceWindow(QWidget):
 
     def close_tab(self, index):
         document = self.tabs.widget(index)
+        was_current = index == self.tabs.currentIndex()
         if document is not None and document.close():
             self.tabs.removeTab(index)
             document.deleteLater()
             if not self.tabs.count():
                 self.add_document_tab()
+            if was_current:
+                active = self.tabs.currentWidget()
+                (active.table if active.path is not None else active.open_button).setFocus()
 
     def dragEnterEvent(self, event):
         self.tabs.currentWidget().dragEnterEvent(event)

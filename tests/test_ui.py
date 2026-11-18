@@ -135,11 +135,20 @@ def test_scroll_buffer_can_restore_evicted_rows(tmp_path):
         bar = window.table.verticalScrollBar()
         for _ in range(3):
             bar.setValue(bar.maximum())
+            last = window.model.index(window.model.rowCount() - 1, 0)
+            window.table.setCurrentIndex(last)
+            current_value = last.data()
+            top_row = window.model.offset + window.table.rowAt(0)
             window.page_job[1].result(timeout=5)
             window.collect_reads()
+            app.processEvents()
             assert len(window.model.rows) <= BUFFER_ROWS
+            assert window.table.currentIndex().data() == current_value
+            assert window.model.offset + window.table.rowAt(0) == top_row
         assert window.model.offset == 200
         assert window.model.rows[-1] == ("0600",)
+        QTest.keyClick(window.table, Qt.Key.Key_PageDown)
+        assert window.table.currentIndex().data() == "0600"
         bar.setValue(0)
         window.page_job[1].result(timeout=5)
         window.collect_reads()
@@ -147,6 +156,26 @@ def test_scroll_buffer_can_restore_evicted_rows(tmp_path):
         assert window.model.rows[0] == ("0000",)
         assert len(window.model.rows) <= BUFFER_ROWS
         assert window.has_more
+        window.activateWindow()
+        window.table.setFocus()
+        app.processEvents()
+        QTest.keyClick(window.table, Qt.Key.Key_End)
+        window.page_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.table.currentIndex().data() == "0600"
+        assert bar.value() == bar.maximum()
+        assert not window.has_more
+        assert window.model.offset == 400
+        bar.setValue(0)
+        window.page_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.model.offset == 200
+        assert window.model.rows[-1] == ("0600",)
+        QTest.keyClick(window.table, Qt.Key.Key_Home)
+        window.page_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.model.offset == 0
+        assert window.table.currentIndex().data() == "0000"
     finally:
         window.close()
         window.executor.shutdown(wait=True)

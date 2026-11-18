@@ -380,9 +380,7 @@ def editable_query(connection, source, selection, edits, fmt=CsvFormat()):
 def read_editable_page(path, offset, selection, edits, *, cancel, fmt=CsvFormat()):
     with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
         sql, params = editable_query(connection, source, selection, edits, fmt)
-        return page_result(
-            connection.execute(sql + " LIMIT ? OFFSET ?", [*params, PAGE_SIZE + 1, offset])
-        )
+        return query_page(connection, sql, params, offset)
 
 
 def prepare_editable_result(
@@ -408,7 +406,7 @@ def prepare_editable_result(
 
 def read_page(
     path: Path,
-    offset: int,
+    offset: int | None,
     selection: Selection = Selection(),
     *,
     cancel: Cancellation | None = None,
@@ -418,11 +416,7 @@ def read_page(
     with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
         sql, params = selection_query(connection, source, selection, fmt)
         cancel.check()
-        cursor = connection.execute(
-            sql + " LIMIT ? OFFSET ?",
-            [*params, PAGE_SIZE + 1, offset],
-        )
-        return page_result(cursor)
+        return query_page(connection, sql, params, offset)
 
 
 def query_csv(path: Path, sql: str, *, fmt=CsvFormat(), cancel: Cancellation | None = None):
@@ -568,19 +562,28 @@ class DiskResult:
         self.scratch = scratch
         self.path = path
 
-    def page(self, offset: int, *, cancel: Cancellation | None = None):
+    def page(self, offset: int | None, *, cancel: Cancellation | None = None):
         with (cancel or Cancellation()).connection() as connection:
-            cursor = connection.execute(
-                "SELECT * FROM read_parquet(?) LIMIT ? OFFSET ?",
-                [str(self.path), PAGE_SIZE + 1, offset],
-            )
-            return page_result(cursor)
+            return query_page(connection, "SELECT * FROM read_parquet(?)", [str(self.path)], offset)
 
 
-def page_result(cursor):
+def query_page(connection, sql, params, offset):
+    tail = offset is None
+    limit = PAGE_SIZE
+    if tail:
+        count = connection.execute(f"SELECT count(*) FROM ({sql})", params).fetchone()[0]
+        # Include the preceding page so the user can scroll up even with a short final page.
+        limit = 2 * PAGE_SIZE
+        offset = max(0, ((count - 1) // PAGE_SIZE - 1) * PAGE_SIZE)
+    cursor = connection.execute(sql + " LIMIT ? OFFSET ?", [*params, limit + 1, offset])
+    page = page_result(cursor, limit)
+    return (*page, offset) if tail else page
+
+
+def page_result(cursor, limit=PAGE_SIZE):
     headers = [column[0] for column in cursor.description]
     rows = cursor.fetchall()
-    return headers, rows[:PAGE_SIZE], len(rows) > PAGE_SIZE
+    return headers, rows[:limit], len(rows) > limit
 
 
 CSV_BLOCK_BYTES = 8 * 2**20
