@@ -377,10 +377,10 @@ def editable_query(connection, source, selection, edits, fmt=CsvFormat()):
     return sql, [pattern, *values]
 
 
-def read_editable_page(path, offset, selection, edits, *, cancel, fmt=CsvFormat()):
+def read_editable_page(path, offset, selection, edits, *, cancel, fmt=CsvFormat(), limit=PAGE_SIZE):
     with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
         sql, params = editable_query(connection, source, selection, edits, fmt)
-        return query_page(connection, sql, params, offset)
+        return query_page(connection, sql, params, offset, limit)
 
 
 def prepare_editable_result(
@@ -411,12 +411,13 @@ def read_page(
     *,
     cancel: Cancellation | None = None,
     fmt=CsvFormat(),
+    limit=PAGE_SIZE,
 ) -> tuple[list[str], list[tuple], bool]:
     cancel = cancel or Cancellation()
     with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
         sql, params = selection_query(connection, source, selection, fmt)
         cancel.check()
-        return query_page(connection, sql, params, offset)
+        return query_page(connection, sql, params, offset, limit)
 
 
 def query_csv(path: Path, sql: str, *, fmt=CsvFormat(), cancel: Cancellation | None = None):
@@ -562,14 +563,74 @@ class DiskResult:
         self.scratch = scratch
         self.path = path
 
-    def page(self, offset: int | None, *, cancel: Cancellation | None = None):
+    def page(self, offset: int | None, *, cancel: Cancellation | None = None, limit=PAGE_SIZE):
         with (cancel or Cancellation()).connection() as connection:
-            return query_page(connection, "SELECT * FROM read_parquet(?)", [str(self.path)], offset)
+            return query_page(
+                connection, "SELECT * FROM read_parquet(?)", [str(self.path)], offset, limit
+            )
 
 
-def query_page(connection, sql, params, offset):
+def search_lower(value):
+    # Match DuckDB's simple Unicode lowercase mapping, including Greek sigma.
+    return value.lower() if value.isascii() else "".join(c.lower()[0] for c in value)
+
+
+def find_csv_cell(
+    path, selection, edits, columns, needle, anchor, forward, *,
+    cancel, fmt=CsvFormat(), result=None,
+):
+    """Return a zero-based (row, column) in the existing view, without storing matches."""
+    with cancel.connection() as connection:
+        if result is not None:
+            return find_cell_in_query(
+                connection, "SELECT * FROM read_parquet(?)", [str(result.path)],
+                columns, needle, anchor, forward,
+            )
+        with utf8_source(path, cancel, fmt) as source:
+            if edits or selection != Selection():
+                sql, params = editable_query(connection, source, selection, edits, fmt)
+            else:
+                sql, params = selection_query(connection, source, selection, fmt)
+            cancel.check()
+            return find_cell_in_query(connection, sql, params, columns, needle, anchor, forward)
+
+
+def find_cell_in_query(connection, sql, params, columns, needle, anchor, forward):
+    aliases = [f"c{i}" for i in range(len(columns))]
+    if not aliases or not needle:
+        return None
+    comparison, direction = (">", "ASC") if forward else ("<", "DESC")
+    indices = range(len(columns)) if forward else range(len(columns) - 1, -1, -1)
+    checks = ", ".join(
+        f"(rn <> anchor_row OR {i} {comparison} anchor_col) "
+        f"AND contains(lower(CAST(c{i} AS VARCHAR)), needle)"
+        for i in indices
+    )
+    projected = ", ".join(map(quote_identifier, columns))
+    row, column = anchor
+    found = connection.execute(
+        f"""
+        WITH numbered(rn, {", ".join(aliases)}) AS (
+            SELECT row_number() OVER () - 1, {projected} FROM ({sql})
+        ), options AS (
+            SELECT lower(?) AS needle, ?::BIGINT AS anchor_row, ?::INTEGER AS anchor_col
+        )
+        SELECT rn, list_position([{checks}], true) AS pos
+        FROM numbered, options
+        WHERE rn {comparison}= anchor_row AND pos IS NOT NULL
+        ORDER BY rn {direction}
+        LIMIT 1
+        """,
+        [*params, needle, row, column],
+    ).fetchone()
+    if found is None:
+        return None
+    row, pos = found
+    return row, pos - 1 if forward else len(columns) - pos
+
+
+def query_page(connection, sql, params, offset, limit):
     tail = offset is None
-    limit = PAGE_SIZE
     if tail:
         count = connection.execute(f"SELECT count(*) FROM ({sql})", params).fetchone()[0]
         # Include the preceding page so the user can scroll up even with a short final page.

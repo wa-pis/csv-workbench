@@ -1,9 +1,11 @@
 from concurrent.futures import wait
+from threading import Event
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt
+from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
 from csv_workbench.ui import MainWindow
 
@@ -177,6 +179,137 @@ def test_scroll_buffer_can_restore_evicted_rows(tmp_path):
         assert window.model.offset == 0
         assert window.table.currentIndex().data() == "0000"
     finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.parametrize("sorted_view", [False, True])
+def test_go_to_row_in_current_view(tmp_path, monkeypatch, sorted_view):
+    from csv_workbench.core import Selection
+    from csv_workbench.ui import BUFFER_ROWS
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "rows.csv"
+    source.write_text(
+        "id,label\n" + "".join(f"{i:04},{'keep' if i % 2 == 0 else 'skip'}\n" for i in range(2000)),
+        encoding="utf-8",
+    )
+    selection = Selection((("label", "keep"),), "id", True) if sorted_view else Selection()
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
+    answers = iter([("401", True), ("abc", True), ("10001", True), ("1", False)])
+    monkeypatch.setattr(QInputDialog, "getText", lambda *_: next(answers))
+    window = MainWindow()
+    window.show()
+    try:
+        window.load_view(source, selection, new_file=True)
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.go_to_row_action.isEnabled()
+        window.go_to_row_action.trigger()
+        window.page_job[1].result(timeout=5)
+        window.collect_reads()
+
+        expected = "1198" if sorted_view else "0400"
+        assert window.table.currentIndex().data() == expected
+        assert window.model.offset + window.table.currentIndex().row() == 400
+        assert window.model.rowCount() <= BUFFER_ROWS
+
+        window.go_to_row_action.trigger()  # Invalid text.
+        window.go_to_row_action.trigger()  # Valid integer, but past the end.
+        window.page_job[1].result(timeout=5)
+        window.collect_reads()
+        window.go_to_row_action.trigger()  # Cancel the dialog.
+        assert len(warnings) == 2
+        assert window.table.currentIndex().data() == expected
+        assert window.model.offset == 200
+        assert window.has_more
+
+        bar = window.table.verticalScrollBar()
+        bar.setValue(0)
+        window.page_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.model.offset == 0
+        assert window.table.currentIndex().data() == expected
+        bar.setValue(bar.maximum())
+        window.page_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.model.offset == 200
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_find_selects_and_highlights_unbuffered_cells_and_cancels(tmp_path, monkeypatch):
+    from csv_workbench.core import Selection
+
+    app = QApplication.instance() or QApplication(["csv-workbench-test", "-platform", "offscreen"])
+    source = tmp_path / "find.csv"
+    source.write_text(
+        "id,note\n" + "".join(f"{i},{'hit far' if i == 710 else 'plain'}\n" for i in range(1000)),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes)
+    window = MainWindow()
+    window.show()
+    window.activateWindow()
+    app.processEvents()
+    release = Event()
+    try:
+        window.load_view(source, Selection(), new_file=True)
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        window.model.setData(window.model.index(0, 1), "HIT edit")
+        window.table.setFocus()
+        QTest.keySequence(window.table, QKeySequence(QKeySequence.StandardKey.Find))
+        assert not window.find_bar.isHidden()
+        window.find_input.setText("hit")
+
+        def navigate(button):
+            button.click()
+            window.find_job[1].result(timeout=5)
+            window.collect_reads()
+            if window.page_job is not None:
+                window.page_job[1].result(timeout=5)
+                window.collect_reads()
+            current = window.table.currentIndex()
+            assert current.column() == 1
+            assert current.data(Qt.ItemDataRole.BackgroundRole) is not None
+            return current.data()
+
+        assert navigate(window.find_next) == "HIT edit"
+        assert navigate(window.find_next) == "hit far"
+        assert window.model.offset + window.table.currentIndex().row() == 710
+        assert navigate(window.find_previous) == "HIT edit"
+        assert window.selection == Selection()
+
+        started = Event()
+
+        def late_search(*_, **__):
+            started.set()
+            assert release.wait(timeout=5)
+            return 710, 1
+
+        monkeypatch.setattr("csv_workbench.ui.find_csv_cell", late_search)
+        window.find_next.click()
+        assert started.wait(timeout=5)
+        window.find_stop.click()
+        assert window.find_job[0].cancelled
+        release.set()
+        window.find_job[1].result(timeout=5)
+        window.collect_reads()
+        assert window.find_message.text() == "Cancelled"
+        assert window.table.currentIndex().data() == "HIT edit"
+        window.close_find()
+        assert window.table.currentIndex().data(Qt.ItemDataRole.BackgroundRole) is None
+    finally:
+        release.set()
         window.close()
         window.executor.shutdown(wait=True)
         window.deleteLater()

@@ -22,7 +22,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -68,6 +68,7 @@ from csv_workbench.core import (
     export_csv,
     export_edited_csv,
     file_revision,
+    find_csv_cell,
     prepare_editable_result,
     prepare_result,
     preview_format,
@@ -76,6 +77,7 @@ from csv_workbench.core import (
     read_format_sample,
     read_page,
     save_csv,
+    search_lower,
     selection_sql,
 )
 from csv_workbench.presets import FormatPresets, export_format_presets, import_format_presets
@@ -96,7 +98,11 @@ from csv_workbench.session import (
 MISSING = object()
 ROOT_INDEX = QModelIndex()
 BUFFER_ROWS = PAGE_SIZE * 3
-JOB_NAMES = ("view_job", "count_job", "page_job", "export_job", "query_job", "save_job")
+JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job")
+FIND_COLORS = {
+    Qt.ItemDataRole.BackgroundRole: QBrush(QColor("#ffe38a")),
+    Qt.ItemDataRole.ForegroundRole: QBrush(QColor("#242424")),
+}
 
 
 class PageModel(QAbstractTableModel):
@@ -112,6 +118,7 @@ class PageModel(QAbstractTableModel):
         self.editable = False
         self.row_ids = []
         self.source_columns = []
+        self.find_text = ""
 
     def replace(self, headers: list[str], rows: list[tuple], offset: int = 0, row_ids=()) -> None:
         self.beginResetModel()
@@ -147,12 +154,14 @@ class PageModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.headers)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or role not in (
-            Qt.ItemDataRole.DisplayRole,
-            Qt.ItemDataRole.EditRole,
-        ):
+        if not index.isValid():
+            return None
+        highlight = self.find_text and role in FIND_COLORS
+        if not highlight and role not in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             return None
         value = self.edits.get(self.cell_key(index), self.rows[index.row()][index.column()])
+        if highlight:
+            return FIND_COLORS[role] if value is not None and self.find_text in search_lower(str(value)) else None
         if role == Qt.ItemDataRole.EditRole:
             return "" if value is None else str(value)
         return "NULL" if value is None else str(value)
@@ -351,6 +360,8 @@ class MainWindow(QMainWindow):
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.count_job = None
         self.page_job = None
+        self.find_job = None
+        self.find_match = None
         self.export_job = None
         self.save_job = None
         self.write_destination = None
@@ -403,6 +414,12 @@ class MainWindow(QMainWindow):
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.redo_action = edit_menu.addAction("Redo", lambda: self.move_history(1))
         self.redo_action.setShortcuts(QKeySequence.StandardKey.Redo)
+        self.go_to_row_action = edit_menu.addAction("Go to Row…", self.prompt_for_row)
+        self.go_to_row_action.setShortcut(QKeySequence("Ctrl+G"))
+        self.go_to_row_action.setEnabled(False)
+        self.find_action = edit_menu.addAction("Find…", self.open_find)
+        self.find_action.setShortcuts(QKeySequence.StandardKey.Find)
+        self.find_action.setEnabled(False)
         for action in (self.save_action, self.save_as_action, self.undo_action, self.redo_action):
             action.setEnabled(False)
         self.copy_action = edit_menu.addAction("Copy range", self.copy_range)
@@ -427,7 +444,8 @@ class MainWindow(QMainWindow):
             self.menuBar().setNativeMenuBar(False)
             for action in (
                 open_action, self.save_action, self.save_as_action, self.undo_action, self.redo_action,
-                self.copy_action, self.paste_action, self.clear_action,
+                self.copy_action, self.paste_action, self.clear_action, self.go_to_row_action,
+                self.find_action,
             ):
                 self.addAction(action)
                 action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -457,6 +475,32 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_operations)
         toolbar.addWidget(self.cancel_button)
+
+        self.find_bar = QWidget()
+        find_layout = QHBoxLayout(self.find_bar)
+        find_layout.setContentsMargins(6, 2, 6, 2)
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("Find in current view")
+        self.find_input.setAccessibleName("Find in current view")
+        find_layout.addWidget(self.find_input, 1)
+        self.find_previous = QPushButton("Previous")
+        self.find_next = QPushButton("Next")
+        self.find_stop = QPushButton("Stop")
+        self.find_message = QLabel()
+        find_close = QPushButton("Close")
+        for widget in (self.find_previous, self.find_next, self.find_stop, self.find_message, find_close):
+            find_layout.addWidget(widget)
+        self.find_input.textChanged.connect(self.reset_find)
+        self.find_input.returnPressed.connect(lambda: self.start_find(True))
+        self.find_previous.clicked.connect(lambda: self.start_find(False))
+        self.find_next.clicked.connect(lambda: self.start_find(True))
+        self.find_stop.clicked.connect(self.stop_find)
+        find_close.clicked.connect(self.close_find)
+        escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.find_bar)
+        escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        escape.activated.connect(self.close_find)
+        self.find_bar.hide()
+        layout.addWidget(self.find_bar)
 
         self.table = QTableView()
         self.table.setModel(self.model)
@@ -934,6 +978,7 @@ class MainWindow(QMainWindow):
         if self.workspace and self.workspace.destination_busy(destination, except_document=self):
             QMessageBox.warning(self, "Save CSV", "The destination is open or being written in another tab.")
             return
+        self.reset_find()
         if self.page_job is not None:
             self.page_job[0].cancel()
             self.page_job[1].cancel()
@@ -1424,6 +1469,7 @@ class MainWindow(QMainWindow):
             )
 
     def refresh_after_edit(self, history):
+        self.reset_find()
         self.pending_history = history
         if self.selection != Selection() or self.identified or self.structural(self.model.edits):
             self.load_view(self.path, self.selection, refreshing_edit=True)
@@ -1463,6 +1509,7 @@ class MainWindow(QMainWindow):
         ):
             return
 
+        self.reset_find()
         fmt = fmt or (CsvFormat() if new_file else self.csv_format)
         edits = {} if new_file else self.model.edits.copy()
         snapshot = None if new_file else self.source_snapshot
@@ -1593,23 +1640,131 @@ class MainWindow(QMainWindow):
             return
         needs_page = self.has_more if last else self.model.offset > 0
         if needs_page:
-            self.load_page(None if last else 0, jump=True)
+            self.load_page(None if last else 0, target_row=None if last else 0)
         else:
             self.show_edge_row(last)
+
+    def prompt_for_row(self):
+        value, accepted = QInputDialog.getText(self, "Go to Row", "Row number in the current view:")
+        if not accepted:
+            return
+        try:
+            number = int(value)
+        except ValueError:
+            number = 0
+        self.go_to_row(number)
+
+    def open_find(self):
+        if self.find_bar.isHidden():
+            self.find_bar.show()
+            self.reset_find()
+        self.find_input.setFocus()
+        self.find_input.selectAll()
+        self.update_status()
+
+    def close_find(self):
+        self.find_bar.hide()
+        self.reset_find()
+        self.table.setFocus()
+
+    def cancel_find(self):
+        jobs = [self.find_job]
+        if self.page_job is not None and self.page_target_column is not None:
+            jobs.append(self.page_job)
+        for job in jobs:
+            if job is not None:
+                token, future = job
+                future.cancel()
+                token.cancel()
+
+    def stop_find(self):
+        self.cancel_find()
+        self.find_match = None
+        self.find_message.setText("Cancelled")
+        self.update_status()
+
+    def reset_find(self):
+        self.cancel_find()
+        self.find_match = None
+        self.find_message.clear()
+        self.model.find_text = (
+            "" if self.find_bar.isHidden() else search_lower(self.find_input.text())
+        )
+        self.table.viewport().update()
+        self.update_status()
+
+    def start_find(self, forward):
+        if not self.find_next.isEnabled():
+            return
+        anchor = self.find_match
+        if anchor is None:
+            anchor = (-1, -1) if forward else (2**63 - 1, -1)
+        path, revision = self.path, self.revision
+        snapshot, result = self.source_snapshot, self.result
+        selection, fmt = self.selection, self.csv_format
+        edits, columns = self.model.edits.copy(), tuple(self.model.headers)
+        needle = self.find_input.text()
+
+        def search(*, cancel):
+            if file_revision(path) != revision:
+                raise ValueError("The source CSV changed. Reopen it before searching.")
+            match = find_csv_cell(
+                Path(snapshot.name) / "source.csv" if snapshot else path,
+                selection, edits, columns, needle, anchor, forward,
+                cancel=cancel, fmt=fmt, result=result,
+            )
+            if file_revision(path) != revision:
+                raise ValueError("The source CSV changed. Reopen it before searching.")
+            return match
+
+        self.find_job = self.submit(search)
+        self.find_message.clear()
+        self.poll.start()
+        self.update_status()
+
+    def apply_find(self, match):
+        if match is None:
+            self.find_message.setText("No more matches" if self.find_match else "No matches")
+            return
+        self.find_match = match
+        row, column = match
+        self.go_to_row(row + 1, column=column)
+
+    def go_to_row(self, number, *, column=None):
+        if self.path is None or self.view_job or self.page_job or self.save_job:
+            return
+        target = number - 1
+        start = self.model.offset
+        end = start + self.model.rowCount()
+        if target < 0 or (not self.has_more and target >= end) or target >= 2**63 - 1:
+            self.report_missing_row()
+        elif start <= target < end:
+            self.show_row(target - start, QAbstractItemView.ScrollHint.PositionAtCenter, column)
+        else:
+            # Leave room to scroll on either side of the target.
+            offset = max(0, target // PAGE_SIZE - 1) * PAGE_SIZE
+            self.load_page(offset, target_row=target, target_column=column, limit=BUFFER_ROWS)
+
+    def report_missing_row(self):
+        QMessageBox.warning(self, "Go to Row", "Enter an existing row number starting at 1.")
 
     def show_edge_row(self, last):
         if self.model.rowCount():
             row = self.model.rowCount() - 1 if last else 0
-            column = max(0, self.table.currentIndex().column())
-            self.table.setCurrentIndex(self.model.index(row, column))
-            if last:
-                self.table.scrollToBottom()
-            else:
-                self.table.scrollToTop()
+            hint = QAbstractItemView.ScrollHint
+            self.show_row(row, hint.PositionAtBottom if last else hint.PositionAtTop)
 
-    def load_page(self, offset, *, jump=False):
+    def show_row(self, row, hint, column=None):
+        if column is None:
+            column = max(0, self.table.currentIndex().column())
+        index = self.model.index(row, column)
+        self.table.setCurrentIndex(index)
+        self.table.scrollTo(index, hint)
+
+    def load_page(self, offset, *, target_row=None, target_column=None, limit=PAGE_SIZE):
         self.page_offset = offset
-        self.page_jump = jump
+        self.page_target_row = target_row
+        self.page_target_column = target_column
         if self.result is None:
             path, revision, selection = self.path, self.revision, self.selection
             edits = self.model.edits.copy()
@@ -1619,7 +1774,7 @@ class MainWindow(QMainWindow):
                 if file_revision(path) != revision:
                     raise ValueError("The source CSV changed. Reopen it before editing.")
                 page = (
-                    read_page(path, offset, selection, cancel=cancel, fmt=fmt)
+                    read_page(path, offset, selection, cancel=cancel, fmt=fmt, limit=limit)
                     if not identified
                     else read_editable_page(
                         Path(snapshot.name) / "source.csv" if snapshot else path,
@@ -1628,6 +1783,7 @@ class MainWindow(QMainWindow):
                         edits,
                         cancel=cancel,
                         fmt=fmt,
+                        limit=limit,
                     )
                 )
                 if file_revision(path) != revision:
@@ -1637,7 +1793,7 @@ class MainWindow(QMainWindow):
             self.page_job = self.submit(read_current_page)
         else:
             # Cached pages only read the existing result and can bypass the scan queue.
-            self.page_job = self.submit(self.result.page, offset, heavy=False)
+            self.page_job = self.submit(self.result.page, offset, limit=limit, heavy=False)
         self.poll.start()
         self.update_status()
 
@@ -1649,13 +1805,26 @@ class MainWindow(QMainWindow):
         ids = []
         if self.identified:
             headers, rows, ids = self.split_row_ids(headers, rows)
-        if headers != self.model.headers or not rows:
+        if headers != self.model.headers:
             raise ValueError("CSV changed. Reopen the file to refresh it.")
-        if self.page_jump:
+        target = self.page_target_row
+        if target is not None and target - self.page_offset >= len(rows):
+            self.report_missing_row()
+            return
+        if not rows:
+            raise ValueError("CSV changed. Reopen the file to refresh it.")
+        if tail_offset is not None or target is not None:
             self.adjusting = True
             self.has_more = has_more
-            self.model.replace(headers, rows, tail_offset or 0, ids)
-            self.show_edge_row(tail_offset is not None)
+            if tail_offset is not None:
+                self.model.replace(headers, rows, tail_offset, ids)
+                self.show_edge_row(True)
+            else:
+                self.model.replace(headers, rows, self.page_offset, ids)
+                self.show_row(
+                    target - self.page_offset, QAbstractItemView.ScrollHint.PositionAtCenter,
+                    self.page_target_column,
+                )
             self.adjusting = False
             return
         start = self.model.offset
@@ -1693,7 +1862,7 @@ class MainWindow(QMainWindow):
     def collect_reads(self):
         for name in JOB_NAMES:
             job = getattr(self, name)
-            if job is None or not job[1].done():
+            if job is None or not job[1].done() or (name == "find_job" and self.page_job):
                 continue
             token, future = job
             setattr(self, name, None)
@@ -1710,6 +1879,8 @@ class MainWindow(QMainWindow):
                     self.total_rows = result
                 elif name == "page_job":
                     self.apply_page(*result)
+                elif name == "find_job":
+                    self.apply_find(result)
                 elif name == "query_job":
                     self.show_query_result(*result)
                 elif name == "save_job":
@@ -1730,6 +1901,8 @@ class MainWindow(QMainWindow):
                     self.rollback_edit()
                 if name == "count_job":
                     self.total_rows = "cancelled"
+                if name == "page_job" and self.page_target_column is not None:
+                    self.find_match = None
             except (duckdb.Error, OSError, ValueError) as exc:
                 if restoring:
                     self.workspace.finish_restore(f"{self.view_request[0]}: {exc}")
@@ -1778,6 +1951,17 @@ class MainWindow(QMainWindow):
         )
         self.save_action.setEnabled(available and self.dirty)
         self.save_as_action.setEnabled(available)
+        self.go_to_row_action.setEnabled(available and self.page_job is None and self.model.rowCount() > 0)
+        self.find_action.setEnabled(self.path is not None)
+        can_find = (
+            available and not self.find_bar.isHidden() and bool(self.model.rowCount())
+            and bool(self.find_input.text()) and self.find_job is None and self.page_job is None
+        )
+        self.find_next.setEnabled(can_find)
+        self.find_previous.setEnabled(can_find)
+        self.find_stop.setEnabled(self.find_job is not None or (
+            self.page_job is not None and self.page_target_column is not None
+        ))
         self.undo_action.setEnabled(available and self.distinct is None and self.history_pos > 0)
         self.redo_action.setEnabled(
             available and self.distinct is None and self.history_pos < len(self.history)
@@ -1823,6 +2007,7 @@ class MainWindow(QMainWindow):
             progress_for(job, label)
             for job, label in (
                 (self.page_job, "Loading more"),
+                (self.find_job, "Searching"),
                 (self.view_job, "Reading CSV"),
                 (self.count_job, "Counting rows"),
                 (self.export_job, "Exporting CSV"),
