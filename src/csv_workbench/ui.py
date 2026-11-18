@@ -1879,6 +1879,7 @@ class WorkspaceWindow(QWidget):
         self.setAcceptDrops(True)
         self.heavy_executor = ThreadPoolExecutor(max_workers=1)
         self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("QTabWidget::tab-bar { alignment: left; }")
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.restore_pending = None
