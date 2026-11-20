@@ -209,9 +209,9 @@ def test_failed_disk_checkpoint_retains_previous_complete_manifest(tmp_path, mon
 
 def test_cleanup_closes_sqlite_before_removing_directory_with_reference_cycle(monkeypatch):
     import gc
-    import shutil
     import sqlite3
     from pathlib import Path
+    from tempfile import TemporaryDirectory
 
     events = []
     connect = sqlite3.connect
@@ -227,15 +227,15 @@ def test_cleanup_closes_sqlite_before_removing_directory_with_reference_cycle(mo
     store = edits.store
     store.cycle = store
     root = Path(store.scratch.name)
-    remove = shutil.rmtree
+    remove = TemporaryDirectory.cleanup
 
-    def check_closed(path, *args, **kwargs):
-        if Path(path) == root:
+    def check_closed(scratch):
+        if Path(scratch.name) == root:
             assert events == ['closed']
             events.append('removed')
-        return remove(path, *args, **kwargs)
+        return remove(scratch)
 
-    monkeypatch.setattr(shutil, 'rmtree', check_closed)
+    monkeypatch.setattr(TemporaryDirectory, 'cleanup', check_closed)
     del edits, store
     gc.collect()
     assert events == ['closed', 'removed'] and not root.exists()
