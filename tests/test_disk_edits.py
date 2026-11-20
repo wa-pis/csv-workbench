@@ -213,22 +213,29 @@ def test_cleanup_closes_sqlite_before_removing_directory_with_reference_cycle(mo
     import sqlite3
     from pathlib import Path
 
+    events = []
+    connect = sqlite3.connect
+
+    class TrackedConnection(sqlite3.Connection):
+        def close(self):
+            super().close()
+            events.append('closed')
+
+    monkeypatch.setattr(sqlite3, 'connect', lambda *args, **kwargs: connect(*args, **kwargs, factory=TrackedConnection))
     edits = DiskEdits()
     edits[(0, 0)] = 'value'
     store = edits.store
     store.cycle = store
-    root, db = Path(store.scratch.name), store.db
+    root = Path(store.scratch.name)
     remove = shutil.rmtree
-    closed = []
 
     def check_closed(path, *args, **kwargs):
         if Path(path) == root:
-            with pytest.raises(sqlite3.ProgrammingError, match='closed'):
-                db.execute('SELECT 1')
-            closed.append(True)
+            assert events == ['closed']
+            events.append('removed')
         return remove(path, *args, **kwargs)
 
     monkeypatch.setattr(shutil, 'rmtree', check_closed)
     del edits, store
     gc.collect()
-    assert closed == [True] and not root.exists()
+    assert events == ['closed', 'removed'] and not root.exists()
