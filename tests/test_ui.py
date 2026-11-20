@@ -1504,7 +1504,8 @@ def test_replace_preview_full_selection_and_single_undo(tmp_path, monkeypatch):
                 QTest.qWait(10)
                 if self.result() == QDialog.DialogCode.Accepted:
                     break
-            assert self.result() == QDialog.DialogCode.Accepted
+            from PySide6.QtWidgets import QLabel
+            assert self.result() == QDialog.DialogCode.Accepted, [label.text() for label in self.findChildren(QLabel)]
             return self.result()
 
     monkeypatch.setattr('csv_workbench.ui.QDialog', InspectDialog)
@@ -1599,6 +1600,52 @@ def test_replace_rejects_stale_preview_and_cancels_without_edits(tmp_path, monke
         monkeypatch.setattr(window, 'submit', track)
         window.open_replace()
         assert not window.model.edits and not window.history and not window.dirty
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_disk_replacement_save_then_undo_restores_original_base(tmp_path, monkeypatch):
+    from csv_workbench.core import Cancellation, Selection, read_page
+    from csv_workbench.replace import preview_replacement
+
+    app = QApplication.instance() or QApplication(['disk-history-test', '-platform', 'offscreen'])
+    source = tmp_path / 'input.csv'
+    source.write_text('id,note\n1,hit\n2,hit\n3,hidden\n')
+    window = MainWindow()
+    monkeypatch.setattr(QMessageBox, 'question', lambda *_: QMessageBox.StandardButton.Yes)
+
+    def finish(name='view_job'):
+        if getattr(window, name):
+            getattr(window, name)[1].result(timeout=5)
+            window.collect_reads()
+
+    try:
+        window.load_view(source, Selection((('note', 'hit'),), 'id', True), new_file=True)
+        finish()
+        plan = preview_replacement(source, window.selection, window.model.edits, 'hit', 'new')
+        window.apply_replacement(plan.prepare(window.model.edits, cancel=Cancellation()))
+        finish()
+        assert window.model.rowCount() == 0 and window.history_pos == 1
+        window.save_document()
+        finish('save_job')
+        assert window.source_snapshot is not None and not window.dirty
+        assert read_page(source, 0)[1] == [('1', 'new'), ('2', 'new'), ('3', 'hidden')]
+        window.undo_action.trigger()
+        finish()
+        assert window.model.rows == [('2', 'hit'), ('1', 'hit')]
+        assert window.dirty and not window.model.edits
+        window.redo_action.trigger()
+        finish()
+        assert not window.dirty and window.model.rowCount() == 0
+        window.undo_action.trigger()
+        finish()
+        window.save_document()
+        finish('save_job')
+        assert read_page(source, 0)[1] == [('1', 'hit'), ('2', 'hit'), ('3', 'hidden')]
     finally:
         window.close()
         window.executor.shutdown(wait=True)

@@ -1,0 +1,92 @@
+{
+  "platform": "macOS 26.6.2 arm64",
+  "python": "3.12.13",
+  "duckdb": "1.5.6",
+  "polars": "1.44.2",
+  "results": [
+    {
+      "rows": 5000000,
+      "source_bytes": 455000025,
+      "temporary_disk_peak_bytes": 942538568,
+      "stages": [
+        {
+          "stage": "preview",
+          "seconds": 9.204528625123203,
+          "rss_high_water_bytes": 498647040
+        },
+        {
+          "stage": "apply",
+          "seconds": 8.470738375093788,
+          "rss_high_water_bytes": 510345216
+        },
+        {
+          "stage": "read-last",
+          "seconds": 3.5595915000885725,
+          "rss_high_water_bytes": 1367097344
+        },
+        {
+          "stage": "undo",
+          "seconds": 2.4172477424144745e-06,
+          "rss_high_water_bytes": 1367097344
+        },
+        {
+          "stage": "redo",
+          "seconds": 1.584179699420929e-06,
+          "rss_high_water_bytes": 1367097344
+        },
+        {
+          "stage": "checkpoint",
+          "seconds": 0.1448389170691371,
+          "rss_high_water_bytes": 1369554944
+        },
+        {
+          "stage": "recover",
+          "seconds": 0.35109779238700867,
+          "rss_high_water_bytes": 1369899008
+        }
+      ]
+    },
+    {
+      "rows": 20000000,
+      "source_bytes": 1820000025,
+      "temporary_disk_peak_bytes": 4085105611,
+      "stages": [
+        {
+          "stage": "preview",
+          "seconds": 37.38039587484673,
+          "rss_high_water_bytes": 687554560
+        },
+        {
+          "stage": "apply",
+          "seconds": 34.76697083422914,
+          "rss_high_water_bytes": 699203584
+        },
+        {
+          "stage": "read-last",
+          "seconds": 15.336194166913629,
+          "rss_high_water_bytes": 1416658944
+        },
+        {
+          "stage": "undo",
+          "seconds": 3.0831433832645416e-06,
+          "rss_high_water_bytes": 1416658944
+        },
+        {
+          "stage": "redo",
+          "seconds": 1.7080456018447876e-06,
+          "rss_high_water_bytes": 1416658944
+        },
+        {
+          "stage": "checkpoint",
+          "seconds": 0.776555959135294,
+          "rss_high_water_bytes": 1419165696
+        },
+        {
+          "stage": "recover",
+          "seconds": 1.3501396672800183,
+          "rss_high_water_bytes": 1420558336
+        }
+      ]
+    }
+  ]
+}

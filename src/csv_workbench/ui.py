@@ -87,6 +87,7 @@ from csv_workbench.core import (
     search_lower,
     selection_sql,
 )
+from csv_workbench.edits import DiskBatch, DiskEdits
 from csv_workbench.presets import FormatPresets, export_format_presets, import_format_presets
 from csv_workbench.recent import (
     clear_recent_files,
@@ -99,6 +100,7 @@ from csv_workbench.recovery import (
     MISSING,
     RecoveryJournal,
     checkpoint_data,
+    disk_recovery,
     read_checkpoint,
 )
 from csv_workbench.replace import preview_replacement
@@ -121,6 +123,7 @@ FIND_COLORS = {
 
 class PageModel(QAbstractTableModel):
     cellEdited = Signal(tuple, object, object)
+    editFailed = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -128,7 +131,7 @@ class PageModel(QAbstractTableModel):
         self.rows: list[tuple] = []
         self.offset = 0
         self.filtered_columns: set[str] = set()
-        self.edits: dict[tuple[int, int], str | None] = {}
+        self.edits = DiskEdits()
         self.editable = False
         self.row_ids = []
         self.source_columns = []
@@ -194,7 +197,11 @@ class PageModel(QAbstractTableModel):
             key = self.cell_key(index)
             before = self.edits.get(key, self.rows[index.row()][index.column()])
             after = value or None
-            self.edits[key] = after
+            try:
+                self.edits[key] = after
+            except OSError as exc:
+                self.editFailed.emit(str(exc))
+                return False
             self.dataChanged.emit(index, index, [role, Qt.ItemDataRole.DisplayRole])
             self.cellEdited.emit(key, before, after)
         return True
@@ -486,7 +493,8 @@ class MainWindow(QMainWindow):
         self.source_snapshot = None
         self.next_row_id = NEW_ROW
         self.model.cellEdited.connect(self.record_edit)
-        self.applied_edits = {}
+        self.model.editFailed.connect(lambda message: QMessageBox.warning(self, "Edit not applied", message))
+        self.applied_edits = self.model.edits.copy()
         self.refreshing_edit = False
         root = QWidget()
         self.setCentralWidget(root)
@@ -1258,11 +1266,7 @@ class MainWindow(QMainWindow):
         path, revision, fmt = self.path, self.revision, self.csv_format
         edits = self.model.edits.copy()
         snapshot = self.source_snapshot
-        keep_base = self.structural(edits) or any(
-            row >= NEW_ROW or col == DELETED_COLUMN
-            for entry in self.history
-            for (row, col), _, _ in entry
-        )
+        keep_base = bool(self.history) or self.structural(edits)
 
         def save(*, cancel):
             if snapshot is not None or not keep_base:
@@ -1328,7 +1332,7 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(
                 self, "Recovery unavailable",
-                f"Unsaved edits are still in memory, but could not be checkpointed: {exc}",
+                f"Unsaved edits are still available, but could not be checkpointed: {exc}",
             )
 
     @property
@@ -1439,8 +1443,12 @@ class MainWindow(QMainWindow):
         target = self.history_pos + step
         if not self.model.editable or not 0 <= target <= len(self.history):
             return
-        for key, before, after in self.history[min(target, self.history_pos)]:
-            self.set_patch(key, before if step < 0 else after)
+        batch = self.history[min(target, self.history_pos)]
+        if isinstance(batch, DiskBatch):
+            self.model.edits = (batch.before if step < 0 else batch.after).copy()
+        else:
+            for key, before, after in batch:
+                self.set_patch(key, before if step < 0 else after)
         self.refresh_after_edit(("move", target))
 
     def commit_history(self):
@@ -1452,6 +1460,8 @@ class MainWindow(QMainWindow):
             if self.clean_pos > self.history_pos:
                 self.clean_pos = -1
             del self.history[self.history_pos :]
+            if not isinstance(value, DiskBatch):
+                value = DiskBatch(self.applied_edits, self.model.edits, len(value))
             self.history.append(value)
             self.history_pos += 1
         else:
@@ -1459,6 +1469,8 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def structural(edits):
+        if isinstance(edits, DiskEdits):
+            return edits.structural
         return any(row >= NEW_ROW or col == DELETED_COLUMN for row, col in edits)
 
     def set_patch(self, key, value):
@@ -1476,8 +1488,13 @@ class MainWindow(QMainWindow):
             if self.model.edits.get(key, MISSING) != value
         ]
         if changes:
-            for key, _, value in changes:
-                self.set_patch(key, value)
+            try:
+                self.model.edits = self.model.edits.updated(
+                    ((key, value) for key, _, value in changes), cancel=Cancellation(),
+                )
+            except OSError as exc:
+                QMessageBox.warning(self, "Edit not applied", str(exc))
+                return
             self.refresh_after_edit(("edit", changes))
 
     def copy_range(self, fmt="TSV"):
@@ -2036,8 +2053,8 @@ class MainWindow(QMainWindow):
         if self.selection != Selection() or self.identified or self.structural(self.model.edits):
             self.load_view(self.path, self.selection, refreshing_edit=True)
         else:
-            self.applied_edits = self.model.edits.copy()
             self.commit_history()
+            self.applied_edits = self.model.edits.copy()
             self.checkpoint_recovery()
             if self.model.rowCount():
                 self.model.dataChanged.emit(
@@ -2086,6 +2103,7 @@ class MainWindow(QMainWindow):
         def read_view(*, cancel):
             revision = file_revision(path)
             if recovery is not None:
+                disk_recovery(recovery, cancel)
                 if revision != recovery.revision:
                     raise ValueError("The source CSV changed; recovery was not applied.")
                 recovered_snapshot = None
@@ -2196,7 +2214,7 @@ class MainWindow(QMainWindow):
         if new_file:
             self.source_snapshot = None
             self.next_row_id = NEW_ROW
-            self.model.edits.clear()
+            self.model.edits = DiskEdits()
             self.history.clear()
             self.history_pos = self.clean_pos = 0
         if self.recovery_request is not None:
@@ -2267,13 +2285,11 @@ class MainWindow(QMainWindow):
             number = 0
         self.go_to_row(number)
 
-    def apply_replacement(self, changes):
-        if not self.model.editable or not changes:
+    def apply_replacement(self, batch):
+        if not self.model.editable or not len(batch):
             return
-        for index, (key, _, after) in enumerate(changes):
-            changes[index] = (key, self.model.edits.get(key, MISSING), after)
-            self.model.edits[key] = after
-        self.refresh_after_edit(("edit", changes))
+        self.model.edits = batch.after.copy()
+        self.refresh_after_edit(("edit", batch))
 
     def open_replace(self):
         if not self.replace_action.isEnabled():
@@ -2366,7 +2382,7 @@ class MainWindow(QMainWindow):
                 message.setText(str(exc))
                 return
             applying = True
-            job = self.submit(plan.changes, heavy=False)
+            job = self.submit(plan.prepare, edits)
             for widget in (needle, replacement, mode, preview_button, apply_button):
                 widget.setEnabled(False)
             stop.setEnabled(True)
@@ -2867,6 +2883,12 @@ class MainWindow(QMainWindow):
         self.result = None
         self.view_job = None
         self.page_job = None
+        self.model.edits = {}
+        self.applied_edits = {}
+        self.history.clear()
+        self.pending_history = None
+        self.export_edits = None
+        self.source_snapshot = None
 
 
 class WorkspaceWindow(QWidget):

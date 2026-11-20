@@ -3,7 +3,9 @@
 import json
 import os
 import shutil
+import sqlite3
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -13,9 +15,8 @@ from uuid import uuid4
 from PySide6.QtCore import QLockFile
 
 from csv_workbench.core import NEW_ROW, CsvFormat, Selection, file_revision
+from csv_workbench.edits import MISSING, DiskBatch, DiskEdits, EditStore
 from csv_workbench.session import parse_session_tab, session_tab
-
-MISSING = object()
 
 
 @dataclass
@@ -25,7 +26,7 @@ class RecoveryState:
     fmt: CsvFormat
     revision: tuple
     headers: list
-    edits: dict
+    edits: dict | DiskEdits
     history: list
     position: int
     clean: int
@@ -57,6 +58,12 @@ def cell_key(value, width):
 
 def read_checkpoint(directory):
     data = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    if isinstance(data, dict) and data.get("version") == 2:
+        return read_disk_checkpoint(directory, data)
+    return parse_checkpoint(directory, data)
+
+
+def parse_checkpoint(directory, data):
     if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
         raise ValueError("Unsupported recovery checkpoint.")
     source, selection, fmt = parse_session_tab(data)
@@ -116,6 +123,16 @@ def read_checkpoint(directory):
 
 
 def checkpoint_data(source, selection, fmt, revision, headers, edits, history, position, clean, next_row):
+    if isinstance(edits, DiskEdits):
+        return {
+            "version": 2, **session_tab(source, selection, fmt),
+            "revision": list(revision), "headers": list(headers),
+            "edits": edits.descriptor(),
+            "history": [{"before": batch.before.descriptor(), "after": batch.after.descriptor(),
+                         "count": len(batch)} for batch in history],
+            "position": position, "clean": clean, "next_row": next_row,
+            "_store": edits.store,
+        }
     return {
         "version": 1, **session_tab(source, selection, fmt),
         "revision": list(revision), "headers": list(headers),
@@ -124,6 +141,69 @@ def checkpoint_data(source, selection, fmt, revision, headers, edits, history, p
                      for key, before, after in batch] for batch in history],
         "position": position, "clean": clean, "next_row": next_row,
     }
+
+
+def read_disk_checkpoint(directory, data):
+    state = parse_checkpoint(directory, {
+        **data, "version": 1, "edits": [], "history": [], "position": 0, "clean": 0,
+    })
+    filename = data.get("store")
+    if not isinstance(filename, str) or Path(filename).name != filename or not filename.endswith('.sqlite'):
+        raise ValueError("Invalid recovery store path.")
+    database = directory / filename
+    if not database.is_file() or list(file_revision(database)) != data.get('store_revision'):
+        raise ValueError("Recovery edit database changed or is missing.")
+    store = EditStore()
+    try:
+        with closing(sqlite3.connect(database)) as source:
+            source.backup(store.db)
+        def snapshot(value):
+            if not isinstance(value, dict):
+                raise ValueError("Invalid edit snapshot.")  # noqa: TRY004
+            versions, count = value.get('versions'), value.get('count')
+            if (not isinstance(versions, list) or any(type(v) is not int or v < 1 for v in versions)
+                    or versions != sorted(set(versions)) or type(count) is not int or count < 0):
+                raise ValueError("Invalid edit snapshot.")
+            for version in versions:
+                if store.db.execute('SELECT 1 FROM versions WHERE id=?', (version,)).fetchone() is None:
+                    raise ValueError("Missing edit generation.")
+            expected = store.db.execute('SELECT count FROM versions WHERE id=?', (versions[-1],)).fetchone()[0] if versions else 0
+            if count != expected:
+                raise ValueError("Invalid edit count.")
+            return DiskEdits(store, versions, count)
+        history = data.get('history')
+        if not isinstance(history, list):
+            raise ValueError("Invalid recovery history.")  # noqa: TRY004
+        batches = []
+        for entry in history:
+            if not isinstance(entry, dict) or type(entry.get('count')) is not int or entry['count'] < 1:
+                raise ValueError("Invalid recovery batch.")
+            batches.append(DiskBatch(snapshot(entry.get('before')), snapshot(entry.get('after')), entry['count']))
+        position, clean = data.get('position'), data.get('clean')
+        if (type(position) is not int or type(clean) is not int
+                or not 0 <= position <= len(batches) or not -1 <= clean <= len(batches)):
+            raise ValueError("Invalid recovery history position.")
+        state.edits, state.history = snapshot(data.get('edits')), batches
+        state.position, state.clean = position, clean
+        return state
+    except sqlite3.Error as exc:
+        raise ValueError("Invalid recovery edit database.") from exc
+
+
+def disk_recovery(state, cancel):
+    """Migrate a legacy checkpoint once, in the existing recovery worker."""
+    if isinstance(state.edits, DiskEdits):
+        return
+    current = DiskEdits().updated(state.edits.items(), cancel=cancel)
+    root = current.copy()
+    for batch in reversed(state.history[:state.position]):
+        root = root.updated(((key, before) for key, before, _ in batch), cancel=cancel)
+    batches = []
+    for changes in state.history:
+        after = root.updated(((key, value) for key, _, value in changes), cancel=cancel)
+        batches.append(DiskBatch(root, after, len(changes)))
+        root = after
+    state.edits, state.history = current, batches
 
 
 class RecoveryJournal:
@@ -151,13 +231,37 @@ class RecoveryJournal:
             if snapshot is not None and not base.exists():
                 with (Path(snapshot.name) / "source.csv").open("rb") as source:
                     self.atomic_write(base, source=source)
-            self.atomic_write(
-                self.directory / "state.json",
-                text=json.dumps({
-                    **data, "base": snapshot is not None,
-                    "base_revision": list(file_revision(base)) if snapshot is not None else None,
-                }, ensure_ascii=False),
-            )
+            data = dict(data)
+            store = data.pop('_store', None)
+            database = None
+            if store is not None:
+                database = self.directory / f"edits-{uuid4().hex}.sqlite"
+                def check():
+                    if self.stopping.is_set():
+                        raise CancelledError()
+                try:
+                    store.backup(database, check)
+                    with database.open('r+b') as handle:
+                        os.fsync(handle.fileno())
+                    data.update(store=database.name, store_revision=list(file_revision(database)))
+                except BaseException:
+                    database.unlink(missing_ok=True)
+                    raise
+            try:
+                self.atomic_write(
+                    self.directory / "state.json",
+                    text=json.dumps({
+                        **data, "base": snapshot is not None,
+                        "base_revision": list(file_revision(base)) if snapshot is not None else None,
+                    }, ensure_ascii=False),
+                )
+            except BaseException:
+                if database is not None:
+                    database.unlink(missing_ok=True)
+                raise
+            for old in self.directory.glob('edits-*.sqlite'):
+                if old.name != data.get('store'):
+                    old.unlink(missing_ok=True)
         except CancelledError:
             return
 
@@ -188,6 +292,8 @@ class RecoveryJournal:
     def _clear(self):
         (self.directory / "state.json").unlink(missing_ok=True)
         (self.directory / "base.csv").unlink(missing_ok=True)
+        for path in self.directory.glob('edits-*.sqlite'):
+            path.unlink(missing_ok=True)
 
     def close(self, *, discard):
         if self.closed:

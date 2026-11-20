@@ -13,6 +13,7 @@ from threading import Lock
 
 import duckdb
 
+from csv_workbench.edits import DiskEdits
 from csv_workbench.text_formats import formatted_chunks
 
 PAGE_SIZE = 200
@@ -369,7 +370,7 @@ def selection_sql(
     return f"SELECT {projection} FROM {source}{where}{order}", values
 
 
-def editable_query(connection, source, selection, edits, fmt=CsvFormat()):
+def editable_query(connection, source, selection, edits, fmt=CsvFormat(), *, cancel=None):
     pattern = csv_pattern(source)
     columns = csv_columns(connection, pattern, fmt)
     name = "__csv_source_row"
@@ -377,28 +378,46 @@ def editable_query(connection, source, selection, edits, fmt=CsvFormat()):
     while name.casefold() in folded:
         name += "_"
     row_id = quote_identifier(name)
-    edited_columns = {col for _, col in edits}
+    edited_columns = edits.columns if isinstance(edits, DiskEdits) else {col for _, col in edits}
     scan = f"(SELECT row_number() OVER () - 1 AS {row_id}, * FROM {fmt.source})"
     if edits:
-        connection.execute("CREATE TEMP TABLE cell_edits (rid BIGINT, col INTEGER, val VARCHAR)")
-        connection.executemany(
-            "INSERT INTO cell_edits VALUES (?, ?, ?)",
-            [(row, col, value) for (row, col), value in edits.items()],
-        )
-        projection = ", ".join(
-            f"CASE WHEN map_contains(p.cells, {index}) THEN map_extract_value(p.cells, {index}) ELSE s.{quoted} END AS {quoted}"
-            if index in edited_columns
-            else f"s.{quoted}"
-            for index, quoted in enumerate(map(quote_identifier, columns))
-        )
-        patches = "(SELECT rid, map(list(col), list(val)) AS cells FROM cell_edits GROUP BY rid)"
-        if any(row >= NEW_ROW for row, _ in edits):
+        if isinstance(edits, DiskEdits):
+            edits.load(connection, cancel=cancel or Cancellation())
+        else:
+            connection.execute("CREATE TEMP TABLE cell_edits (rid BIGINT, col INTEGER, val VARCHAR)")
+            connection.executemany(
+                "INSERT INTO cell_edits VALUES (?, ?, ?)",
+                [(row, col, value) for (row, col), value in edits.items()],
+            )
+        if isinstance(edits, DiskEdits):
+            active = sorted(edited_columns - {DELETED_COLUMN})
+            fields = [f"max(val) FILTER (WHERE col={index}) AS v{index}, bool_or(col={index}) AS h{index}"
+                      for index in active]
+            fields.append("bool_or(col=-1) AS deleted")
+            connection.execute("CREATE TEMP TABLE wide_edits AS SELECT rid," + ",".join(fields)
+                               + " FROM cell_edits GROUP BY rid")
+            projection = ", ".join(
+                f"CASE WHEN p.h{index} THEN p.v{index} ELSE s.{quoted} END AS {quoted}"
+                if index in edited_columns else f"s.{quoted}"
+                for index, quoted in enumerate(map(quote_identifier, columns))
+            )
+            patches = "wide_edits"
+            deleted = "p.deleted"
+        else:
+            projection = ", ".join(
+                f"CASE WHEN map_contains(p.cells, {index}) THEN map_extract_value(p.cells, {index}) ELSE s.{quoted} END AS {quoted}"
+                if index in edited_columns else f"s.{quoted}"
+                for index, quoted in enumerate(map(quote_identifier, columns))
+            )
+            patches = "(SELECT rid, map(list(col), list(val)) AS cells FROM cell_edits GROUP BY rid)"
+            deleted = f"map_contains(p.cells, {DELETED_COLUMN})"
+        if (edits.structural if isinstance(edits, DiskEdits) else any(row >= NEW_ROW for row, _ in edits)):
             blanks = ", ".join(f"NULL::VARCHAR AS {quote_identifier(col)}" for col in columns)
             scan = f"({scan} UNION ALL SELECT rid, {blanks} FROM {patches} WHERE rid >= {NEW_ROW})"
         scan = (
             f"(SELECT s.{row_id}, {projection} FROM {scan} s LEFT JOIN "
             f"{patches} p ON s.{row_id} = p.rid "
-            f"WHERE NOT coalesce(map_contains(p.cells, {DELETED_COLUMN}), false))"
+            f"WHERE NOT coalesce({deleted}, false))"
         )
     sql, values = selection_sql(columns, selection, source=scan, row_id=row_id)
     if edits and selection.sort_column is None:
@@ -408,7 +427,7 @@ def editable_query(connection, source, selection, edits, fmt=CsvFormat()):
 
 def read_editable_page(path, offset, selection, edits, *, cancel, fmt=CsvFormat(), limit=PAGE_SIZE):
     with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
-        sql, params = editable_query(connection, source, selection, edits, fmt)
+        sql, params = editable_query(connection, source, selection, edits, fmt, cancel=cancel)
         return query_page(connection, sql, params, offset, limit)
 
 
@@ -419,7 +438,7 @@ def prepare_editable_result(
     output = Path(scratch.name) / "result.parquet"
     try:
         with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
-            sql, params = editable_query(connection, source, selection, edits, fmt)
+            sql, params = editable_query(connection, source, selection, edits, fmt, cancel=cancel)
             if distinct is not None:
                 having = " HAVING count(*) = 1" if singletons else ""
                 sql = (
@@ -549,7 +568,7 @@ def export_text(
         output = Path(scratch) / "export"
         with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
             if edits or source != document.resolve():
-                sql, params = editable_query(connection, decoded, selection, edits or {}, fmt)
+                sql, params = editable_query(connection, decoded, selection, edits or {}, fmt, cancel=cancel)
                 skip = 1
             else:
                 sql, params = selection_query(connection, decoded, selection, fmt)
@@ -611,7 +630,7 @@ def export_edited_csv(
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "edited.csv"
         with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
-            sql, params = editable_query(connection, decoded, selection, edits, fmt)
+            sql, params = editable_query(connection, decoded, selection, edits, fmt, cancel=cancel)
             count = write_csv_rows(
                 connection.execute(sql, params), output, fmt if save else output_format, cancel, skip=1
             )
@@ -669,7 +688,7 @@ def find_csv_cell(
             )
         with utf8_source(path, cancel, fmt) as source:
             if edits or selection != Selection():
-                sql, params = editable_query(connection, source, selection, edits, fmt)
+                sql, params = editable_query(connection, source, selection, edits, fmt, cancel=cancel)
             else:
                 sql, params = selection_query(connection, source, selection, fmt)
             cancel.check()

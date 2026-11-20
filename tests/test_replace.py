@@ -30,7 +30,7 @@ def test_preview_full_view_respects_edits_filters_columns_and_sort(tmp_path):
         assert plan.cells == 1200 and plan.occurrences == 2399
         assert len(plan.preview) == 100
         assert plan.preview[0] == (1, "note", "edited HiT", "edited new")
-        changes = plan.changes(cancel=Cancellation())
+        changes = list(plan.iter_changes(cancel=Cancellation()))
         assert len(changes) == 1200
         assert changes[0] == ((1200, 1), "edited HiT", "edited new")
         assert changes[-1] == ((0, 1), "hit HIT", "new new")
@@ -47,7 +47,7 @@ def test_first_replaces_one_occurrence_in_first_cell_in_view_order(tmp_path):
     )
     try:
         assert plan.occurrences == plan.cells == 1
-        assert plan.changes(cancel=Cancellation()) == [((1, 1), "HIT hit", "new hit")]
+        assert list(plan.iter_changes(cancel=Cancellation())) == [((1, 1), "HIT hit", "new hit")]
     finally:
         plan.scratch.cleanup()
 
@@ -58,7 +58,7 @@ def test_null_empty_output_noop_and_manual_encoding(tmp_path):
     fmt = CsvFormat(";", encoding="cp1251")
     plan = preview_replacement(source, Selection(), {}, "привет", "", fmt=fmt)
     try:
-        assert plan.changes(cancel=Cancellation()) == [((1, 1), "Привет", None)]
+        assert list(plan.iter_changes(cancel=Cancellation())) == [((1, 1), "Привет", None)]
     finally:
         plan.scratch.cleanup()
     plan = preview_replacement(source, Selection(), {}, "Привет", "Привет", fmt=fmt)
@@ -88,7 +88,7 @@ def test_inserted_deleted_rows_and_column_order(tmp_path):
     edits = {(0, DELETED_COLUMN): '1', (NEW_ROW, 0): 'new hit', (NEW_ROW, 1): 'hit'}
     plan = preview_replacement(source, Selection(column_order=('b', 'a')), edits, 'hit', 'x')
     try:
-        changes = plan.changes(cancel=Cancellation())
+        changes = list(plan.iter_changes(cancel=Cancellation()))
         assert [key for key, _, _ in changes] == [(1, 1), (1, 0), (NEW_ROW, 1), (NEW_ROW, 0)]
     finally:
         plan.scratch.cleanup()

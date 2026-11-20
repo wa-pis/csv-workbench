@@ -37,6 +37,8 @@
 
 [`replace-in-csv-view`](openspec/changes/archive/2026-11-20-replace-in-csv-view/proposal.md) закрыт. Поиск и замена первого/всех совпадений во всей текущей выборке с правками: предпросмотр, отмена, проверка устаревшего плана и один шаг Undo/Redo. Предпросмотр ограничен 100 ячейками; применение охватывает все найденные изменения.
 
+[`disk-backed-csv-edits`](openspec/changes/archive/2026-11-20-disk-backed-csv-edits/proposal.md) закрыт. Правки и Undo/Redo на диске, потоковая массовая замена, Parquet для запросов, восстановление без загрузки всех ячеек в RAM. [Замеры на 5 и 20 млн строк](openspec/changes/archive/2026-11-20-disk-backed-csv-edits/benchmarks.md).
+
 Все этапы текущего roadmap завершены.
 
 Подключения к СУБД, импорт в базу и функции самой IDE вне этого плана.

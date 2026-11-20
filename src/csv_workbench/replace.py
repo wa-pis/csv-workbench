@@ -15,6 +15,7 @@ from csv_workbench.core import (
     search_lower,
     utf8_source,
 )
+from csv_workbench.edits import DiskBatch, DiskEdits
 
 
 def replace_literal(value, needle, replacement, *, first=False):
@@ -40,16 +41,20 @@ class ReplacementPlan:
     cells: int
     occurrences: int
 
-    def changes(self, *, cancel):
-        # shortcut: patches and Undo scale with changed cells; move history to disk for massive replacements.
-        changes = []
+    def iter_changes(self, *, cancel):
         with (Path(self.scratch.name) / "changes.jsonl").open(encoding="utf-8") as source:
             for line in source:
                 cancel.check()
                 row, column, before, after = json.loads(line)
-                changes.append(((row, column), before, after))
+                yield ((row, column), before, after)
         cancel.check()
-        return changes
+
+    def prepare(self, edits, *, cancel):
+        before = edits.copy() if isinstance(edits, DiskEdits) else DiskEdits()
+        if not isinstance(edits, DiskEdits) and edits:
+            before = before.updated(edits.items(), cancel=cancel)
+        after = before.updated(((key, value) for key, _, value in self.iter_changes(cancel=cancel)), cancel=cancel)
+        return DiskBatch(before, after, self.cells)
 
 
 def preview_replacement(path, selection, edits, needle, replacement, *, first=False, fmt=None, cancel=None):
@@ -66,7 +71,7 @@ def preview_replacement(path, selection, edits, needle, replacement, *, first=Fa
             columns = csv_columns(connection, csv_pattern(source), fmt)
             visible = [name for name in selection.ordered_columns(columns)
                        if selection.visible_columns is None or name in selection.visible_columns]
-            sql, params = editable_query(connection, source, selection, edits, fmt)
+            sql, params = editable_query(connection, source, selection, edits, fmt, cancel=cancel)
             position_name = "__csv_replace_position"
             while position_name.casefold() in {name.casefold() for name in columns}:
                 position_name += "_"
