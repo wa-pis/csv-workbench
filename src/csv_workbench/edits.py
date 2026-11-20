@@ -8,6 +8,7 @@ from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import RLock
+from weakref import finalize
 
 MISSING = object()
 NEW_ROW = 1 << 62
@@ -20,6 +21,7 @@ class EditStore:
         self.lock = RLock()
         self.cache_lock = RLock()
         self.db = self.connect()
+        self._finalizer = finalize(self, self._cleanup, self.db, self.scratch)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript("""
             CREATE TABLE versions (id INTEGER PRIMARY KEY, count INTEGER NOT NULL, columns TEXT NOT NULL DEFAULT '[]', structural INTEGER NOT NULL DEFAULT 0);
@@ -48,9 +50,11 @@ class EditStore:
                 cancel.check()
             raise OSError(f"Edit database: {exc}") from exc
 
-    def __del__(self):
-        if hasattr(self, 'db'):
-            self.db.close()
+    @staticmethod
+    def _cleanup(db, scratch):
+        # Windows cannot remove the directory while SQLite still has its files open.
+        db.close()
+        scratch.cleanup()
 
     def backup(self, destination, check=lambda: None):
         with self.connection() as source, closing(sqlite3.connect(destination)) as output:

@@ -223,8 +223,10 @@ def test_heavy_jobs_queue_across_tabs_and_cached_reads_bypass_queue(tmp_path, wo
         workspace.open_document(path, Selection(), CsvFormat())
         document = workspace.tabs.currentWidget()
         finish_view(document)
-        document.count_job[1].result(timeout=5)
-        document.collect_reads()
+        if document.count_job is not None:
+            document.count_job[1].result(timeout=5)
+            document.collect_reads()
+        assert document.total_rows == 1
     first, second = workspace.documents()
     workspace.tabs.setCurrentWidget(first)
     started, release, queued_started = Event(), Event(), Event()

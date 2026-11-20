@@ -205,3 +205,30 @@ def test_failed_disk_checkpoint_retains_previous_complete_manifest(tmp_path, mon
         assert read_checkpoint(journal.directory).edits[(0, 0)] == 'new'
     finally:
         journal.close(discard=True).result(timeout=5)
+
+
+def test_cleanup_closes_sqlite_before_removing_directory_with_reference_cycle(monkeypatch):
+    import gc
+    import shutil
+    import sqlite3
+    from pathlib import Path
+
+    edits = DiskEdits()
+    edits[(0, 0)] = 'value'
+    store = edits.store
+    store.cycle = store
+    root, db = Path(store.scratch.name), store.db
+    remove = shutil.rmtree
+    closed = []
+
+    def check_closed(path, *args, **kwargs):
+        if Path(path) == root:
+            with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+                db.execute('SELECT 1')
+            closed.append(True)
+        return remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, 'rmtree', check_closed)
+    del edits, store
+    gc.collect()
+    assert closed == [True] and not root.exists()
