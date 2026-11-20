@@ -39,9 +39,20 @@
 
 [`disk-backed-csv-edits`](openspec/changes/archive/2026-11-20-disk-backed-csv-edits/proposal.md) закрыт. Правки и Undo/Redo на диске, потоковая массовая замена, Parquet для запросов, восстановление без загрузки всех ячеек в RAM. [Замеры на 5 и 20 млн строк](openspec/changes/archive/2026-11-20-disk-backed-csv-edits/benchmarks.md).
 
-Все этапы текущего roadmap завершены.
+Базовые этапы завершены. Четыре этапа полировки взаимодействия с таблицей также завершены (ниже).
 
 Подключения к СУБД, импорт в базу и функции самой IDE вне этого плана.
+
+## Полировка таблицы по сценариям JetBrains
+
+[Сравнение, источники и намеренные отличия](GRID_POLISH.md). Этапы выполняются по порядку через OpenSpec и юнит-тесты.
+
+| Порядок | OpenSpec change | Критерий готовности | Статус |
+|---|---|---|---|
+| 1 | `polish-csv-keyboard-navigation` | Стрелки, Tab и страницы проходят границы буфера; Go to Row поддерживает column:row | [Завершён](openspec/changes/archive/2026-11-20-polish-csv-keyboard-navigation/proposal.md) |
+| 2 | `polish-csv-selection` | Select Row/Column и Extend/Shrink, понятные границы и размер выделения | [Завершён](openspec/changes/archive/2026-11-21-polish-csv-selection/proposal.md) |
+| 3 | `polish-csv-cell-editing` | Enter/F2, двойной щелчок, Enter/Escape и один Undo | [Завершён](openspec/changes/archive/2026-11-21-polish-csv-cell-editing/proposal.md) |
+| 4 | `polish-csv-context-menus` | Общие действия Edit, корректная цель ПКМ, Menu/Shift+F10 | [Завершён](openspec/changes/archive/2026-11-21-polish-csv-context-menus/proposal.md) |
 
 ## История v0.1
 

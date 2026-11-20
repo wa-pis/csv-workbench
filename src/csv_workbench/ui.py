@@ -13,6 +13,8 @@ import duckdb
 from PySide6.QtCore import (
     QAbstractTableModel,
     QEvent,
+    QItemSelection,
+    QItemSelectionModel,
     QModelIndex,
     QPersistentModelIndex,
     QPoint,
@@ -308,6 +310,8 @@ class CsvHeader(QHeaderView):
 
 
 class CsvTable(QTableView):
+    navigationRequested = Signal(object, int)
+
     def __init__(self, model):
         super().__init__()
         self.setModel(model)
@@ -327,8 +331,21 @@ class CsvTable(QTableView):
             view.verticalHeader().setDefaultSectionSize(23)
             view.setAlternatingRowColors(True)
             view.setShowGrid(False)
+            view.setEditTriggers(
+                QAbstractItemView.EditTrigger.DoubleClicked
+                | QAbstractItemView.EditTrigger.EditKeyPressed
+                | QAbstractItemView.EditTrigger.AnyKeyPressed
+            )
         self.pinned.hide()
         self.pinned_sections = ()
+        self.more_rows = lambda: False
+        self.selection_steps = []
+        self.changing_selection = False
+        self.selectionModel().selectionChanged.connect(self.reset_selection_steps)
+        self.selectionModel().currentChanged.connect(self.reset_selection_steps)
+        model.modelReset.connect(self.reset_selection_steps)
+        model.rowsRemoved.connect(self.reset_selection_steps)
+        model.rowsInserted.connect(self.reset_selection_steps)
         self.verticalScrollBar().valueChanged.connect(self.pinned.verticalScrollBar().setValue)
         self.pinned.verticalScrollBar().valueChanged.connect(self.sync_pinned_scroll)
         self.verticalHeader().sectionResized.connect(
@@ -336,6 +353,83 @@ class CsvTable(QTableView):
         )
         self.pinned.horizontalHeader().sectionResized.connect(
             lambda col, _, size: self.setColumnWidth(col, size)
+        )
+
+    def moveCursor(self, action, modifiers):
+        current = self.currentIndex()
+        moves = self.CursorAction
+        if not current.isValid() or action not in (
+            moves.MoveUp, moves.MoveDown, moves.MoveNext, moves.MovePrevious,
+            moves.MovePageUp, moves.MovePageDown,
+        ):
+            return super().moveCursor(action, modifiers)
+        row, column = current.row(), current.column()
+        if action in (moves.MoveNext, moves.MovePrevious):
+            header = self.horizontalHeader()
+            order = [header.logicalIndex(i) for i in range(header.count())
+                     if not self.isColumnHidden(header.logicalIndex(i))]
+            position = order.index(column) + (1 if action == moves.MoveNext else -1)
+            row += position // len(order)
+            column = order[position % len(order)]
+        else:
+            step = 1 if action in (moves.MoveUp, moves.MoveDown) else max(
+                1, self.viewport().height() // self.verticalHeader().defaultSectionSize() - 1,
+            )
+            row += step if action in (moves.MoveDown, moves.MovePageDown) else -step
+        if 0 <= row < self.model().rowCount():
+            return self.model().index(row, column)
+        if row < 0 and self.model().offset == 0:
+            return self.model().index(0, current.column())
+        if row >= self.model().rowCount() and not self.more_rows():
+            return self.model().index(self.model().rowCount() - 1, current.column())
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            return current
+        self.navigationRequested.emit(self.model().offset + row, column)
+        return current
+
+    def reset_selection_steps(self, *_):
+        if not self.changing_selection:
+            self.selection_steps.clear()
+
+    def set_selection(self, selection):
+        self.changing_selection = True
+        try:
+            self.selectionModel().select(selection, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        finally:
+            self.changing_selection = False
+
+    def select_scope(self, scope, *, extending=False):
+        current, model = self.currentIndex(), self.model()
+        if not current.isValid():
+            return
+        if not extending:
+            self.selection_steps.clear()
+        top, bottom = (current.row(), current.row()) if scope == 'row' else (0, model.rowCount() - 1)
+        left, right = (current.column(), current.column()) if scope == 'column' else (0, model.columnCount() - 1)
+        self.set_selection(QItemSelection(model.index(top, left), model.index(bottom, right)))
+
+    def extend_selection(self):
+        if self.currentIndex().isValid() and len(self.selection_steps) < 3:
+            scope = ('column', 'row', 'all')[len(self.selection_steps)]
+            self.selection_steps.append(QItemSelection(self.selectionModel().selection()))
+            self.select_scope(scope, extending=True)
+
+    def shrink_selection(self):
+        if self.selection_steps:
+            self.set_selection(self.selection_steps.pop())
+
+    def selection_summary(self):
+        ranges = self.selectionModel().selection()
+        def total(intervals):
+            count, end = 0, -1
+            for left, right in sorted(intervals):
+                count += max(0, right - max(end + 1, left) + 1)
+                end = max(end, right)
+            return count
+        return (
+            sum(r.width() * r.height() for r in ranges),
+            total((r.top(), r.bottom()) for r in ranges),
+            total((r.left(), r.right()) for r in ranges),
         )
 
     def sync_pinned_scroll(self, value):
@@ -465,6 +559,7 @@ class MainWindow(QMainWindow):
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.count_job = None
         self.page_job = None
+        self.keyboard_target = None
         self.find_job = None
         self.find_match = None
         self.export_job = None
@@ -545,6 +640,9 @@ class MainWindow(QMainWindow):
         self.replace_action.setShortcuts(QKeySequence.StandardKey.Replace)
         self.transpose_action = edit_menu.addAction("Transpose Selection…", self.transpose_selection)
         self.record_action = edit_menu.addAction("Record View…", self.show_record)
+        self.edit_action = edit_menu.addAction("Edit Cell", self.edit_current_cell)
+        self.edit_action.setShortcuts(['Return', 'Enter', 'F2'])
+        self.edit_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         self.value_action = edit_menu.addAction("Open in Value Editor…", self.edit_cell_value)
         self.value_action.setShortcuts(["Shift+Return", "Shift+Enter"])
         self.value_action.setEnabled(False)
@@ -641,8 +739,30 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.find_bar)
 
         self.table = CsvTable(self.model)
+        self.table.more_rows = lambda: self.has_more
+        self.table.addAction(self.edit_action)
+        self.cell_menu_action = edit_menu.addAction('Cell Actions…', self.open_current_cell_menu)
+        self.cell_menu_action.setShortcuts(['Menu', 'Shift+F10'])
+        self.cell_menu_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        self.table.addAction(self.cell_menu_action)
+        self.table.navigationRequested.connect(self.navigate_table)
         self.table.selectionModel().currentChanged.connect(self.update_edit_actions)
         self.table.selectionModel().selectionChanged.connect(self.update_edit_actions)
+        edit_menu.addSeparator()
+        self.selection_actions = []
+        for label, callback in (
+            ('Select Row', lambda: self.table.select_scope('row')),
+            ('Select Column (buffered)', lambda: self.table.select_scope('column')),
+            ('Select Buffered Cells', lambda: self.table.select_scope('all')),
+            ('Extend Selection', self.table.extend_selection),
+            ('Shrink Selection', self.table.shrink_selection),
+        ):
+            self.selection_actions.append(edit_menu.addAction(label, callback))
+        modifier = 'Alt' if sys.platform == 'darwin' else 'Ctrl+Alt'
+        for action, key in zip(self.selection_actions[-2:], ('Up', 'Down'), strict=True):
+            action.setShortcut(QKeySequence(f'{modifier}+{key}'))
+            action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+            self.table.addAction(action)
         header = CsvHeader(self.table)
         self.table.setHorizontalHeader(header)
         header.setSectionsClickable(True)
@@ -692,6 +812,8 @@ class MainWindow(QMainWindow):
             shortcut.activated.connect(lambda last=last: self.go_to_edge(last))
         self.status = QLabel("Open a CSV file to begin")
         self.statusBar().addWidget(self.status, 1)
+        self.selection_status = QLabel()
+        self.statusBar().addPermanentWidget(self.selection_status)
         self.update_edit_actions()
 
     def cycle_column_sort(self, section, append):
@@ -728,18 +850,49 @@ class MainWindow(QMainWindow):
             return
         self.load_view(self.path, selection)
 
+    def open_current_cell_menu(self):
+        index = self.table.currentIndex()
+        if index.isValid():
+            view = self.table.pinned if index.column() in self.table.pinned_sections else self.table
+            self.cell_filter_menu(view.visualRect(index).center(), view)
+
     def cell_filter_menu(self, point, table=None):
         table = table or self.table
         index = table.indexAt(point)
-        if not index.isValid() or not self.columns_action.isEnabled():
+        if not index.isValid() or self.path is None:
             return
+        selection = self.table.selectionModel()
+        if selection.isSelected(index):
+            selection.setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+        else:
+            self.table.setCurrentIndex(index)
+        self.table.setFocus()
+        self.update_edit_actions()
         menu = QMenu(self)
+        for action in (self.edit_action, self.value_action, self.record_action):
+            menu.addAction(action)
+        menu.addSeparator()
+        menu.addAction(self.copy_action)
+        menu.addMenu(self.copy_as_menu)
+        menu.addAction(self.paste_action)
+        menu.addAction(self.clear_action)
+        menu.addSeparator()
+        for action in (self.add_row_action, self.clone_action, self.delete_action):
+            menu.addAction(action)
+        menu.addSeparator()
+        selections = menu.addMenu('Selection (buffered rows)')
+        for action in self.selection_actions:
+            selections.addAction(action)
         filters = menu.addMenu("Filter by")
+        filters.setEnabled(self.columns_action.isEnabled())
         equals = filters.addAction("Equals this value")
         not_equals = filters.addAction("Does not equal this value")
+        menu.addSeparator()
+        menu.addAction(self.undo_action)
+        menu.addAction(self.redo_action)
         cell = QPersistentModelIndex(index)
         action = menu.exec(table.viewport().mapToGlobal(point))
-        if action in (equals, not_equals) and cell.isValid():
+        if filters.isEnabled() and action in (equals, not_equals) and cell.isValid():
             self.quick_filter(QModelIndex(cell), "equals" if action == equals else "not_equals")
 
     def quick_filter(self, index, operator):
@@ -1228,6 +1381,7 @@ class MainWindow(QMainWindow):
         return token, future
 
     def cancel_operations(self):
+        self.keyboard_target = None
         for job in self.jobs():
             if job is not None:
                 token, future = job
@@ -1428,6 +1582,12 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         dialog.exec()
+
+    def edit_current_cell(self):
+        current = self.table.currentIndex()
+        if self.model.editable and current.isValid():
+            view = self.table.pinned if current.column() in self.table.pinned_sections else self.table
+            view.edit(current)
 
     def edit_cell_value(self):
         current = self.table.currentIndex()
@@ -2091,6 +2251,7 @@ class MainWindow(QMainWindow):
             return
 
         self.reset_find()
+        self.keyboard_target = None
         self.recovery_request = recovery
         fmt = fmt or (CsvFormat() if new_file else self.csv_format)
         edits = {} if new_file else self.model.edits.copy()
@@ -2275,15 +2436,44 @@ class MainWindow(QMainWindow):
         else:
             self.show_edge_row(last)
 
+    def navigate_table(self, row, column):
+        if self.path is None or self.view_job or self.save_job:
+            return
+        self.keyboard_target = row, column
+        self.flush_keyboard_navigation()
+
+    def flush_keyboard_navigation(self):
+        if self.keyboard_target is None or self.page_job or self.view_job or self.save_job:
+            return
+        row, column = self.keyboard_target
+        self.keyboard_target = None
+        end = self.model.offset + self.model.rowCount()
+        if row < 0 or (not self.has_more and row >= end):
+            row = max(0, min(row, end - 1))
+            column = max(0, self.table.currentIndex().column())
+        self.go_to_row(row + 1, column=column)
+        if self.page_job:
+            self.page_clamp_target = True
+
     def prompt_for_row(self):
-        value, accepted = QInputDialog.getText(self, "Go to Row", "Row number in the current view:")
+        value, accepted = QInputDialog.getText(self, "Go to Row", "Row or column:row in the current view (starting at 1):")
         if not accepted:
             return
         try:
-            number = int(value)
+            parts = value.split(":")
+            if len(parts) == 1:
+                column, number = None, int(parts[0])
+            elif len(parts) == 2:
+                visual, number = map(int, parts)
+                if not 1 <= visual <= self.model.columnCount():
+                    raise ValueError("Invalid column")
+                column = self.table.horizontalHeader().logicalIndex(visual - 1)
+            else:
+                raise ValueError("Invalid address")
         except ValueError:
-            number = 0
-        self.go_to_row(number)
+            self.report_missing_row()
+            return
+        self.go_to_row(number, column=column)
 
     def apply_replacement(self, batch):
         if not self.model.editable or not len(batch):
@@ -2557,6 +2747,7 @@ class MainWindow(QMainWindow):
 
     def load_page(self, offset, *, target_row=None, target_column=None, limit=PAGE_SIZE):
         self.page_offset = offset
+        self.page_clamp_target = False
         self.page_target_row = target_row
         self.page_target_column = target_column
         if self.result is None:
@@ -2603,8 +2794,11 @@ class MainWindow(QMainWindow):
             raise ValueError("CSV changed. Reopen the file to refresh it.")
         target = self.page_target_row
         if target is not None and target - self.page_offset >= len(rows):
-            self.report_missing_row()
-            return
+            if self.page_clamp_target and rows:
+                target = self.page_offset + len(rows) - 1
+            else:
+                self.report_missing_row()
+                return
         if not rows:
             raise ValueError("CSV changed. Reopen the file to refresh it.")
         if tail_offset is not None or target is not None:
@@ -2673,6 +2867,7 @@ class MainWindow(QMainWindow):
                     self.total_rows = result
                 elif name == "page_job":
                     self.apply_page(*result)
+                    self.flush_keyboard_navigation()
                 elif name == "find_job":
                     self.apply_find(result)
                 elif name == "text_job":
@@ -2733,6 +2928,13 @@ class MainWindow(QMainWindow):
             self.workspace.discard_empty_tab(self)
 
     def update_edit_actions(self):
+        current = self.table.currentIndex().isValid()
+        self.cell_menu_action.setEnabled(self.path is not None and current)
+        for action in self.selection_actions:
+            action.setEnabled(current and self.view_job is None and self.page_job is None)
+        if hasattr(self, 'selection_status'):
+            cells, rows, columns = self.table.selection_summary()
+            self.selection_status.setText(f'Selection: {cells:,} cells; {rows:,} rows; {columns:,} columns (buffered)')
         self.copy_action.setEnabled(self.path is not None)
         self.copy_as_menu.setEnabled(self.path is not None)
         self.transpose_action.setEnabled(
@@ -2743,15 +2945,12 @@ class MainWindow(QMainWindow):
             self.path is not None and self.distinct is None and self.view_job is None
             and self.table.currentIndex().isValid()
         )
-        for action in (
-            self.value_action,
-            self.paste_action,
-            self.clear_action,
-            self.add_row_action,
-            self.clone_action,
-            self.delete_action,
-        ):
-            action.setEnabled(self.model.editable)
+        for action in (self.edit_action, self.value_action, self.paste_action):
+            action.setEnabled(self.model.editable and current)
+        selected = self.table.selectionModel().hasSelection()
+        for action in (self.clear_action, self.clone_action, self.delete_action):
+            action.setEnabled(self.model.editable and selected)
+        self.add_row_action.setEnabled(self.model.editable)
 
     def update_status(self):
         def progress_for(job, label):

@@ -527,7 +527,8 @@ def test_cell_menu_filters_empty_value_and_removes_rule_individually(tmp_path, m
 
     class CellMenu(QMenu):
         def exec(self, point):
-            return self.actions()[0].menu().actions()[0]
+            filters = next(action.menu() for action in self.actions() if action.text() == 'Filter by')
+            return filters.actions()[0]
 
     monkeypatch.setattr("csv_workbench.ui.QMenu", CellMenu)
     window = MainWindow()

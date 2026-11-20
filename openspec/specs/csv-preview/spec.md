@@ -634,3 +634,43 @@ The application SHALL store cell patches and Undo/Redo values on disk, with memo
 - **WHEN** a recovery checkpoint is written and reopened
 - **THEN** patches and history SHALL be saved and restored without materializing all cell values in RAM
 - **AND** legacy version 1 checkpoints SHALL remain readable
+
+### Requirement: Keyboard navigation across buffered CSV rows
+
+Arrow, Tab, reverse Tab and page movement SHALL work across buffer boundaries without loading the whole selection; Go to Row SHALL accept a visible column and row.
+
+#### Scenario: Use the grid action
+
+- **WHEN** the user invokes the documented action on the current CSV view
+- **THEN** it SHALL follow the contract in GRID_POLISH.md without altering unrelated cells
+- **AND** disabled or invalid actions SHALL leave the document unchanged
+
+### Requirement: Explicit bounded CSV selection
+
+The application SHALL provide row, column, extend and shrink selection actions, scoped explicitly to buffered rows; selection SHALL remain bounded and report its size.
+
+#### Scenario: Use the grid action
+
+- **WHEN** the user invokes the documented action on the current CSV view
+- **THEN** it SHALL follow the contract in GRID_POLISH.md without altering unrelated cells
+- **AND** disabled or invalid actions SHALL leave the document unchanged
+
+### Requirement: Explicit cell editing keyboard contract
+
+Enter, F2 and double click SHALL start editing an editable cell; Enter SHALL confirm one Undo operation and Escape SHALL cancel without changing the document.
+
+#### Scenario: Use the grid action
+
+- **WHEN** the user invokes the documented action on the current CSV view
+- **THEN** it SHALL follow the contract in GRID_POLISH.md without altering unrelated cells
+- **AND** disabled or invalid actions SHALL leave the document unchanged
+
+### Requirement: Consistent CSV cell context actions
+
+Cell context menus SHALL reuse existing editing actions, preserve a selected range when invoked inside it, select an outside target, and support keyboard invocation.
+
+#### Scenario: Use the grid action
+
+- **WHEN** the user invokes the documented action on the current CSV view
+- **THEN** it SHALL follow the contract in GRID_POLISH.md without altering unrelated cells
+- **AND** disabled or invalid actions SHALL leave the document unchanged
