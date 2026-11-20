@@ -1465,3 +1465,143 @@ def test_compare_command_pages_through_saved_file_differences(tmp_path, monkeypa
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_replace_preview_full_selection_and_single_undo(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QComboBox, QDialog, QLineEdit, QPushButton, QTableWidget
+
+    from csv_workbench.core import Cancellation, Selection, export_edited_csv, read_page
+
+    app = QApplication.instance() or QApplication(['replace-test', '-platform', 'offscreen'])
+    source = tmp_path / 'replace.csv'
+    original = 'id,note,group\n' + ''.join(f'{i:04},hit HIT,yes\n' for i in range(1201))
+    source.write_text(original)
+    window = MainWindow()
+
+    def finish():
+        if window.view_job:
+            window.view_job[1].result(timeout=10)
+            window.collect_reads()
+
+    class InspectDialog(QDialog):
+        def exec(self):
+            needle, replacement = self.findChildren(QLineEdit)
+            needle.setText('hit')
+            replacement.setText('new')
+            self.findChild(QComboBox).setCurrentIndex(1)
+            buttons = {b.text(): b for b in self.findChildren(QPushButton)}
+            buttons['Preview'].click()
+            for _ in range(500):
+                QTest.qWait(10)
+                if buttons['Replace All'].isEnabled():
+                    break
+            assert buttons['Replace All'].isEnabled()
+            assert self.findChild(QTableWidget).rowCount() == 100
+            assert window.model.edits == prior
+            assert source.read_text() == original
+            buttons['Replace All'].click()
+            for _ in range(500):
+                QTest.qWait(10)
+                if self.result() == QDialog.DialogCode.Accepted:
+                    break
+            assert self.result() == QDialog.DialogCode.Accepted
+            return self.result()
+
+    monkeypatch.setattr('csv_workbench.ui.QDialog', InspectDialog)
+    monkeypatch.setattr(QMessageBox, 'question', lambda *_: QMessageBox.StandardButton.Yes)
+    try:
+        window.load_view(source, Selection((('group', 'yes'),), 'id', True, ('id', 'note')), new_file=True)
+        finish()
+        window.model.setData(window.model.index(0, 1), 'edited HiT')
+        finish()
+        prior = window.model.edits.copy()
+        position = window.history_pos
+        assert window.model.rowCount() < 1201
+        window.open_replace()
+        finish()
+        assert window.history_pos == position + 1
+        assert len(window.history[-1]) == 1201
+        assert window.model.edits[(0, 1)] == 'new new'
+        assert window.model.edits[(1200, 1)] == 'edited new'
+        output = tmp_path / 'export.csv'
+        export_edited_csv(source, output, window.model.edits, window.revision, window.selection, cancel=Cancellation())
+        assert read_page(output, 1200)[1] == [('0000', 'new new')]
+        window.undo_action.trigger()
+        finish()
+        assert window.history_pos == position
+        assert window.model.edits[(1200, 1)] == 'edited HiT'
+        assert window.model.edits == prior
+        window.redo_action.trigger()
+        finish()
+        assert window.model.edits[(0, 1)] == 'new new'
+        assert source.read_text() == original
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.parametrize('action', ['stale', 'reset', 'stop', 'apply-stop'])
+def test_replace_rejects_stale_preview_and_cancels_without_edits(tmp_path, monkeypatch, action):
+    from PySide6.QtWidgets import QDialog, QLabel, QLineEdit, QPushButton
+
+    from csv_workbench.core import Selection
+
+    app = QApplication.instance() or QApplication(['replace-test', '-platform', 'offscreen'])
+    source = tmp_path / 'replace.csv'
+    source.write_text('note\nhit\n')
+    window = MainWindow()
+    tokens = []
+    submit = window.submit
+
+    def track(*args, **kwargs):
+        job = submit(*args, **kwargs)
+        tokens.append(job[0])
+        return job
+
+    class InspectDialog(QDialog):
+        def exec(self):
+            needle, replacement = self.findChildren(QLineEdit)
+            needle.setText('hit')
+            replacement.setText('new')
+            buttons = {b.text(): b for b in self.findChildren(QPushButton)}
+            buttons['Preview'].click()
+            if action == 'stop':
+                buttons['Stop'].click()
+                assert tokens[-1].cancelled
+            else:
+                for _ in range(500):
+                    QTest.qWait(10)
+                    if buttons['Replace One'].isEnabled():
+                        break
+                assert buttons['Replace One'].isEnabled()
+                if action == 'apply-stop':
+                    buttons['Replace One'].click()
+                    buttons['Stop'].click()
+                    assert tokens[-1].cancelled
+                elif action == 'stale':
+                    source.write_text('note\nchanged externally\n')
+                    buttons['Replace One'].click()
+                    assert any('changed' in label.text() for label in self.findChildren(QLabel))
+                else:
+                    replacement.setText('different')
+            assert not buttons['Replace One'].isEnabled()
+            self.reject()
+            return self.result()
+
+    monkeypatch.setattr('csv_workbench.ui.QDialog', InspectDialog)
+    try:
+        window.load_view(source, Selection(), new_file=True)
+        window.view_job[1].result(timeout=5)
+        window.collect_reads()
+        monkeypatch.setattr(window, 'submit', track)
+        window.open_replace()
+        assert not window.model.edits and not window.history and not window.dirty
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

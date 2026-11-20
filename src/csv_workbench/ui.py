@@ -101,6 +101,7 @@ from csv_workbench.recovery import (
     checkpoint_data,
     read_checkpoint,
 )
+from csv_workbench.replace import preview_replacement
 from csv_workbench.session import (
     load_session,
     load_workspace_session,
@@ -532,6 +533,8 @@ class MainWindow(QMainWindow):
         self.find_action = edit_menu.addAction("Find…", self.open_find)
         self.find_action.setShortcuts(QKeySequence.StandardKey.Find)
         self.find_action.setEnabled(False)
+        self.replace_action = edit_menu.addAction("Find and Replace…", self.open_replace)
+        self.replace_action.setShortcuts(QKeySequence.StandardKey.Replace)
         self.transpose_action = edit_menu.addAction("Transpose Selection…", self.transpose_selection)
         self.record_action = edit_menu.addAction("Record View…", self.show_record)
         self.value_action = edit_menu.addAction("Open in Value Editor…", self.edit_cell_value)
@@ -567,7 +570,7 @@ class MainWindow(QMainWindow):
             for action in (
                 open_action, self.save_action, self.save_as_action, self.undo_action, self.redo_action,
                 self.copy_action, self.paste_action, self.clear_action, self.go_to_row_action,
-                self.find_action, self.value_action,
+                self.find_action, self.replace_action, self.value_action,
             ):
                 self.addAction(action)
                 action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -2264,6 +2267,171 @@ class MainWindow(QMainWindow):
             number = 0
         self.go_to_row(number)
 
+    def apply_replacement(self, changes):
+        if not self.model.editable or not changes:
+            return
+        for index, (key, _, after) in enumerate(changes):
+            changes[index] = (key, self.model.edits.get(key, MISSING), after)
+            self.model.edits[key] = after
+        self.refresh_after_edit(("edit", changes))
+
+    def open_replace(self):
+        if not self.replace_action.isEnabled():
+            return
+        self.cancel_find()
+        path, revision, selection, fmt = self.path, self.revision, self.selection, self.csv_format
+        edits = self.model.edits.copy()
+        snapshot = self.source_snapshot
+        base = Path(snapshot.name) / "source.csv" if snapshot else path
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Find and Replace — current selection")
+        dialog.resize(800, 520)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        needle = QLineEdit(self.find_input.text())
+        replacement = QLineEdit()
+        mode = QComboBox()
+        mode.addItems(["First occurrence (from start)", "All occurrences"])
+        form.addRow("Find (literal, case insensitive)", needle)
+        form.addRow("Replace with (empty removes text)", replacement)
+        form.addRow("Scope: visible columns, all selected rows", mode)
+        layout.addLayout(form)
+        message = QLabel("Preview changes before applying. CSV is not modified until Save.")
+        message.setWordWrap(True)
+        layout.addWidget(message)
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["Row", "Column", "Before", "After"])
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        preview_button = buttons.addButton("Preview", QDialogButtonBox.ButtonRole.ActionRole)
+        apply_button = buttons.addButton("Replace One", QDialogButtonBox.ButtonRole.ActionRole)
+        stop = buttons.addButton("Stop", QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        job = plan = None
+        applying = False
+        accepted_changes = None
+        timer = QTimer(dialog, interval=30)
+
+        def unchanged():
+            if (
+                self.path != path or self.revision != revision or self.selection != selection
+                or self.model.edits != edits or file_revision(path) != revision
+            ):
+                raise ValueError("The CSV or current view changed. Close and reopen replacement.")
+
+        def reset():
+            nonlocal job, plan
+            if job:
+                job[0].cancel()
+                job[1].cancel()
+                job = None
+            timer.stop()
+            plan = None
+            table.setRowCount(0)
+            apply_button.setText("Replace All" if mode.currentIndex() else "Replace One")
+            apply_button.setEnabled(False)
+            preview_button.setEnabled(bool(needle.text()))
+            stop.setEnabled(False)
+
+        def start():
+            nonlocal job
+            reset()
+            text, value, first = needle.text(), replacement.text(), mode.currentIndex() == 0
+
+            def prepare(*, cancel):
+                unchanged()
+                prepared = preview_replacement(
+                    base, selection, edits, text, value, first=first, fmt=fmt, cancel=cancel,
+                )
+                unchanged()
+                return prepared
+
+            job = self.submit(prepare)
+            message.setText("Preparing preview…")
+            stop.setEnabled(True)
+            preview_button.setEnabled(False)
+            timer.start()
+
+        def apply():
+            nonlocal job, applying
+            if plan is None or not plan.cells:
+                return
+            try:
+                unchanged()
+            except (OSError, ValueError) as exc:
+                reset()
+                message.setText(str(exc))
+                return
+            applying = True
+            job = self.submit(plan.changes, heavy=False)
+            for widget in (needle, replacement, mode, preview_button, apply_button):
+                widget.setEnabled(False)
+            stop.setEnabled(True)
+            message.setText("Preparing one Undo operation…")
+            timer.start()
+
+        def collect():
+            nonlocal job, plan, accepted_changes
+            if job is None or not job[1].done():
+                return
+            token, future = job
+            job = None
+            timer.stop()
+            stop.setEnabled(False)
+            try:
+                result = future.result()
+                token.check()
+                unchanged()
+                if applying:
+                    accepted_changes = result
+                    dialog.accept()
+                    return
+                plan = result
+                table.setRowCount(len(plan.preview))
+                for row, values in enumerate(plan.preview):
+                    for column, value in enumerate(values):
+                        table.setItem(row, column, QTableWidgetItem(str(value)))
+                message.setText(
+                    f"{plan.occurrences:,} matches; {plan.cells:,} changed cells. "
+                    f"Showing first {len(plan.preview)} changes. "
+                    "All confirmed changes form one Undo operation."
+                )
+                apply_button.setEnabled(bool(plan.cells))
+                preview_button.setEnabled(bool(needle.text()))
+            except (CancelledError, duckdb.Error, OSError, ValueError) as exc:
+                reset()
+                message.setText("Cancelled" if isinstance(exc, CancelledError) else str(exc))
+                if applying:
+                    dialog.reject()
+
+        def stop_job():
+            if applying:
+                dialog.reject()
+            else:
+                reset()
+                message.setText("Cancelled")
+
+        needle.textChanged.connect(reset)
+        replacement.textChanged.connect(reset)
+        mode.currentIndexChanged.connect(reset)
+        preview_button.clicked.connect(start)
+        apply_button.clicked.connect(apply)
+        stop.clicked.connect(stop_job)
+        timer.timeout.connect(collect)
+        dialog.finished.connect(reset)
+        reset()
+        dialog.exec()
+        if accepted_changes is not None:
+            try:
+                unchanged()
+                self.apply_replacement(accepted_changes)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "Replacement not applied", str(exc))
+        dialog.deleteLater()
+
     def open_find(self):
         if self.find_bar.isHidden():
             self.find_bar.show()
@@ -2586,6 +2754,7 @@ class MainWindow(QMainWindow):
         self.save_as_action.setEnabled(available)
         self.go_to_row_action.setEnabled(available and self.page_job is None and self.model.rowCount() > 0)
         self.find_action.setEnabled(self.path is not None)
+        self.replace_action.setEnabled(available and self.distinct is None and self.page_job is None)
         self.view_mode.setEnabled(available)
         self.compare_action.setEnabled(available and self.compare_job is None and self.distinct is None)
         can_manage_columns = available and self.distinct is None
