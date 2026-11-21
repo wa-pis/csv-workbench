@@ -63,6 +63,8 @@ from PySide6.QtWidgets import (
 )
 
 from csv_workbench.compare import compare_csv
+from csv_workbench.completion import complete_values
+from csv_workbench.completion_ui import CompletionDelegate
 from csv_workbench.core import (
     CSV_ENCODINGS,
     DELETED_COLUMN,
@@ -117,7 +119,7 @@ from csv_workbench.text_formats import clipboard_text
 
 ROOT_INDEX = QModelIndex()
 BUFFER_ROWS = PAGE_SIZE * 3
-JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job", "compare_job")
+JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job", "compare_job", "completion_job")
 FIND_COLORS = {
     Qt.ItemDataRole.BackgroundRole: QBrush(QColor("#ffe38a")),
     Qt.ItemDataRole.ForegroundRole: QBrush(QColor("#242424")),
@@ -570,6 +572,8 @@ class MainWindow(QMainWindow):
         self.query_job = None
         self.text_job = None
         self.compare_job = None
+        self.completion_job = None
+        self.completion_request = None
         self.sql_text = "SELECT * FROM csv_data"
         self.poll = QTimer(self, interval=30)
         self.poll.timeout.connect(self.collect_reads)
@@ -740,6 +744,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.find_bar)
 
         self.table = CsvTable(self.model)
+        self.completion_delegates = []
+        for view in (self.table, self.table.pinned):
+            # Each view owns its delegate's commit/close signals.
+            delegate = CompletionDelegate(view)
+            self.completion_delegates.append(delegate)
+            view.setItemDelegate(delegate)
+            delegate.editorOpened.connect(lambda d=delegate: self.activate_completion_delegate(d))
+            delegate.requested.connect(self.start_completion)
+            delegate.cancelled.connect(lambda d=delegate: self.cancel_completion(d))
+            self.model.modelAboutToBeReset.connect(delegate.dismiss)
+        self.completion_delegate = self.completion_delegates[0]
+        self.complete_action = edit_menu.addAction('Complete Value', self.complete_current_value)
+        self.complete_action.setShortcut('Ctrl+Space')
+        self.complete_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.table.addAction(self.complete_action)
         self.table.more_rows = lambda: self.has_more
         self.table.addAction(self.edit_action)
         self.cell_menu_action = edit_menu.addAction('Cell Actions…', self.open_current_cell_menu)
@@ -873,7 +892,7 @@ class MainWindow(QMainWindow):
         self.table.setFocus()
         self.update_edit_actions()
         menu = QMenu(self)
-        for action in (self.edit_action, self.value_action, self.record_action):
+        for action in (self.edit_action, self.complete_action, self.value_action, self.record_action):
             menu.addAction(action)
         menu.addSeparator()
         menu.addAction(self.copy_action)
@@ -1387,6 +1406,7 @@ class MainWindow(QMainWindow):
         return token, future
 
     def cancel_operations(self):
+        self.completion_delegate.dismiss()
         self.keyboard_target = None
         for job in self.jobs():
             if job is not None:
@@ -1588,6 +1608,78 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         dialog.exec()
+
+    def complete_current_value(self):
+        if not self.model.editable:
+            return
+        if self.completion_delegate.editor is None:
+            self.edit_current_cell()
+        self.completion_delegate.begin()
+
+    def activate_completion_delegate(self, delegate):
+        if delegate is not self.completion_delegate:
+            self.completion_delegate.dismiss()
+            self.completion_delegate = delegate
+
+    def cancel_completion(self, owner=None):
+        if (owner is not None and self.completion_request is not None
+                and self.completion_request[0] is not owner.editor):
+            return
+        if self.completion_job is not None:
+            token, future = self.completion_job
+            token.cancel()
+            future.cancel()
+            self.completion_job = None
+        self.completion_request = None
+
+    def completion_state(self):
+        return (self.path, self.revision, self.selection, self.history_pos, self.result)
+
+    def start_completion(self, editor, prefix):
+        self.cancel_completion()
+        if not self.model.editable or self.path is None:
+            return
+        delegate = self.completion_delegate
+        if not delegate.cell.isValid():
+            return
+        column = self.model.headers[delegate.cell.column()]
+        state = self.completion_state()
+        path, revision, selection, _, result = state
+        snapshot, fmt = self.source_snapshot, self.csv_format
+        edits = self.model.edits.copy()
+        self.completion_request = (editor, prefix, state, QPersistentModelIndex(delegate.cell))
+
+        def search(*, cancel):
+            if file_revision(path) != revision:
+                raise ValueError('The source CSV changed. Reopen it before completing values.')
+            values = complete_values(
+                Path(snapshot.name) / 'source.csv' if snapshot else path,
+                selection, edits, column, prefix, cancel=cancel, fmt=fmt, result=result,
+            )
+            if file_revision(path) != revision:
+                raise ValueError('The source CSV changed. Reopen it before completing values.')
+            return values
+
+        self.completion_job = self.submit(search)
+        self.poll.start()
+        self.update_status()
+
+    def apply_completion(self, result):
+        request = self.completion_request
+        self.completion_request = None
+        if request is None:
+            return
+        editor, prefix, state, cell = request
+        delegate = self.completion_delegate
+        if (delegate.active and editor is delegate.editor and cell.isValid()
+                and cell == delegate.cell and state == self.completion_state()
+                and prefix == editor.text()):
+            delegate.show_values(*result)
+            values, truncated = result
+            self.statusBar().showMessage(
+                'First 100 suggestions; narrow the prefix' if truncated
+                else f'{len(values)} completion suggestions', 5000,
+            )
 
     def edit_current_cell(self):
         current = self.table.currentIndex()
@@ -2674,6 +2766,7 @@ class MainWindow(QMainWindow):
         self.update_status()
 
     def reset_find(self):
+        self.completion_delegate.dismiss()
         self.cancel_find()
         self.find_match = None
         self.find_message.clear()
@@ -2874,6 +2967,8 @@ class MainWindow(QMainWindow):
                 elif name == "page_job":
                     self.apply_page(*result)
                     self.flush_keyboard_navigation()
+                elif name == "completion_job":
+                    self.apply_completion(result)
                 elif name == "find_job":
                     self.apply_find(result)
                 elif name == "text_job":
@@ -2951,7 +3046,7 @@ class MainWindow(QMainWindow):
             self.path is not None and self.distinct is None and self.view_job is None
             and self.table.currentIndex().isValid()
         )
-        for action in (self.edit_action, self.value_action, self.paste_action):
+        for action in (self.edit_action, self.complete_action, self.value_action, self.paste_action):
             action.setEnabled(self.model.editable and current)
         selected = self.table.selectionModel().hasSelection()
         for action in (self.clear_action, self.clone_action, self.delete_action):
@@ -3038,6 +3133,7 @@ class MainWindow(QMainWindow):
             for job, label in (
                 (self.page_job, "Loading more"),
                 (self.find_job, "Searching"),
+                (self.completion_job, "Completing values"),
                 (self.view_job, "Reading CSV"),
                 (self.count_job, "Counting rows"),
                 (self.export_job, "Exporting CSV"),
@@ -3350,6 +3446,9 @@ class WorkspaceWindow(QWidget):
 
     def activate_document(self):
         document = self.tabs.currentWidget()
+        for other in self.documents():
+            if other is not document:
+                other.completion_delegate.dismiss()
         if (
             document is not None and document.path is not None
             and document.total_rows is None and document.count_job is None

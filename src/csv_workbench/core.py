@@ -370,7 +370,7 @@ def selection_sql(
     return f"SELECT {projection} FROM {source}{where}{order}", values
 
 
-def editable_query(connection, source, selection, edits, fmt=CsvFormat(), *, cancel=None):
+def editable_query(connection, source, selection, edits, fmt=CsvFormat(), *, cancel=None, ordered=True):
     pattern = csv_pattern(source)
     columns = csv_columns(connection, pattern, fmt)
     name = "__csv_source_row"
@@ -420,7 +420,7 @@ def editable_query(connection, source, selection, edits, fmt=CsvFormat(), *, can
             f"WHERE NOT coalesce({deleted}, false))"
         )
     sql, values = selection_sql(columns, selection, source=scan, row_id=row_id)
-    if edits and selection.sort_column is None:
+    if ordered and edits and selection.sort_column is None:
         sql += f" ORDER BY {row_id}"
     return sql, [pattern, *values]
 

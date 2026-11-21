@@ -476,3 +476,40 @@ def test_startup_restores_multiple_tabs_and_skips_live_owners(tmp_path, monkeypa
     workspace.offer_recovery()
     assert prompts == []
     assert workspace.documents() == restored
+
+
+def test_switch_tab_cancels_completion_and_does_not_publish_elsewhere(tmp_path, monkeypatch, workspace):
+    from concurrent.futures import CancelledError
+    from threading import Event
+
+    started, release = Event(), Event()
+
+    def delayed(*args, cancel, **kwargs):
+        started.set()
+        assert release.wait(5)
+        cancel.check()
+        return ['stale'], False
+
+    source = tmp_path / 'complete.csv'
+    source.write_text('note\nfirst\nsecond\n')
+    workspace.open_document(source, Selection(), CsvFormat())
+    active = workspace.tabs.currentWidget()
+    finish_view(active)
+    workspace.show()
+    workspace.activateWindow()
+    active.table.setCurrentIndex(active.model.index(0, 0))
+    active.edit_current_cell()
+    monkeypatch.setattr('csv_workbench.ui.complete_values', delayed)
+    active.complete_action.trigger()
+    token, future = active.completion_job
+    try:
+        assert started.wait(5)
+        other = workspace.add_document_tab()
+        QApplication.processEvents()
+        assert token.cancelled and active.completion_job is None
+        assert not active.completion_delegate.active
+        assert other.completion_job is None and other.completion_delegate.editor is None
+    finally:
+        release.set()
+    with pytest.raises(CancelledError):
+        future.result(timeout=5)
