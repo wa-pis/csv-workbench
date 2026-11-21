@@ -90,6 +90,7 @@ from csv_workbench.core import (
     selection_sql,
 )
 from csv_workbench.edits import DiskBatch, DiskEdits
+from csv_workbench.keyboard_trace import trace_keyboard
 from csv_workbench.presets import FormatPresets, export_format_presets, import_format_presets
 from csv_workbench.recent import (
     clear_recent_files,
@@ -851,6 +852,7 @@ class MainWindow(QMainWindow):
         self.load_view(self.path, selection)
 
     def open_current_cell_menu(self):
+        trace_keyboard('cell_menu_requested', enabled=self.cell_menu_action.isEnabled())
         index = self.table.currentIndex()
         if index.isValid():
             view = self.table.pinned if index.column() in self.table.pinned_sections else self.table
@@ -859,6 +861,8 @@ class MainWindow(QMainWindow):
     def cell_filter_menu(self, point, table=None):
         table = table or self.table
         index = table.indexAt(point)
+        trace_keyboard('cell_menu_target', valid=index.isValid(), has_file=self.path is not None,
+                       pinned=table is self.table.pinned)
         if not index.isValid() or self.path is None:
             return
         selection = self.table.selectionModel()
@@ -891,7 +895,9 @@ class MainWindow(QMainWindow):
         menu.addAction(self.undo_action)
         menu.addAction(self.redo_action)
         cell = QPersistentModelIndex(index)
+        trace_keyboard('cell_menu_opening')
         action = menu.exec(table.viewport().mapToGlobal(point))
+        trace_keyboard('cell_menu_closed')
         if filters.isEnabled() and action in (equals, not_equals) and cell.isValid():
             self.quick_filter(QModelIndex(cell), "equals" if action == equals else "not_equals")
 

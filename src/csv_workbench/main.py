@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -6,6 +7,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from csv_workbench.core import Selection, export_csv, prepare_result, read_page
+from csv_workbench.keyboard_trace import KeyboardTrace
 from csv_workbench.ui import WorkspaceWindow
 
 
@@ -13,6 +15,11 @@ def main() -> int:
     smoke = sys.argv[1:] == ["--smoke-test"]
     app = QApplication([sys.argv[0], "-platform", "offscreen"] if smoke else sys.argv)
     app.setApplicationName("CSV Workbench")
+    if path := os.environ.get("CSV_WORKBENCH_KEY_LOG"):
+        try:
+            app.keyboard_trace = KeyboardTrace(app, path)
+        except OSError as exc:
+            print(f"Cannot open keyboard trace: {exc}", file=sys.stderr)
     window = WorkspaceWindow()
     window.resize(1100, 720)
     window.show()

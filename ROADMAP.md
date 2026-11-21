@@ -45,6 +45,8 @@
 
 Исправление фокуса клавиатурного меню ячейки: [`fix-csv-cell-menu-focus`](openspec/changes/archive/2026-11-21-fix-csv-cell-menu-focus/proposal.md) — завершено; 235 тестов прошли.
 
+Диагностика macOS и проверка реального popup: [`diagnose-macos-cell-menu`](openspec/changes/archive/2026-11-21-diagnose-macos-cell-menu/proposal.md) — завершено; нативная трасса подтвердила работающий popup, 243 теста прошли.
+
 ## Полировка таблицы по сценариям JetBrains
 
 [Сравнение, источники и намеренные отличия](GRID_POLISH.md). Этапы выполняются по порядку через OpenSpec и юнит-тесты.

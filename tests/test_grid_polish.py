@@ -320,3 +320,50 @@ def test_cell_menu_shortcut_does_not_capture_search_field(grid, monkeypatch):
     QTest.keyClick(grid.find_input, Qt.Key.Key_F10, Qt.KeyboardModifier.ShiftModifier)
     assert calls == []
     assert grid.history_pos == 0
+
+
+@pytest.mark.parametrize('pinned', [False, True])
+@pytest.mark.parametrize('editing', [False, True])
+def test_shift_f10_opens_real_popup_from_cell_or_editor(grid, monkeypatch, tmp_path,
+                                                       pinned, editing):
+    import json
+
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QLineEdit, QMenu
+
+    from csv_workbench.keyboard_trace import KeyboardTrace
+
+    app = QApplication.instance()
+    path = tmp_path / 'keyboard.jsonl'
+    trace = KeyboardTrace(app, path)
+    monkeypatch.setattr(app, 'keyboard_trace', trace, raising=False)
+    observations = []
+    if pinned:
+        grid.table.set_pins(('note',))
+    grid.table.setCurrentIndex(grid.model.index(2, 1))
+    target = grid.table
+    if editing:
+        grid.edit_current_cell()
+        target = next(w for w in grid.table.findChildren(QLineEdit) if w.isVisible())
+        target.setText('real popup edit')
+
+    def inspect_popup():
+        popup = app.activePopupWidget()
+        observations.append(isinstance(popup, QMenu) and popup.isVisible()
+                            and grid.edit_action in popup.actions())
+        if popup:
+            popup.close()
+
+    try:
+        QTimer.singleShot(0, inspect_popup)
+        QTest.keyClick(target, Qt.Key.Key_F10, Qt.KeyboardModifier.ShiftModifier)
+        assert observations == [True]
+        finish(grid)
+        assert grid.history_pos == int(editing)
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        stages = [row['event'] for row in events if row['event'].startswith('cell_menu_')]
+        assert stages == ['cell_menu_requested', 'cell_menu_target',
+                          'cell_menu_opening', 'cell_menu_closed']
+        assert next(row for row in events if row['event'] == 'cell_menu_target')['pinned'] == pinned
+    finally:
+        trace.close()
