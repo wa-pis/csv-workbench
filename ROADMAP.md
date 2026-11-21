@@ -45,7 +45,7 @@
 
 Исправление фокуса клавиатурного меню ячейки: [`fix-csv-cell-menu-focus`](openspec/changes/archive/2026-11-21-fix-csv-cell-menu-focus/proposal.md) — завершено; 235 тестов прошли.
 
-Диагностика macOS и проверка реального popup: [`diagnose-macos-cell-menu`](openspec/changes/archive/2026-11-21-diagnose-macos-cell-menu/proposal.md) — завершено; нативная трасса подтвердила работающий popup, 243 теста прошли.
+Диагностика macOS и проверка реального popup: [`diagnose-macos-cell-menu`](openspec/changes/archive/2026-11-21-diagnose-macos-cell-menu/proposal.md) — закрыт; 243 теста прошли. [Ручная приёмка Apple Silicon](openspec/changes/archive/2026-11-21-diagnose-macos-cell-menu/manual-validation.md) CI-сборки `3a52c0c` от 21 ноября 2026 года подтвердила все четыре случая на CSV с 5 млн строк: обычная и закреплённая ячейка, каждая до и во время редактирования. Реальный QMenu подтверждён журналом доставки Down/Enter и Escape.
 
 ## Полировка таблицы по сценариям JetBrains
 
