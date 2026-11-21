@@ -275,3 +275,48 @@ def test_inline_edit_in_filtered_sorted_view_has_one_undo(grid):
     grid.undo_action.trigger()
     finish(grid)
     assert grid.model.rows[0][0] == '0600'
+
+
+@pytest.mark.parametrize('pinned', [False, True])
+@pytest.mark.parametrize('key,modifiers', [(Qt.Key.Key_Menu, Qt.KeyboardModifier.NoModifier),
+                                         (Qt.Key.Key_F10, Qt.KeyboardModifier.ShiftModifier)])
+def test_context_menu_shortcut_from_inline_editor(grid, monkeypatch, pinned, key, modifiers):
+    from PySide6.QtWidgets import QLineEdit, QMenu
+
+    if pinned:
+        grid.table.set_pins(('note',))
+    grid.table.setCurrentIndex(grid.model.index(2, 1))
+    grid.edit_current_cell()
+    editor = next(w for w in grid.table.findChildren(QLineEdit) if w.isVisible())
+    editor.setText('edited before menu')
+    calls = []
+
+    class InspectMenu(QMenu):
+        def exec(self, point):
+            calls.append(grid.table.currentIndex().data())
+
+    monkeypatch.setattr('csv_workbench.ui.QMenu', InspectMenu)
+    QTest.keyClick(editor, key, modifiers)
+    assert calls == ['edited before menu']
+    finish(grid)
+    assert grid.history_pos == 1
+    grid.undo_action.trigger()
+    finish(grid)
+    assert grid.model.index(2, 1).data() == 'note2'
+
+
+def test_cell_menu_shortcut_does_not_capture_search_field(grid, monkeypatch):
+    from PySide6.QtWidgets import QMenu
+
+    calls = []
+
+    class InspectMenu(QMenu):
+        def exec(self, point):
+            calls.append(True)
+
+    monkeypatch.setattr('csv_workbench.ui.QMenu', InspectMenu)
+    grid.table.setCurrentIndex(grid.model.index(2, 1))
+    grid.open_find()
+    QTest.keyClick(grid.find_input, Qt.Key.Key_F10, Qt.KeyboardModifier.ShiftModifier)
+    assert calls == []
+    assert grid.history_pos == 0

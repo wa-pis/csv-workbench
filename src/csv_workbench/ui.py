@@ -743,7 +743,7 @@ class MainWindow(QMainWindow):
         self.table.addAction(self.edit_action)
         self.cell_menu_action = edit_menu.addAction('Cell Actions…', self.open_current_cell_menu)
         self.cell_menu_action.setShortcuts(['Menu', 'Shift+F10'])
-        self.cell_menu_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        self.cell_menu_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.table.addAction(self.cell_menu_action)
         self.table.navigationRequested.connect(self.navigate_table)
         self.table.selectionModel().currentChanged.connect(self.update_edit_actions)
