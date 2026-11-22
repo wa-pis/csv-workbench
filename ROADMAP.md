@@ -128,3 +128,6 @@
 Сохранение и восстановление вкладок: [`workspace-csv-sessions`](openspec/changes/archive/2026-11-16-workspace-csv-sessions/proposal.md) закрыт.
 
 Roadmap задаёт порядок и критерии готовности. Каждый этап начинается с предложения, сценариев, дизайна и списка задач в `openspec/changes/`. После реализации и проверки изменение архивируется, а согласованное поведение попадает в `openspec/specs/`.
+
+
+Исправление macOS Accessibility: [`fix-macos-table-accessibility`](openspec/changes/archive/2026-11-22-fix-macos-table-accessibility/proposal.md) выполнено. Upstream-дефект Qt воспроизведён до исправления; официальный Qt 6.12.1 закреплён для macOS. Нативная регрессия включена в автономную сборку; ручная проверка подсказок, правок, Undo и активной отмены на 20 млн строк прошла без падений. После выхода стабильного PySide6 6.12.1 заменить временный snapshot.

@@ -196,3 +196,42 @@ def test_queued_completion_can_be_cancelled_without_running(window):
         release.set()
         for future in blockers:
             future.result(timeout=5)
+
+
+@pytest.mark.parametrize('pinned', [False, True])
+@pytest.mark.parametrize('cancel_from', ['escape', 'button'])
+def test_active_search_cancellation_keeps_editor_and_rejects_late_result(
+        window, monkeypatch, pinned, cancel_from):
+    started, release = Event(), Event()
+
+    def delayed(*args, cancel, **kwargs):
+        started.set()
+        assert release.wait(5)
+        # Simulate a response which races with cancellation rather than cooperates.
+        return ['late-value'], False
+
+    monkeypatch.setattr('csv_workbench.ui.complete_values', delayed)
+    if pinned:
+        window.table.set_pins(('note',))
+    window.table.setCurrentIndex(window.model.index(0, 1))
+    window.edit_current_cell()
+    editor = window.completion_delegate.editor
+    editor.setText('value')
+    window.complete_action.trigger()
+    token, future = window.completion_job
+    try:
+        assert started.wait(5)
+        if cancel_from == 'escape':
+            QTest.keyClick(editor, Qt.Key.Key_Escape)
+        else:
+            window.cancel_button.click()
+        assert token.cancelled and window.completion_job is None
+        assert not window.completion_delegate.active
+        assert editor.text() == 'value' and not window.dirty
+    finally:
+        release.set()
+    future.result(timeout=5)
+    window.collect_reads()
+    QApplication.processEvents()
+    assert not editor.completer().popup().isVisible()
+    assert window.history_pos == 0

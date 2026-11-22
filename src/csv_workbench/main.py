@@ -14,6 +14,9 @@ from csv_workbench.ui import WorkspaceWindow
 def main() -> int:
     smoke = sys.argv[1:] == ["--smoke-test"]
     app = QApplication([sys.argv[0], "-platform", "offscreen"] if smoke else sys.argv)
+    if sys.argv[1:] == ["--accessibility-smoke-test"]:
+        from csv_workbench.accessibility_smoke import check_tables
+        return check_tables()
     app.setApplicationName("CSV Workbench")
     if path := os.environ.get("CSV_WORKBENCH_KEY_LOG"):
         try:

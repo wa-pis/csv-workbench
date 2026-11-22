@@ -34,6 +34,11 @@ def main():
         executable = executable.with_suffix(".exe")
     subprocess.run([str(executable.resolve()), "--smoke-test"], check=True, timeout=60)
 
+    if sys.platform == "darwin":
+        # Exercise the bundled Cocoa plugin; offscreen smoke tests cannot catch QTBUG-149612.
+        subprocess.run([str(executable.resolve()), "--accessibility-smoke-test"],
+                       check=True, timeout=60)
+
     archive = bundle.parent / f"{name}-{platform.system()}-{platform.machine()}.zip"
     if sys.platform == "darwin":
         subprocess.run(["ditto", "-c", "-k", "--keepParent", str(bundle), str(archive)], check=True)

@@ -12,7 +12,9 @@ dependencies = [
     "charset-normalizer>=3.4,<4",
     "duckdb>=1.1,<2",
     "polars>=1.42,<2",
-    "PySide6-Essentials>=6.7,<7",
+    "PySide6-Essentials>=6.7,<7; sys_platform != 'darwin'",
+    "PySide6-Essentials==6.12.0a1.dev1795190098; sys_platform == 'darwin'",
+    "shiboken6==6.12.0a1.dev1795190098; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
@@ -29,3 +31,9 @@ packages = ["src/csv_workbench"]
 
 [tool.ruff]
 line-length = 100
+
+# QTBUG-149612: stable Qt 6.12.0 deletes live table accessibility interfaces.
+# Replace this immutable official snapshot with stable PySide6 6.12.1 once released.
+[tool.uv.sources]
+PySide6-Essentials = { url = "https://download.qt.io/snapshots/ci/pyside/6.12/a97d38fe94be33d879e03f35321833a33a141061/pyside6/pyside6_essentials-6.12.0a1.dev1795190098-cp310-abi3-macosx_14_0_universal2.whl", marker = "sys_platform == 'darwin'" }
+shiboken6 = { url = "https://download.qt.io/snapshots/ci/pyside/6.12/a97d38fe94be33d879e03f35321833a33a141061/pyside6/shiboken6-6.12.0a1.dev1795190098-cp310-abi3-macosx_14_0_universal2.whl", marker = "sys_platform == 'darwin'" }
