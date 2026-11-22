@@ -3,7 +3,7 @@ from threading import Event
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt
-from PySide6.QtTest import QTest
+from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from csv_workbench.core import Selection
@@ -163,7 +163,8 @@ def test_debounce_restarts_search_and_closed_editor_cannot_receive_old_results(w
     old_request = (editor, editor.text(), window.completion_state(), window.completion_delegate.cell)
     editor.selectAll()
     QTest.keyClicks(editor, 'value06')
-    QTest.qWait(220)
+    assert window.completion_delegate.timer.isActive()
+    assert QSignalSpy(window.completion_delegate.timer.timeout).wait(5000)
     settle(window)
     assert editor.completer().popup().model().rowCount() == 1
     assert editor.completer().popup().model().index(0, 0).data() == 'value0600'
