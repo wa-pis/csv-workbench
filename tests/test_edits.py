@@ -23,7 +23,7 @@ def test_edit_survives_buffer_replacement_and_exports_all_rows(tmp_path):
     output = tmp_path / "copy.csv"
     assert export_edited_csv(source, output, model.edits, revision) == 203
     assert read_page(output, 0)[1][0] == ("000", 'Привет, "мир"\nстрока')
-    assert read_page(output, 200)[1] == [("200", None), ("201", None), ("202", None)]
+    assert read_page(output, 200)[1] == [("200", ""), ("201", None), ("202", "")]
     assert source.read_text(encoding="utf-8") == original
     with pytest.raises(ValueError, match="other than the source"):
         export_edited_csv(source, source, model.edits, revision)

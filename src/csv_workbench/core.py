@@ -67,7 +67,7 @@ class CsvFormat:
         quote = self.quote.replace("'", "''")
         return (
             f"read_csv(?, header = {str(self.header).lower()}, delim = '{delimiter}', "
-            f"quote = '{quote}', escape = '{quote}', all_varchar = true, hive_partitioning = false)"
+            f"quote = '{quote}', escape = '{quote}', all_varchar = true, allow_quoted_nulls = false, hive_partitioning = false)"
         )
 
 
@@ -139,6 +139,12 @@ class Selection:
 
     # View metadata must not switch the CSV query or paging path.
     pinned_columns: tuple[str, ...] = field(default=(), compare=False)
+
+    column_types: tuple[tuple[str, str, bool], ...] = field(default=(), compare=False)
+
+    def __post_init__(self):
+        from csv_workbench.validation import parse_rules
+        parse_rules(self.column_types)
 
     def ordered_columns(self, columns):
         if len(set(self.column_order)) != len(self.column_order):
@@ -501,7 +507,10 @@ def write_csv_rows(cursor, output, fmt, cancel, *, skip=0):
             cancel.check()
             for row in batch:
                 values = row[skip:]
-                writer.writerow(("",) if values == (None,) else values)
+                if values == (None,):
+                    handle.write("\r\n")
+                else:
+                    writer.writerow(values)
             count += len(batch)
     return count
 
@@ -815,7 +824,6 @@ def stage_selection(path, selection, distinct, directory, cancel, fmt=CsvFormat(
             quote_char=fmt.quote,
             infer_schema=False,
             n_threads=2,
-            null_values="",
         )
         if not fmt.header:
             digits = len(str(first_frame.width - 1))
@@ -866,7 +874,6 @@ def stage_selection(path, selection, distinct, directory, cancel, fmt=CsvFormat(
                     infer_schema=False,
                     n_threads=2,
                     new_columns=names,
-                    null_values="",
                     raise_if_empty=False,
                 ),
                 index,

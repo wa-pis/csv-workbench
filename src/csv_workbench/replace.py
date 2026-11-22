@@ -99,7 +99,7 @@ def preview_replacement(path, selection, edits, needle, replacement, *, first=Fa
                             occurrences += count
                             if after != before:
                                 output.write(json.dumps(
-                                    [row_id, columns.index(name), before, after or None],
+                                    [row_id, columns.index(name), before, after],
                                     ensure_ascii=False,
                                 ) + "\n")
                                 cells += 1

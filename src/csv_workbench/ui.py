@@ -116,10 +116,11 @@ from csv_workbench.session import (
     save_workspace_session,
 )
 from csv_workbench.text_formats import clipboard_text
+from csv_workbench.validation import TYPES, cell_error, parse_rules, validate_csv_values
 
 ROOT_INDEX = QModelIndex()
 BUFFER_ROWS = PAGE_SIZE * 3
-JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job", "compare_job", "completion_job")
+JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job", "compare_job", "completion_job", "validation_job")
 FIND_COLORS = {
     Qt.ItemDataRole.BackgroundRole: QBrush(QColor("#ffe38a")),
     Qt.ItemDataRole.ForegroundRole: QBrush(QColor("#242424")),
@@ -141,6 +142,7 @@ class PageModel(QAbstractTableModel):
         self.row_ids = []
         self.source_columns = []
         self.find_text = ""
+        self.column_types = {}
 
     def replace(self, headers: list[str], rows: list[tuple], offset: int = 0, row_ids=()) -> None:
         self.beginResetModel()
@@ -178,6 +180,16 @@ class PageModel(QAbstractTableModel):
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
+        if role in (Qt.ItemDataRole.BackgroundRole, Qt.ItemDataRole.ForegroundRole,
+                    Qt.ItemDataRole.ToolTipRole):
+            value = self.cell_value(index)
+            rule = self.column_types.get(self.headers[index.column()], ('text', True))
+            error = cell_error(value, *rule)
+            if role == Qt.ItemDataRole.ToolTipRole:
+                label = 'NULL (missing value)' if value is None else ('Empty string ("")' if value == '' else str(value))
+                return f'{label}\n{error}' if error else label
+            if error:
+                return QBrush(QColor('#ffd7d7' if role == Qt.ItemDataRole.BackgroundRole else '#8b0000'))
         highlight = self.find_text and role in FIND_COLORS
         if not highlight and role not in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             return None
@@ -186,7 +198,7 @@ class PageModel(QAbstractTableModel):
             return FIND_COLORS[role] if value is not None and self.find_text in search_lower(str(value)) else None
         if role == Qt.ItemDataRole.EditRole:
             return "" if value is None else str(value)
-        return "NULL" if value is None else str(value)
+        return "NULL" if value is None else ('""' if value == "" else str(value))
 
     def cell_value(self, index):
         return self.edits.get(self.cell_key(index), self.rows[index.row()][index.column()])
@@ -198,10 +210,10 @@ class PageModel(QAbstractTableModel):
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
         if not self.editable or not index.isValid() or role != Qt.ItemDataRole.EditRole:
             return False
-        if value != self.data(index, role):
+        if value != self.cell_value(index):
             key = self.cell_key(index)
             before = self.edits.get(key, self.rows[index.row()][index.column()])
-            after = value or None
+            after = value
             try:
                 self.edits[key] = after
             except OSError as exc:
@@ -574,6 +586,10 @@ class MainWindow(QMainWindow):
         self.compare_job = None
         self.completion_job = None
         self.completion_request = None
+        self.validation_job = None
+        self.validation_request = None
+        self.validation_result = None
+        self.validation_note = ''
         self.sql_text = "SELECT * FROM csv_data"
         self.poll = QTimer(self, interval=30)
         self.poll.timeout.connect(self.collect_reads)
@@ -653,6 +669,8 @@ class MainWindow(QMainWindow):
         self.value_action.setEnabled(False)
         self.columns_action = edit_menu.addAction("Manage Columns…", self.manage_columns)
         self.columns_action.setEnabled(False)
+        self.column_types_action = edit_menu.addAction('Column Types / Validation…', self.configure_column_types)
+        self.validate_action = edit_menu.addAction('Validate Current Selection', self.start_validation)
         for action in (self.save_action, self.save_as_action, self.undo_action, self.redo_action):
             action.setEnabled(False)
         self.copy_action = edit_menu.addAction("Copy range", self.copy_range)
@@ -664,6 +682,8 @@ class MainWindow(QMainWindow):
         self.paste_action.setShortcut(QKeySequence.StandardKey.Paste)
         self.clear_action = edit_menu.addAction("Clear cells", self.clear_cells)
         self.clear_action.setShortcut(QKeySequence.StandardKey.Delete)
+        self.null_action = edit_menu.addAction('Set NULL', self.clear_cells)
+        self.empty_action = edit_menu.addAction('Set Empty String', self.set_empty_cells)
         self.add_row_action = edit_menu.addAction("Add row", lambda: self.add_rows())
         self.clone_action = edit_menu.addAction("Duplicate rows", lambda: self.add_rows(clone=True))
         self.delete_action = edit_menu.addAction("Delete rows", self.delete_rows)
@@ -899,6 +919,7 @@ class MainWindow(QMainWindow):
         menu.addMenu(self.copy_as_menu)
         menu.addAction(self.paste_action)
         menu.addAction(self.clear_action)
+        menu.addAction(self.empty_action)
         menu.addSeparator()
         for action in (self.add_row_action, self.clone_action, self.delete_action):
             menu.addAction(action)
@@ -948,6 +969,7 @@ class MainWindow(QMainWindow):
         hide = menu.addAction("Hide Column")
         hide.setEnabled(section >= 0 and self.model.columnCount() > 1)
         menu.addAction(self.columns_action)
+        menu.addAction(self.column_types_action)
         action = menu.exec(header.viewport().mapToGlobal(point))
         if pin is not None and action == pin:
             pins = self.selection.pinned_columns
@@ -1609,6 +1631,103 @@ class MainWindow(QMainWindow):
         layout.addWidget(buttons)
         dialog.exec()
 
+    def validation_state(self):
+        return (self.path, self.revision, self.selection, self.selection.column_types,
+                self.history_pos)
+
+    def invalidate_validation(self):
+        if self.validation_job is not None:
+            token, future = self.validation_job
+            token.cancel()
+            future.cancel()
+            self.validation_job = None
+        self.validation_request = None
+        self.validation_result = None
+        self.validation_note = ''
+
+    def set_column_types(self, rules):
+        rules = parse_rules(rules)
+        if missing := {name for name, _, _ in rules}.difference(self.source_headers):
+            raise ValueError(f'Unknown validation column: {min(missing)}')
+        self.invalidate_validation()
+        self.selection = replace(self.selection, column_types=rules)
+        self.model.column_types = {name: (kind, nullable) for name, kind, nullable in rules}
+        if self.model.rowCount() and self.model.columnCount():
+            self.model.dataChanged.emit(self.model.index(0, 0),
+                                        self.model.index(self.model.rowCount() - 1,
+                                                         self.model.columnCount() - 1))
+        self.checkpoint_recovery()
+        self.update_status()
+
+    def configure_column_types(self):
+        if self.path is None or self.distinct is not None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Column Types / Validation')
+        dialog.resize(620, 420)
+        layout = QVBoxLayout(dialog)
+        notice = QLabel('Rules check values without converting them. Date: YYYY-MM-DD; '
+                        'boolean: true/false. Empty text differs from NULL.\n'
+                        'Validation includes configured hidden columns in the current selection.')
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        fields = QTableWidget(len(self.source_headers), 3)
+        fields.setHorizontalHeaderLabels(['Column', 'Type', 'Allow NULL'])
+        fields.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        fields.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(fields)
+        rules = {name: (kind, nullable) for name, kind, nullable in self.selection.column_types}
+        controls = []
+        for row, name in enumerate(self.source_headers):
+            kind, nullable = rules.get(name, ('text', True))
+            fields.setItem(row, 0, QTableWidgetItem(name))
+            types = QComboBox()
+            types.addItems(TYPES)
+            types.setCurrentText(kind)
+            allowed = QCheckBox()
+            allowed.setChecked(nullable)
+            fields.setCellWidget(row, 1, types)
+            fields.setCellWidget(row, 2, allowed)
+            controls.append((name, types, allowed))
+        if self.validation_result is not None:
+            summary = ', '.join(f'{name}: {count:,}' for name, count in self.validation_result.errors)
+            label = QLabel(f'Last check: {self.validation_result.rows:,} rows. Errors: {summary}')
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            layout.addWidget(label)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec():
+            self.set_column_types(tuple((name, types.currentText(), allowed.isChecked())
+                                        for name, types, allowed in controls
+                                        if types.currentText() != 'text' or not allowed.isChecked()))
+
+    def start_validation(self):
+        if (self.path is None or self.distinct is not None or self.view_job is not None
+                or self.save_job is not None or not self.selection.column_types):
+            return
+        self.invalidate_validation()
+        state = self.validation_state()
+        path, revision, selection, _, _ = state
+        snapshot, fmt, edits = self.source_snapshot, self.csv_format, self.model.edits.copy()
+        self.validation_request = state
+
+        def validate(*, cancel):
+            if file_revision(path) != revision:
+                raise ValueError('The source CSV changed. Reopen it before validation.')
+            result = validate_csv_values(Path(snapshot.name) / 'source.csv' if snapshot else path,
+                                         selection, edits, cancel=cancel, fmt=fmt)
+            if file_revision(path) != revision:
+                raise ValueError('The source CSV changed. Reopen it before validation.')
+            return result
+
+        self.validation_job = self.submit(validate)
+        self.poll.start()
+        self.update_status()
+
     def complete_current_value(self):
         if not self.model.editable:
             return
@@ -1803,7 +1922,6 @@ class MainWindow(QMainWindow):
         self.edit_batch(
             {
                 self.model.cell_key(self.model.index(anchor.row() + r, anchor.column() + c)): value
-                or None
                 for r, row in enumerate(rows)
                 for c, value in enumerate(row)
             }
@@ -1813,6 +1931,9 @@ class MainWindow(QMainWindow):
         self.edit_batch(
             {self.model.cell_key(index): None for index in self.table.selectedIndexes()}
         )
+
+    def set_empty_cells(self):
+        self.edit_batch({self.model.cell_key(index): '' for index in self.table.selectedIndexes()})
 
     def selected_rows(self):
         return sorted({index.row() for index in self.table.selectedIndexes()})
@@ -1829,7 +1950,7 @@ class MainWindow(QMainWindow):
             for col in range(len(self.source_headers)):
                 index = self.model.index(row, col) if row is not None else None
                 values[self.next_row_id, col] = (
-                    self.model.data(index, Qt.ItemDataRole.EditRole) or None
+                    self.model.cell_value(index)
                     if index is not None
                     else None
                 )
@@ -2267,12 +2388,14 @@ class MainWindow(QMainWindow):
                 column_order=current.column_order,
                 exact_filters=tuple(exact_rules),
                 pinned_columns=current.pinned_columns,
+                column_types=current.column_types,
             )
             self.load_view(self.path, selection)
             dialog.accept()
 
         def reset():
-            self.load_view(self.path, Selection(pinned_columns=current.pinned_columns))
+            self.load_view(self.path, Selection(pinned_columns=current.pinned_columns,
+                                                column_types=current.column_types))
             dialog.accept()
 
         buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(apply)
@@ -2306,6 +2429,7 @@ class MainWindow(QMainWindow):
             )
 
     def refresh_after_edit(self, history):
+        self.invalidate_validation()
         self.reset_find()
         self.pending_history = history
         if self.selection != Selection() or self.identified or self.structural(self.model.edits):
@@ -2348,6 +2472,7 @@ class MainWindow(QMainWindow):
         ):
             return
 
+        self.invalidate_validation()
         self.reset_find()
         self.keyboard_target = None
         self.recovery_request = recovery
@@ -2488,6 +2613,8 @@ class MainWindow(QMainWindow):
         self.commit_history()
         self.checkpoint_recovery()
         self.applied_edits = self.model.edits.copy()
+        self.model.column_types = ({name: (kind, nullable) for name, kind, nullable
+                                    in selection.column_types} if distinct is None else {})
         self.model.source_columns = self.source_headers
         self.result, self.distinct = result, distinct
         self.has_more = False
@@ -2969,6 +3096,10 @@ class MainWindow(QMainWindow):
                     self.flush_keyboard_navigation()
                 elif name == "completion_job":
                     self.apply_completion(result)
+                elif name == "validation_job":
+                    if self.validation_request == self.validation_state():
+                        self.validation_result = result
+                    self.validation_request = None
                 elif name == "find_job":
                     self.apply_find(result)
                 elif name == "text_job":
@@ -2995,6 +3126,9 @@ class MainWindow(QMainWindow):
                 else:
                     QMessageBox.information(self, "Export CSV", f"Exported {result:,} rows.")
             except CancelledError:
+                if name == 'validation_job':
+                    self.validation_request = None
+                    self.validation_note = 'Validation cancelled'
                 if restoring:
                     self.workspace.finish_restore("The workspace restore was cancelled.")
                     return
@@ -3049,7 +3183,7 @@ class MainWindow(QMainWindow):
         for action in (self.edit_action, self.complete_action, self.value_action, self.paste_action):
             action.setEnabled(self.model.editable and current)
         selected = self.table.selectionModel().hasSelection()
-        for action in (self.clear_action, self.clone_action, self.delete_action):
+        for action in (self.clear_action, self.null_action, self.empty_action, self.clone_action, self.delete_action):
             action.setEnabled(self.model.editable and selected)
         self.add_row_action.setEnabled(self.model.editable)
 
@@ -3075,6 +3209,9 @@ class MainWindow(QMainWindow):
         self.compare_action.setEnabled(available and self.compare_job is None and self.distinct is None)
         can_manage_columns = available and self.distinct is None
         self.columns_action.setEnabled(can_manage_columns)
+        self.column_types_action.setEnabled(can_manage_columns)
+        self.validate_action.setEnabled(can_manage_columns and self.validation_job is None
+                                        and bool(self.selection.column_types))
         self.table.horizontalHeader().setSectionsMovable(can_manage_columns)
         can_find = (
             available and not self.find_bar.isHidden() and bool(self.model.rowCount())
@@ -3134,6 +3271,7 @@ class MainWindow(QMainWindow):
                 (self.page_job, "Loading more"),
                 (self.find_job, "Searching"),
                 (self.completion_job, "Completing values"),
+                (self.validation_job, "Validating selection"),
                 (self.view_job, "Reading CSV"),
                 (self.count_job, "Counting rows"),
                 (self.export_job, "Exporting CSV"),
@@ -3146,8 +3284,16 @@ class MainWindow(QMainWindow):
             progress += " • Cancelling…"
         if self.distinct is not None:
             progress += f" • Unique: {self.distinct}"
+        if self.validation_note:
+            progress += f' • {self.validation_note}'
+        if self.validation_result is not None:
+            progress += (f' • Validation: {self.validation_result.cells:,} errors'
+                         f' / {self.validation_result.rows:,} rows')
         if self.dirty:
             progress += " • Unsaved edits"
+        self.status.setToolTip(', '.join(f'{name}: {count:,} errors'
+                                        for name, count in self.validation_result.errors)
+                               if self.validation_result is not None else '')
         self.status.setText(
             f"File: {self.file_size:,} bytes • Total rows: {total if total is not None else 'counting…'}"
             f" • Buffered: {len(self.model.rows):,}{progress}"

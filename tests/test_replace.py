@@ -58,7 +58,7 @@ def test_null_empty_output_noop_and_manual_encoding(tmp_path):
     fmt = CsvFormat(";", encoding="cp1251")
     plan = preview_replacement(source, Selection(), {}, "привет", "", fmt=fmt)
     try:
-        assert list(plan.iter_changes(cancel=Cancellation())) == [((1, 1), "Привет", None)]
+        assert list(plan.iter_changes(cancel=Cancellation())) == [((1, 1), "Привет", "")]
     finally:
         plan.scratch.cleanup()
     plan = preview_replacement(source, Selection(), {}, "Привет", "Привет", fmt=fmt)

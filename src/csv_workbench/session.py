@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from csv_workbench.core import CsvFormat, Selection
+from csv_workbench.validation import parse_rules
 
 
 def session_tab(source, selection, fmt):
@@ -155,6 +156,7 @@ def parse_session_tab(data):
             tuple(column_order),
             tuple(tuple(rule) for rule in exact_filters),
             tuple(pinned),
+            parse_rules(selection.get("column_types", [])),
         ),
         fmt,
     )
