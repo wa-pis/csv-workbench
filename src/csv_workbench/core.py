@@ -82,13 +82,42 @@ def read_format_sample(path, encoding=None):
     return sample[: 128 * 1024], len(sample) > 128 * 1024
 
 
-def format_records(sample, delimiter, limit=11, *, quote='"'):
+def preview_nulls(row, raw, delimiter, quote):
+    # Python 3.12's CSV reader collapses quoted and unquoted empty fields.
+    start = pos = column = 0
+    quoted = False
+    while pos < len(raw):
+        char = raw[pos]
+        if char == quote and (quoted or pos == start):
+            if quoted and pos + 1 < len(raw) and raw[pos + 1] == quote:
+                pos += 2
+                continue
+            quoted = not quoted
+        elif char == delimiter and not quoted:
+            if pos == start:
+                row[column] = None
+            column += 1
+            start = pos + 1
+        pos += 1
+    if start == len(raw):
+        row[column] = None
+    return row
+
+
+def format_records(sample, delimiter, limit=11, *, quote='"', nullable=False):
     text, truncated = sample
     reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, quotechar=quote, strict=True)
     rows = []
+    lines = list(io.StringIO(text, newline="")) if nullable else []
+    previous_line = 0
     try:
         for row in reader:
-            if row:
+            if nullable:
+                raw = "".join(lines[previous_line:reader.line_num]).rstrip("\r\n")
+                previous_line = reader.line_num
+                if row:
+                    row = preview_nulls(row, raw, delimiter, quote)
+            if row or nullable:
                 rows.append(row)
             if len(rows) == limit:
                 break
@@ -116,11 +145,17 @@ def detect_delimiter(sample, fallback=",", *, quote='"'):
 
 
 def preview_format(sample, fmt):
-    rows = format_records(sample, fmt.delimiter, limit=10 + fmt.header, quote=fmt.quote)
+    rows = format_records(sample, fmt.delimiter, limit=10 + fmt.header,
+                          quote=fmt.quote, nullable=True)
     if not rows:
         return [], []
+    width = max(map(len, rows))
+    if width > 1:
+        rows = [row for row in rows if row]
+    else:
+        rows = [row or [None] for row in rows]
     if fmt.header:
-        return rows[0], rows[1:]
+        return [value if value is not None else "" for value in rows[0]], rows[1:]
     width = max(map(len, rows))
     digits = len(str(width - 1))
     return [f"column{i:0{digits}d}" for i in range(width)], rows

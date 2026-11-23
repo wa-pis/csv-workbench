@@ -1373,7 +1373,7 @@ class MainWindow(QMainWindow):
                 open_button.setEnabled(True)
                 width = max([len(headers), *(len(row) for row in rows)])
                 headers += [""] * (width - len(headers))
-                model.replace(headers, [tuple(row + [""] * (width - len(row))) for row in rows])
+                model.replace(headers, [tuple(row + [None] * (width - len(row))) for row in rows])
                 status.setText(
                     "Preview: up to 10 records"
                     if headers

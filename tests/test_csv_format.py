@@ -124,3 +124,42 @@ def test_manual_encoding_and_quote_apply_to_full_file(tmp_path):
 def test_invalid_quote(quote):
     with pytest.raises(ValueError, match="quote"):
         CsvFormat(quote=quote)
+
+
+@pytest.mark.parametrize('delimiter,quote', [(',', '"'), (';', "'"), ('\t', '"'), ('|', '"')])
+@pytest.mark.parametrize('header', [False, True])
+def test_preview_distinguishes_null_empty_and_quoted_syntax(tmp_path, delimiter, quote, header):
+    import csv
+    import io
+
+    output = io.StringIO(newline='')
+    writer = csv.writer(output, delimiter=delimiter, quotechar=quote, quoting=csv.QUOTE_NOTNULL)
+    if header:
+        writer.writerow(['id', 'missing', 'empty', 'text'])
+    writer.writerows([('0', None, '', f'a{delimiter}b\r\n{quote}quoted{quote}'),
+                      ('1', '', None, 'NULL')])
+    path = tmp_path / 'sample.csv'
+    path.write_bytes(output.getvalue().encode('utf-16'))
+    fmt = CsvFormat(delimiter, header, 'utf-16', quote)
+    before = path.read_bytes()
+    columns, rows = preview_format(read_format_sample(path, fmt.encoding), fmt)
+    assert columns == (['id', 'missing', 'empty', 'text'] if header else
+                       ['column0', 'column1', 'column2', 'column3'])
+    assert rows == [['0', None, '', f'a{delimiter}b\r\n{quote}quoted{quote}'],
+                    ['1', '', None, 'NULL']]
+    assert rows == [list(row) for row in read_page(path, 0, fmt=fmt)[1]]
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('header', [False, True])
+def test_single_column_preview_keeps_null_physical_record(header):
+    sample = (('v\n' if header else '') + '\n""\nNULL\n', False)
+    assert preview_format(sample, CsvFormat(header=header)) == (
+        ['v'] if header else ['column0'], [[None], [''], ['NULL']])
+
+
+def test_nullable_preview_truncated_multiline_and_literal_quotes():
+    sample = ('a,b,c\r\n,"","line\r\nwith ""quote"""\r\nx"y,,\r\n9,"unfinished', True)
+    assert preview_format(sample, CsvFormat()) == (
+        ['a', 'b', 'c'], [[None, '', 'line\r\nwith "quote"'], ['x"y', None, None]])
+    assert preview_format(('a,b\n\n1,\n', False), CsvFormat())[1] == [['1', None]]

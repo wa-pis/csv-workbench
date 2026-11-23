@@ -1653,3 +1653,36 @@ def test_disk_replacement_save_then_undo_restores_original_base(tmp_path, monkey
         window.deleteLater()
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_format_preview_null_empty_updates_with_quote_setting(tmp_path, monkeypatch, preset_settings):
+    from PySide6.QtWidgets import QDialog, QLineEdit, QTableView
+
+    app = QApplication.instance() or QApplication(['preview-null-test', '-platform', 'offscreen'])
+    source = tmp_path / 'preview.csv'
+    source.write_text('id,note\n0,\n1,""\n2,\'\'\n')
+    window = MainWindow()
+
+    def inspect(dialog):
+        model = dialog.findChild(QTableView).model()
+        assert model.rows == [('0', None), ('1', ''), ('2', "''")]
+        assert model.index(0, 1).data() == 'NULL'
+        assert model.index(1, 1).data() == '""'
+        assert 'missing' in model.index(0, 1).data(Qt.ItemDataRole.ToolTipRole)
+        assert 'Empty string' in model.index(1, 1).data(Qt.ItemDataRole.ToolTipRole)
+        quote = dialog.findChildren(QLineEdit)[1]
+        quote.setText("'")
+        assert model.rows == [('0', None), ('1', '""'), ('2', '')]
+        assert model.index(0, 1).data() == 'NULL'
+        assert model.index(2, 1).data() == '""'
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(QDialog, 'exec', inspect)
+    try:
+        assert window.configure_format(source) is None
+    finally:
+        window.close()
+        window.executor.shutdown(wait=True)
+        window.deleteLater()
+        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
