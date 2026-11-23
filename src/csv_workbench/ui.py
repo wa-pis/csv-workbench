@@ -62,6 +62,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from csv_workbench.aggregate import aggregate_selection
 from csv_workbench.compare import compare_csv
 from csv_workbench.completion import complete_values
 from csv_workbench.completion_ui import CompletionDelegate
@@ -120,7 +121,7 @@ from csv_workbench.validation import TYPES, cell_error, parse_rules, validate_cs
 
 ROOT_INDEX = QModelIndex()
 BUFFER_ROWS = PAGE_SIZE * 3
-JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job", "compare_job", "completion_job", "validation_job")
+JOB_NAMES = ("view_job", "count_job", "page_job", "find_job", "export_job", "query_job", "save_job", "text_job", "compare_job", "completion_job", "validation_job", "aggregate_job")
 FIND_COLORS = {
     Qt.ItemDataRole.BackgroundRole: QBrush(QColor("#ffe38a")),
     Qt.ItemDataRole.ForegroundRole: QBrush(QColor("#242424")),
@@ -586,6 +587,8 @@ class MainWindow(QMainWindow):
         self.compare_job = None
         self.completion_job = None
         self.completion_request = None
+        self.aggregate_job = None
+        self.aggregate_result = None
         self.validation_job = None
         self.validation_request = None
         self.validation_result = None
@@ -787,7 +790,12 @@ class MainWindow(QMainWindow):
         self.table.addAction(self.cell_menu_action)
         self.table.navigationRequested.connect(self.navigate_table)
         self.table.selectionModel().currentChanged.connect(self.update_edit_actions)
+        self.table.selectionModel().selectionChanged.connect(self.invalidate_aggregate)
         self.table.selectionModel().selectionChanged.connect(self.update_edit_actions)
+        for signal in (self.model.modelAboutToBeReset, self.model.rowsAboutToBeInserted,
+                       self.model.rowsAboutToBeRemoved, self.model.dataChanged):
+            signal.connect(self.invalidate_aggregate)
+        self.aggregate_action = edit_menu.addAction('Aggregate Selection (buffered)', self.start_aggregate)
         edit_menu.addSeparator()
         self.selection_actions = []
         for label, callback in (
@@ -838,6 +846,13 @@ class MainWindow(QMainWindow):
         text_layout.addWidget(self.source_text)
         self.views.addWidget(text_panel)
         layout.addWidget(self.views, 1)
+        self.aggregate_label = QLabel()
+        self.aggregate_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.aggregate_label.setWordWrap(True)
+        self.aggregate_label.setToolTip('Selected buffered cells only. Numeric sum/average use '
+                                       '38 significant decimal digits; text is skipped.')
+        self.aggregate_label.hide()
+        layout.addWidget(self.aggregate_label)
 
         self.table.verticalScrollBar().valueChanged.connect(self.load_at_edge)
         for key, standard, last in (
@@ -918,6 +933,7 @@ class MainWindow(QMainWindow):
         menu.addAction(self.copy_action)
         menu.addMenu(self.copy_as_menu)
         menu.addAction(self.paste_action)
+        menu.addAction(self.aggregate_action)
         menu.addAction(self.clear_action)
         menu.addAction(self.empty_action)
         menu.addSeparator()
@@ -1630,6 +1646,44 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         dialog.exec()
+
+    def invalidate_aggregate(self, *_):
+        if self.aggregate_job is not None:
+            token, future = self.aggregate_job
+            token.cancel()
+            future.cancel()
+            self.aggregate_job = None
+        self.aggregate_result = None
+        if hasattr(self, 'aggregate_label'):
+            self.aggregate_label.clear()
+            self.aggregate_label.hide()
+
+    def start_aggregate(self):
+        if not self.aggregate_action.isEnabled():
+            return
+        self.invalidate_aggregate()
+        ranges = tuple((r.top(), r.left(), r.bottom(), r.right())
+                       for r in self.table.selectionModel().selection())
+        rows, ids = tuple(self.model.rows), tuple(self.model.row_ids)
+        columns = tuple(self.model.source_columns.index(name) for name in self.model.headers) if ids else ()
+        self.aggregate_job = self.submit(aggregate_selection, rows, ranges, self.model.edits.copy(),
+                                         offset=self.model.offset, row_ids=ids, columns=columns)
+        self.aggregate_label.setText('Aggregating selected buffered cells…')
+        self.aggregate_label.show()
+        self.poll.start()
+        self.update_status()
+
+    def apply_aggregate(self, result):
+        self.aggregate_result = result
+        def display(value):
+            return '—' if value is None else str(value)
+        self.aggregate_label.setText(
+            f'Buffered selection: Count {result.count:,} • NULL {result.nulls:,}'
+            f' • Empty {result.empty:,} • Numeric {result.numeric:,} • Skipped text {result.skipped:,}'
+            f' • Sum {display(result.total)} • Average {display(result.average)}'
+            f' • Numeric min {display(result.minimum)} • Numeric max {display(result.maximum)}'
+        )
+        self.aggregate_label.show()
 
     def validation_state(self):
         return (self.path, self.revision, self.selection, self.selection.column_types,
@@ -2429,6 +2483,7 @@ class MainWindow(QMainWindow):
             )
 
     def refresh_after_edit(self, history):
+        self.invalidate_aggregate()
         self.invalidate_validation()
         self.reset_find()
         self.pending_history = history
@@ -2472,6 +2527,7 @@ class MainWindow(QMainWindow):
         ):
             return
 
+        self.invalidate_aggregate()
         self.invalidate_validation()
         self.reset_find()
         self.keyboard_target = None
@@ -3096,6 +3152,8 @@ class MainWindow(QMainWindow):
                     self.flush_keyboard_navigation()
                 elif name == "completion_job":
                     self.apply_completion(result)
+                elif name == "aggregate_job":
+                    self.apply_aggregate(result)
                 elif name == "validation_job":
                     if self.validation_request == self.validation_state():
                         self.validation_result = result
@@ -3126,6 +3184,8 @@ class MainWindow(QMainWindow):
                 else:
                     QMessageBox.information(self, "Export CSV", f"Exported {result:,} rows.")
             except CancelledError:
+                if name == 'aggregate_job':
+                    self.aggregate_label.setText('Selection aggregation cancelled')
                 if name == 'validation_job':
                     self.validation_request = None
                     self.validation_note = 'Validation cancelled'
@@ -3141,6 +3201,8 @@ class MainWindow(QMainWindow):
                 if name == "page_job" and self.page_target_column is not None:
                     self.find_match = None
             except (duckdb.Error, OSError, ValueError) as exc:
+                if name == 'aggregate_job':
+                    self.aggregate_label.setText('Selection aggregation failed')
                 if restoring:
                     self.workspace.finish_restore(f"{self.view_request[0]}: {exc}")
                     return
@@ -3170,6 +3232,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'selection_status'):
             cells, rows, columns = self.table.selection_summary()
             self.selection_status.setText(f'Selection: {cells:,} cells; {rows:,} rows; {columns:,} columns (buffered)')
+        self.aggregate_action.setEnabled(
+            self.path is not None and self.distinct is None and self.view_job is None
+            and self.page_job is None and self.save_job is None
+            and self.table.selectionModel().hasSelection()
+        )
         self.copy_action.setEnabled(self.path is not None)
         self.copy_as_menu.setEnabled(self.path is not None)
         self.transpose_action.setEnabled(
@@ -3272,6 +3339,7 @@ class MainWindow(QMainWindow):
                 (self.find_job, "Searching"),
                 (self.completion_job, "Completing values"),
                 (self.validation_job, "Validating selection"),
+                (self.aggregate_job, "Aggregating selection"),
                 (self.view_job, "Reading CSV"),
                 (self.count_job, "Counting rows"),
                 (self.export_job, "Exporting CSV"),
