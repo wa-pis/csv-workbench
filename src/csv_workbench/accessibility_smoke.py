@@ -1,11 +1,14 @@
 """Native Cocoa regression probe for QTBUG-149612, run in an isolated process."""
 
 import ctypes
+import json
+from time import monotonic
 
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtGui import QAccessible
-from PySide6.QtWidgets import QApplication, QTableView
+from PySide6.QtWidgets import QApplication, QLineEdit, QTableView
 
+from csv_workbench.accessibility import MAX_CELLS
 from csv_workbench.ui import CsvTable, PageModel
 
 
@@ -41,17 +44,15 @@ def check_tables():
     for pinned in (False, True):
         model = PageModel()
         model.replace(['a', 'b'], [('one', 'two')] * 4)
-        table = CsvTable(model)
-        table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        table.show()
+        views = [QTableView() for _ in range(2 if pinned else 1)]
+        for view in views:
+            view.setModel(model)
+            view.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+            view.show()
         app.processEvents()
-        views = (table, table.pinned) if pinned else (table,)
-        if pinned:
-            table.set_pins(('a',))
         ids = [QAccessible.uniqueId(QAccessible.queryAccessibleInterface(view)) for view in views]
         for count in (2, 3, 2) * 5:
             model.replace(['a', 'b', 'c'][:count], [tuple('abc'[:count])] * 4)
-            table.set_pins(('a',) if pinned else ())
             app.processEvents()
             for view, ident in zip(views, ids, strict=True):
                 native = tables(int(view.winId()))
@@ -61,14 +62,68 @@ def check_tables():
                     for row in children(element, 'accessibilityRows'):
                         children(row, 'accessibilityChildren')
                     for row in range(4):
-                        table.selectRow(row)
+                        view.selectRow(row)
                         app.processEvents()
                         selected = children(element, 'accessibilitySelectedChildren')
                         assert QAccessible.accessibleInterface(ident) is not None, (
                             'QTBUG-149612: parent table interface deleted')
                         assert selected, 'native selected cells missing'
-        table.close()
-        table.deleteLater()
+        for view in views:
+            view.close()
+            view.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         app.processEvents()
+    # Reproduce the actual wide, fully selected hierarchy through Cocoa. Python-only
+    # childCount checks cannot detect native synthetic-table expansion.
+    model = PageModel()
+    model.editable = True
+    model.replace([f'n{i}' for i in range(2000)], [('1',) * 2000] * 200)
+    table = CsvTable(model)
+    table.resize(900, 500)
+    table.set_pins(('n0',))
+    table.show()
+    table.selectAll()
+    app.processEvents()
+
+    def walk(obj, depth=0, roles=None):
+        assert depth < 20, 'accessible hierarchy cycle'
+        if roles is not None:
+            role = send(obj, 'accessibilityRole')
+            roles.append(send(role, 'UTF8String', ctypes.c_char_p) if role else None)
+        return 1 + sum(walk(child, depth + 1, roles)
+                       for child in children(obj, 'accessibilityChildren'))
+
+    counts = []
+    started = monotonic()
+    for position in (0, 90000, 180000, 0):
+        table.horizontalScrollBar().setValue(position)
+        model.setData(model.index(0, 0), 'edited')
+        app.processEvents()
+        counts.append(walk(int(table.winId())))
+        assert 10 < counts[-1] < MAX_CELLS * 4, 'unbounded or missing native hierarchy'
+        for view in (table, table.pinned):
+            iface = QAccessible.queryAccessibleInterface(view)
+            assert iface.role() == QAccessible.Role.Grouping
+            assert iface.childCount() <= MAX_CELLS + 5
+        table.setCurrentIndex(model.index(0, 0))
+        table.edit(model.index(0, 0))
+        app.processEvents()
+        assert any(editor.isVisible() for editor in table.findChildren(QLineEdit))
+        roles = []
+        assert walk(int(table.winId()), roles=roles) < MAX_CELLS * 4
+        assert b'AXTextField' in roles, 'native cell editor missing'
+        table.closePersistentEditor(model.index(0, 0))
+        table.setFocus()
+    elapsed = monotonic() - started
+    assert elapsed < 10, 'native viewport traversal blocked UI'
+    print(json.dumps({'wide_cocoa_seconds': elapsed, 'native_node_counts': counts}))
+    model.edits.clear()
+    model.replace(['a', 'b'], [('new', 'value')])
+    app.processEvents()
+    assert walk(int(table.winId())) < MAX_CELLS * 4
+    assert model.data(model.index(0, 0), Qt.ItemDataRole.DisplayRole) == 'new'
+    table.close()
+    table.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
     return 0

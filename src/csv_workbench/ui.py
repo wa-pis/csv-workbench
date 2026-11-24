@@ -62,6 +62,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from csv_workbench.accessibility import AccessibleTableView
 from csv_workbench.aggregate import aggregate_selection
 from csv_workbench.compare import compare_csv
 from csv_workbench.completion import complete_values
@@ -325,13 +326,13 @@ class CsvHeader(QHeaderView):
             self.filterRequested.emit(section)
 
 
-class CsvTable(QTableView):
+class CsvTable(AccessibleTableView):
     navigationRequested = Signal(object, int)
 
     def __init__(self, model):
         super().__init__()
         self.setModel(model)
-        self.pinned = QTableView(self)
+        self.pinned = AccessibleTableView(self)
         self.pinned.setModel(model)
         self.pinned.setSelectionModel(self.selectionModel())
         self.pinned.setHorizontalHeader(CsvHeader(self.pinned))
