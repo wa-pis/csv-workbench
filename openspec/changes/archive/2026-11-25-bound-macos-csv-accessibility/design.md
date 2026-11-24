@@ -7,3 +7,5 @@ Visible section lookup follows header viewport geometry, including moved/hidden 
 Primary references: https://doc.qt.io/qt-6/accessible-qwidget.html and https://github.com/qt/qtbase/blob/6.12/src/plugins/platforms/cocoa/qcocoaaccessibilityelement.mm . Native regressions must traverse Cocoa children, not merely query Python wrappers. The original ownership regression remains exercised on a standard Qt table.
 
 Accessible cell focus follows the real keyboard focus of the main view, including pinned cells whose overlay has NoFocus. Native line editors retain focus priority; moving focus outside the table clears the accessible cell focus.
+
+The native regression limits each complete Cocoa hierarchy traversal to 10 seconds, separately from editor setup, scrolling and event dispatch. The subprocess retains its 60-second outer timeout; node-count assertions remain independent of runner speed.

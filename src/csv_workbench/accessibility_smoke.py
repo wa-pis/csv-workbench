@@ -93,13 +93,26 @@ def check_tables():
         return 1 + sum(walk(child, depth + 1, roles)
                        for child in children(obj, 'accessibilityChildren'))
 
+    walk_seconds = []
+
+    def timed_walk(*, roles=None):
+        window = int(table.winId())
+        # Editor setup and event dispatch are separate from native hierarchy traversal.
+        walk_started = monotonic()
+        count = walk(window, roles=roles)
+        elapsed = monotonic() - walk_started
+        walk_seconds.append(elapsed)
+        print(json.dumps({'native_walk_seconds': elapsed, 'native_walk_nodes': count}), flush=True)
+        assert elapsed < 10, 'native viewport traversal blocked UI'
+        return count
+
     counts = []
     started = monotonic()
     for position in (0, 90000, 180000, 0):
         table.horizontalScrollBar().setValue(position)
         model.setData(model.index(0, 0), 'edited')
         app.processEvents()
-        counts.append(walk(int(table.winId())))
+        counts.append(timed_walk())
         assert 10 < counts[-1] < MAX_CELLS * 4, 'unbounded or missing native hierarchy'
         for view in (table, table.pinned):
             iface = QAccessible.queryAccessibleInterface(view)
@@ -110,18 +123,18 @@ def check_tables():
         app.processEvents()
         assert any(editor.isVisible() for editor in table.findChildren(QLineEdit))
         roles = []
-        assert walk(int(table.winId()), roles=roles) < MAX_CELLS * 4
+        assert timed_walk(roles=roles) < MAX_CELLS * 4
         assert b'AXTextField' in roles, 'native cell editor missing'
         table.closePersistentEditor(model.index(0, 0))
         table.setFocus()
-    elapsed = monotonic() - started
-    assert elapsed < 10, 'native viewport traversal blocked UI'
-    print(json.dumps({'wide_cocoa_seconds': elapsed, 'native_node_counts': counts}))
     model.edits.clear()
     model.replace(['a', 'b'], [('new', 'value')])
     app.processEvents()
-    assert walk(int(table.winId())) < MAX_CELLS * 4
+    assert timed_walk() < MAX_CELLS * 4
     assert model.data(model.index(0, 0), Qt.ItemDataRole.DisplayRole) == 'new'
+    print(json.dumps({'wide_cocoa_seconds': monotonic() - started,
+                      'native_max_walk_seconds': max(walk_seconds),
+                      'native_node_counts': counts}), flush=True)
     table.close()
     table.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
