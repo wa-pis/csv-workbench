@@ -16,7 +16,11 @@ import duckdb
 from csv_workbench.edits import DiskEdits
 from csv_workbench.text_formats import formatted_chunks
 
+# The streaming preview also accepts fields beyond the CSV module's default size limit.
+csv.field_size_limit(2**31 - 1)
+
 PAGE_SIZE = 200
+WIDE_CSV_COLUMNS = 2048
 NEW_ROW = 1 << 62
 DELETED_COLUMN = -1
 CSV_ENCODINGS = {
@@ -84,23 +88,14 @@ def read_format_sample(path, encoding=None):
 
 def preview_nulls(row, raw, delimiter, quote):
     # Python 3.12's CSV reader collapses quoted and unquoted empty fields.
-    start = pos = column = 0
-    quoted = False
-    while pos < len(raw):
-        char = raw[pos]
-        if char == quote and (quoted or pos == start):
-            if quoted and pos + 1 < len(raw) and raw[pos + 1] == quote:
-                pos += 2
-                continue
-            quoted = not quoted
-        elif char == delimiter and not quoted:
-            if pos == start:
-                row[column] = None
-            column += 1
-            start = pos + 1
-        pos += 1
-    if start == len(raw):
-        row[column] = None
+    separator, quoted = re.escape(delimiter), re.escape(quote)
+    fields = re.finditer(
+        rf'(?:\A|{separator})({quoted}(?:[^{quoted}]++|{quoted}{quoted})*+{quoted}|[^{separator}]*)(?={separator}|\Z)',
+        raw,
+    )
+    for column, match in enumerate(fields):
+        if match.start(1) == match.end(1):
+            row[column] = None
     return row
 
 
@@ -503,10 +498,26 @@ def read_page(
     limit=PAGE_SIZE,
 ) -> tuple[list[str], list[tuple], bool]:
     cancel = cancel or Cancellation()
-    with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
-        sql, params = selection_query(connection, source, selection, fmt)
-        cancel.check()
-        return query_page(connection, sql, params, offset, limit)
+    with utf8_source(path, cancel, fmt) as source:
+        with cancel.connection() as connection:
+            columns = (
+                csv_columns(connection, csv_pattern(source), fmt)
+                if selection == Selection() else []
+            )
+            if len(columns) <= WIDE_CSV_COLUMNS:
+                sql, params = selection_query(connection, source, selection, fmt)
+                cancel.check()
+                return query_page(connection, sql, params, offset, limit)
+            tail = offset is None
+            if tail:
+                count = connection.execute(
+                    f"SELECT count(*) FROM {fmt.source}", [csv_pattern(source)]
+                ).fetchone()[0]
+                limit = 2 * PAGE_SIZE
+                offset = max(0, ((count - 1) // PAGE_SIZE - 1) * PAGE_SIZE)
+        # Release the schema scanner's buffers before allocating the page.
+        page = read_wide_page(source, offset, columns, limit, cancel, fmt)
+        return (*page, offset) if tail else page
 
 
 def query_csv(path: Path, sql: str, *, fmt=CsvFormat(), cancel: Cancellation | None = None):
@@ -794,15 +805,55 @@ def page_result(cursor, limit=PAGE_SIZE):
 CSV_BLOCK_BYTES = 8 * 2**20
 
 
+def read_wide_page(path, offset, columns, limit, cancel, fmt):
+    """Avoid DuckDB's full-width vectors when only a preview page is needed."""
+    rows = []
+    header = fmt.header
+    with path.open("rb") as source:
+        for index, block in enumerate(csv_blocks(
+            source, cancel, quote=fmt.quote.encode("ascii"),
+            delimiter=fmt.delimiter.encode("ascii"),
+        )):
+            records = format_records(
+                (block.decode("utf-8-sig" if index == 0 else "utf-8"), False),
+                fmt.delimiter, limit=None, quote=fmt.quote, nullable=True,
+            )
+            cancel.check()
+            for record in records:
+                cancel.check()
+                if not record:
+                    continue
+                if len(record) != len(columns):
+                    if header:
+                        raise ValueError("Wide CSV preview does not support a nonempty preamble.")
+                    raise ValueError("CSV row does not match the number of columns.")
+                if header:
+                    header = False
+                    continue
+                if offset:
+                    offset -= 1
+                else:
+                    rows.append(tuple(record))
+                    if len(rows) > limit:
+                        cancel.check()
+                        return columns, rows[:limit], True
+    cancel.check()
+    return columns, rows[:limit], len(rows) > limit
+
+
+def last_line_end(data, start=0, end=None):
+    return max(data.rfind(b"\n", start, end), data.rfind(b"\r", start, end)) + 1
+
+
 def custom_quote_boundary(data, opening, closing):
     end = pos = 0
     while match := opening.search(data, pos):
-        end = max(end, data.rfind(b"\n", pos, match.end() - 1) + 1)
+        end = max(end, last_line_end(data, pos, match.end() - 1))
         match = closing.match(data, match.end())
         if match is None:
             return end
         pos = match.end()
-    return max(end, data.rfind(b"\n", pos) + 1)
+    return max(end, last_line_end(data, pos))
 
 
 def csv_blocks(source, cancel, block_bytes=CSV_BLOCK_BYTES, *, quote=b'"', delimiter=b","):
@@ -810,13 +861,13 @@ def csv_blocks(source, cancel, block_bytes=CSV_BLOCK_BYTES, *, quote=b'"', delim
     opening = closing = None
     if quote != b'"':
         escaped = re.escape(quote)
-        opening = re.compile(rb"(?:\A|[" + re.escape(delimiter) + rb"\n])" + escaped)
+        opening = re.compile(rb"(?:\A|[" + re.escape(delimiter) + rb"\r\n])" + escaped)
         closing = re.compile(rb"(?:[^" + escaped + rb"]++|" + escaped * 2 + rb")*+" + escaped)
     pending = b""
     while chunk := source.read(block_bytes):
         cancel.check()
         pending += chunk
-        end = pending.rfind(b"\n") + 1
+        end = last_line_end(pending)
         if not end:
             continue
         if opening is not None:
@@ -824,11 +875,17 @@ def csv_blocks(source, cancel, block_bytes=CSV_BLOCK_BYTES, *, quote=b'"', delim
         elif pending.count(quote, 0, end) % 2:
             # An escaped quote contributes two quotes, so it cannot change parity.
             while end:
-                previous = pending.rfind(b"\n", 0, end - 1) + 1
+                previous = last_line_end(pending, 0, end - 1)
                 if pending.count(quote, previous, end) % 2:
                     end = previous
                     break
                 end = previous
+        if end == len(pending) and pending.endswith(b"\r"):
+            # Keep a CRLF pair together without waiting for another complete block.
+            following = source.read(1)
+            pending += following
+            if following == b"\n":
+                end += 1
         if end:
             yield pending[:end]
             pending = pending[end:]

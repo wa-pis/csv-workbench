@@ -1,0 +1,54 @@
+{
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "architecture": "arm64",
+  "python": "3.12.13",
+  "duckdb_memory_limit": "512MiB",
+  "csv_block_target_bytes": 8388608,
+  "source_bytes": 242422890,
+  "source_sha256": "6f2b1292a23fa78771413339aa5480cdc52df23603dba64152371314b4d280de",
+  "source_unchanged": true,
+  "rows": 600,
+  "columns": 4000,
+  "temporary_disk_poll_seconds": 0.01,
+  "results": [
+    {
+      "operation": "baseline",
+      "ok": false,
+      "error": "OutOfMemoryException: Out of Memory Error: failed to allocate data of size 32.0 KiB (511.9 MiB/512.0 MiB used)",
+      "seconds": 0.9633528338745236,
+      "peak_rss_bytes": 550273024,
+      "peak_temporary_file_bytes": 0
+    },
+    {
+      "operation": "open",
+      "ok": true,
+      "columns": 4000,
+      "rows": 200,
+      "has_more": true,
+      "seconds": 1.4675717502832413,
+      "peak_rss_bytes": 704970752,
+      "peak_temporary_file_bytes": 4
+    },
+    {
+      "operation": "next-page",
+      "ok": true,
+      "columns": 4000,
+      "rows": 200,
+      "has_more": true,
+      "seconds": 1.9970931252464652,
+      "peak_rss_bytes": 712556544,
+      "peak_temporary_file_bytes": 0
+    },
+    {
+      "operation": "last-page",
+      "ok": true,
+      "columns": 4000,
+      "rows": 400,
+      "has_more": false,
+      "offset": 200,
+      "seconds": 3.4795299996621907,
+      "peak_rss_bytes": 859865088,
+      "peak_temporary_file_bytes": 0
+    }
+  ]
+}

@@ -37,6 +37,8 @@ def run(operation, source, output):
 
     actions = {
         "open": lambda: read_page(source, 0),
+        "next-page": lambda: read_page(source, 200),
+        "last-page": lambda: read_page(source, None),
         "count": lambda: count_rows(source),
         "select": lambda: read_page(source, 0, selection),
         "cached-sort": cached,
@@ -87,7 +89,7 @@ def measure(source, operation):
                 except FileNotFoundError:
                     continue
             peak = max(peak, used)
-            sleep(0.02)
+            sleep(0.01)
         stdout, _ = process.communicate()
         if process.returncode:
             raise SystemExit(f"{operation} failed: {process.returncode}")
