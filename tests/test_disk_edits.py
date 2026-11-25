@@ -40,6 +40,85 @@ def test_snapshots_null_missing_and_redo_branch():
     assert not branch and len(before) == 2
 
 
+def test_row_stream_keeps_latest_null_empty_and_structural_patches():
+    before = DiskEdits().updated([
+        ((0, 0), 'old'), ((0, 1), 'old'), ((0, 2), 'restored source'),
+        ((1, 0), 'removed patch'), ((2, DELETED_COLUMN), None),
+        ((NEW_ROW, 0), 'new row'), ((NEW_ROW + 1, 0), 'deleted new row'),
+    ], cancel=Cancellation())
+    after = before.updated([
+        ((0, 0), None), ((0, 1), ''), ((0, 2), MISSING), ((1, 0), MISSING),
+        ((NEW_ROW, 0), None), ((NEW_ROW, 1), ''),
+        ((NEW_ROW + 1, DELETED_COLUMN), None),
+    ], cancel=Cancellation())
+    # An unrelated redo branch must not replace the snapshot's latest generation.
+    before.updated([((0, 0), 'other branch')], cancel=Cancellation())
+
+    assert list(after.iter_rows(cancel=Cancellation())) == [
+        (0, {0: None, 1: ''}), (2, {DELETED_COLUMN: None}),
+        (NEW_ROW, {0: None, 1: ''}),
+        (NEW_ROW + 1, {DELETED_COLUMN: None, 0: 'deleted new row'}),
+    ]
+    assert before[(0, 2)] == 'restored source'
+
+
+def test_row_stream_freezes_snapshot_before_iteration_and_during_reads():
+    edits = DiskEdits().updated([((0, 0), 'first'), ((1, 0), 'second')], cancel=Cancellation())
+    stream = edits.iter_rows(cancel=Cancellation())
+    edits[(0, 0)] = 'later first'
+    assert next(stream) == (0, {0: 'first'})
+    edits[(1, 0)] = 'later second'
+    assert list(stream) == [(1, {0: 'second'})]
+    assert list(edits.iter_rows(cancel=Cancellation())) == [
+        (0, {0: 'later first'}), (1, {0: 'later second'}),
+    ]
+
+
+def test_row_stream_groups_a_wide_row_across_fetch_batches():
+    cells = {column: str(column) for column in range(2050)}
+    changes = [((7, column), value) for column, value in cells.items()]
+    changes.append(((8, 0), None))
+    edits = DiskEdits().updated(changes, cancel=Cancellation())
+    assert list(edits.iter_rows(cancel=Cancellation())) == [(7, cells), (8, {0: None})]
+
+
+@pytest.mark.parametrize('termination', ['close', 'cancel'])
+def test_row_stream_closes_sqlite_after_early_exit(monkeypatch, termination):
+    import sqlite3
+    from contextlib import contextmanager
+
+    edits = DiskEdits().updated([((row, 0), str(row)) for row in range(3)], cancel=Cancellation())
+    connection = edits.store.connection
+    opened = []
+
+    @contextmanager
+    def tracked_connection(cancel=None):
+        with connection(cancel) as db:
+            opened.append(db)
+            yield db
+
+    monkeypatch.setattr(edits.store, 'connection', tracked_connection)
+    token = Cancellation()
+    stream = edits.iter_rows(cancel=token)
+    assert next(stream) == (0, {0: '0'})
+    assert len(opened) == 1
+    if termination == 'close':
+        stream.close()
+    else:
+        token.cancel()
+        with pytest.raises(CancelledError):
+            next(stream)
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        opened[0].execute('SELECT 1')
+
+
+def test_cancelled_empty_row_stream_does_not_return_success():
+    token = Cancellation()
+    token.cancel()
+    with pytest.raises(CancelledError):
+        list(DiskEdits().iter_rows(cancel=token))
+
+
 @pytest.mark.parametrize('failure', ['cancel', 'io'])
 def test_failed_generation_rolls_back_without_publishing(failure):
     edits = DiskEdits()

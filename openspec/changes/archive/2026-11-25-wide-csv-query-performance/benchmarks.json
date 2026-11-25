@@ -1,0 +1,47 @@
+{
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.12.13",
+  "duckdb": "1.5.6",
+  "duckdb_memory_limit": "512MiB",
+  "source_bytes": 242422890,
+  "source_sha256": "6f2b1292a23fa78771413339aa5480cdc52df23603dba64152371314b4d280de",
+  "source_unchanged": true,
+  "rows": 600,
+  "columns": 4000,
+  "temporary_disk_poll_seconds": 0.01,
+  "results": [
+    {
+      "operation": "sort",
+      "seconds": 3.596070125233382,
+      "peak_rss_bytes": 806043648,
+      "peak_temporary_file_bytes": 248246272
+    },
+    {
+      "operation": "edited-sort",
+      "seconds": 3.459529208019376,
+      "peak_rss_bytes": 827703296,
+      "peak_temporary_file_bytes": 248246272
+    },
+    {
+      "operation": "unique",
+      "seconds": 2.61651266599074,
+      "peak_rss_bytes": 683917312,
+      "peak_temporary_file_bytes": 736
+    },
+    {
+      "operation": "save",
+      "published_output_bytes": 247235303,
+      "seconds": 4.091476207599044,
+      "peak_rss_bytes": 652001280,
+      "verified_saved_rows": 601,
+      "peak_temporary_file_bytes": 246819396
+    },
+    {
+      "operation": "cancel-sort",
+      "cancellation_seconds": 0.005503375083208084,
+      "seconds": 1.173618083819747,
+      "peak_rss_bytes": 635142144,
+      "peak_temporary_file_bytes": 12288
+    }
+  ]
+}

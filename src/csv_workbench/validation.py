@@ -2,6 +2,7 @@
 
 import math
 import re
+from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import date
 
@@ -67,10 +68,9 @@ class ValidationResult:
 
 
 def validate_csv_values(path, selection, edits, *, cancel, fmt=None):
+    from csv_workbench import core
     from csv_workbench.core import (
         CsvFormat,
-        csv_columns,
-        csv_pattern,
         editable_query,
         quote_identifier,
         utf8_source,
@@ -81,20 +81,38 @@ def validate_csv_values(path, selection, edits, *, cancel, fmt=None):
     # Check configured hidden columns too; ordering cannot change aggregate counts.
     unordered = replace(selection, visible_columns=None, column_order=(), sort_column=None,
                         descending=False, extra_sort=())
-    with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
-        columns = csv_columns(connection, csv_pattern(source), fmt)
+    with utf8_source(path, cancel, fmt) as source:
+        columns = core.source_columns(source, cancel, fmt)
         if missing := {name for name, _, _ in rules}.difference(columns):
             raise ValueError(f'Unknown validation column: {min(missing)}')
-        sql, params = editable_query(connection, source, unordered, edits, fmt, cancel=cancel,
-                                     ordered=False)
-        counts = ['count(*)'] + [
-            f'count(*) FILTER (WHERE {invalid_sql(quote_identifier(name), kind, nullable)})'
-            for name, kind, nullable in rules
-        ]
-        cancel.check()
-        row_count, *errors = connection.execute(
-            f'SELECT {", ".join(counts)} FROM ({sql})', params,
-        ).fetchone()
-        cancel.check()
+        if len(columns) > core.WIDE_CSV_COLUMNS:
+            from csv_workbench.wide import effective_rows, selection_matcher
+
+            matches = selection_matcher(columns, unordered)
+            indexed_rules = [(columns.index(name), kind, nullable) for name, kind, nullable in rules]
+            row_count, errors = 0, [0] * len(rules)
+            with closing(effective_rows(source, columns, edits, cancel=cancel, fmt=fmt)) as rows:
+                for _, row in rows:
+                    cancel.check()
+                    if matches(row):
+                        row_count += 1
+                        for index, (column, kind, nullable) in enumerate(indexed_rules):
+                            errors[index] += cell_error(row[column], kind, nullable) is not None
+            cancel.check()
+        else:
+            with cancel.connection() as connection:
+                sql, params = editable_query(
+                    connection, source, unordered, edits, fmt, cancel=cancel,
+                    ordered=False, columns=columns,
+                )
+                counts = ['count(*)'] + [
+                    f'count(*) FILTER (WHERE {invalid_sql(quote_identifier(name), kind, nullable)})'
+                    for name, kind, nullable in rules
+                ]
+                cancel.check()
+                row_count, *errors = connection.execute(
+                    f'SELECT {", ".join(counts)} FROM ({sql})', params,
+                ).fetchone()
+                cancel.check()
         return ValidationResult(row_count, tuple((rule[0], count)
                                                 for rule, count in zip(rules, errors, strict=True)))

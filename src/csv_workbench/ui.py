@@ -72,6 +72,7 @@ from csv_workbench.core import (
     DELETED_COLUMN,
     NEW_ROW,
     PAGE_SIZE,
+    WIDE_CSV_COLUMNS,
     Cancellation,
     CsvFormat,
     Selection,
@@ -86,6 +87,7 @@ from csv_workbench.core import (
     prepare_result,
     preview_format,
     query_csv,
+    read_columns,
     read_editable_page,
     read_format_sample,
     read_page,
@@ -2558,10 +2560,10 @@ class MainWindow(QMainWindow):
                                 output.write(chunk)
                     else:
                         base = path
-                    source_headers = read_page(base, 0, cancel=cancel, fmt=fmt)[0]
+                    source_headers = read_columns(base, cancel=cancel, fmt=fmt)
                     if source_headers != recovery.headers:
                         raise ValueError("CSV columns do not match the recovery checkpoint.")
-                    if selection.sort_column:
+                    if selection.sort_column or len(source_headers) > WIDE_CSV_COLUMNS:
                         result = prepare_editable_result(
                             base, selection, recovery.edits, cancel=cancel, fmt=fmt,
                         )
@@ -2583,7 +2585,7 @@ class MainWindow(QMainWindow):
             base = Path(snapshot.name) / "source.csv" if snapshot else path
             source_headers = None
             if new_file and (selection.visible_columns is not None or selection.column_order):
-                source_headers = read_page(path, 0, cancel=cancel, fmt=fmt)[0]
+                source_headers = read_columns(path, cancel=cancel, fmt=fmt)
             if distinct is not None and (edits or snapshot):
                 result = prepare_editable_result(
                     base,
@@ -2614,6 +2616,16 @@ class MainWindow(QMainWindow):
                     raise ValueError("The source CSV changed. Reopen it before editing.")
                 return revision, page, result, source_headers
             if identified:
+                if new_file and source_headers is None:
+                    source_headers = read_columns(base, cancel=cancel, fmt=fmt)
+                if len(source_headers if source_headers is not None else self.source_headers) > WIDE_CSV_COLUMNS:
+                    result = prepare_editable_result(
+                        base, selection, edits, cancel=cancel, fmt=fmt,
+                    )
+                    page = result.page(0, cancel=cancel)
+                    if file_revision(path) != revision:
+                        raise ValueError("The source CSV changed. Reopen it before editing.")
+                    return revision, page, result, source_headers
                 page = read_editable_page(base, 0, selection, edits, cancel=cancel, fmt=fmt)
             else:
                 page = read_page(path, 0, selection, cancel=cancel, fmt=fmt)

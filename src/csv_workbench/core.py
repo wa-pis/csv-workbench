@@ -5,8 +5,9 @@ import csv
 import io
 import re
 from concurrent.futures import CancelledError
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
+from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Lock
@@ -360,11 +361,23 @@ def csv_columns(connection, pattern, fmt):
     return [column[0] for column in cursor.description]
 
 
+def source_columns(source, cancel, fmt):
+    with cancel.connection() as connection:
+        return csv_columns(connection, csv_pattern(source), fmt)
+
+
+def read_columns(path, *, cancel=None, fmt=CsvFormat()):
+    cancel = cancel or Cancellation()
+    with utf8_source(path, cancel, fmt) as source:
+        return source_columns(source, cancel, fmt)
+
+
 def selection_query(
-    connection, path: Path, selection: Selection, fmt=CsvFormat()
+    connection, path: Path, selection: Selection, fmt=CsvFormat(), *, columns=None
 ) -> tuple[str, list[str | None]]:
     pattern = csv_pattern(path)
-    columns = csv_columns(connection, pattern, fmt) if selection != Selection() else []
+    if columns is None:
+        columns = csv_columns(connection, pattern, fmt) if selection != Selection() else []
     sql, values = selection_sql(columns, selection, source=fmt.source)
     return sql, [pattern, *values]
 
@@ -406,9 +419,10 @@ def selection_sql(
     return f"SELECT {projection} FROM {source}{where}{order}", values
 
 
-def editable_query(connection, source, selection, edits, fmt=CsvFormat(), *, cancel=None, ordered=True):
+def editable_query(connection, source, selection, edits, fmt=CsvFormat(), *, cancel=None, ordered=True, columns=None):
     pattern = csv_pattern(source)
-    columns = csv_columns(connection, pattern, fmt)
+    if columns is None:
+        columns = csv_columns(connection, pattern, fmt)
     name = "__csv_source_row"
     folded = {column.casefold() for column in columns}
     while name.casefold() in folded:
@@ -462,19 +476,53 @@ def editable_query(connection, source, selection, edits, fmt=CsvFormat(), *, can
 
 
 def read_editable_page(path, offset, selection, edits, *, cancel, fmt=CsvFormat(), limit=PAGE_SIZE):
-    with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
-        sql, params = editable_query(connection, source, selection, edits, fmt, cancel=cancel)
-        return query_page(connection, sql, params, offset, limit)
+    with utf8_source(path, cancel, fmt) as source:
+        columns = source_columns(source, cancel, fmt)
+        if len(columns) > WIDE_CSV_COLUMNS:
+            from csv_workbench.wide import prepare_wide_result
+
+            result = prepare_wide_result(
+                source, columns, selection, edits, cancel=cancel, fmt=fmt, identified=True,
+            )
+            try:
+                return result.page(offset, cancel=cancel, limit=limit)
+            finally:
+                result.scratch.cleanup()
+        with cancel.connection() as connection:
+            sql, params = editable_query(
+                connection, source, selection, edits, fmt, cancel=cancel, columns=columns,
+            )
+            return query_page(connection, sql, params, offset, limit)
 
 
 def prepare_editable_result(
     path, selection, edits, *, cancel, distinct=None, singletons=False, fmt=CsvFormat()
 ):
+    with utf8_source(path, cancel, fmt) as source:
+        columns = source_columns(source, cancel, fmt)
+        if len(columns) > WIDE_CSV_COLUMNS:
+            from csv_workbench.wide import prepare_wide_result
+
+            return prepare_wide_result(
+                source, columns, selection, edits, cancel=cancel, fmt=fmt,
+                identified=True, distinct=distinct, singletons=singletons,
+            )
+        return prepare_narrow_editable_result(
+            source, selection, edits, columns, cancel=cancel,
+            distinct=distinct, singletons=singletons, fmt=fmt,
+        )
+
+
+def prepare_narrow_editable_result(
+    source, selection, edits, columns, *, cancel, distinct, singletons, fmt,
+):
     scratch = TemporaryDirectory(prefix="csv-result-")
     output = Path(scratch.name) / "result.parquet"
     try:
-        with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
-            sql, params = editable_query(connection, source, selection, edits, fmt, cancel=cancel)
+        with cancel.connection() as connection:
+            sql, params = editable_query(
+                connection, source, selection, edits, fmt, cancel=cancel, columns=columns,
+            )
             if distinct is not None:
                 having = " HAVING count(*) = 1" if singletons else ""
                 sql = (
@@ -500,21 +548,28 @@ def read_page(
     cancel = cancel or Cancellation()
     with utf8_source(path, cancel, fmt) as source:
         with cancel.connection() as connection:
-            columns = (
-                csv_columns(connection, csv_pattern(source), fmt)
-                if selection == Selection() else []
-            )
+            columns = csv_columns(connection, csv_pattern(source), fmt)
             if len(columns) <= WIDE_CSV_COLUMNS:
-                sql, params = selection_query(connection, source, selection, fmt)
+                sql, params = selection_query(connection, source, selection, fmt, columns=columns)
                 cancel.check()
                 return query_page(connection, sql, params, offset, limit)
             tail = offset is None
-            if tail:
+            if tail and selection == Selection():
                 count = connection.execute(
                     f"SELECT count(*) FROM {fmt.source}", [csv_pattern(source)]
                 ).fetchone()[0]
                 limit = 2 * PAGE_SIZE
                 offset = max(0, ((count - 1) // PAGE_SIZE - 1) * PAGE_SIZE)
+        if selection != Selection():
+            from csv_workbench.wide import prepare_wide_result
+
+            result = prepare_wide_result(
+                source, columns, selection, {}, cancel=cancel, fmt=fmt,
+            )
+            try:
+                return result.page(offset, cancel=cancel, limit=limit)
+            finally:
+                result.scratch.cleanup()
         # Release the schema scanner's buffers before allocating the page.
         page = read_wide_page(source, offset, columns, limit, cancel, fmt)
         return (*page, offset) if tail else page
@@ -538,6 +593,17 @@ def query_csv(path: Path, sql: str, *, fmt=CsvFormat(), cancel: Cancellation | N
 
 
 def write_csv_rows(cursor, output, fmt, cancel, *, skip=0):
+    def records():
+        while batch := cursor.fetchmany(1024):
+            cancel.check()
+            yield from (row[skip:] for row in batch)
+
+    return write_csv_records(
+        [column[0] for column in cursor.description[skip:]], records(), output, fmt, cancel,
+    )
+
+
+def write_csv_records(headers, rows, output, fmt, cancel):
     count = 0
     with output.open("w", encoding=fmt.encoding or "utf-8", newline="") as handle:
         writer = csv.writer(
@@ -548,17 +614,37 @@ def write_csv_rows(cursor, output, fmt, cancel, *, skip=0):
             lineterminator="\r\n",
         )
         if fmt.header:
-            writer.writerow([column[0] for column in cursor.description[skip:]])
-        while batch := cursor.fetchmany(1024):
+            writer.writerow(headers)
+        for row in rows:
             cancel.check()
-            for row in batch:
-                values = row[skip:]
-                if values == (None,):
-                    handle.write("\r\n")
-                else:
-                    writer.writerow(values)
-            count += len(batch)
+            values = tuple(row)
+            if values == (None,):
+                handle.write("\r\n")
+            else:
+                writer.writerow(values)
+            count += 1
+        cancel.check()
     return count
+
+
+def write_wide_view(source, columns, selection, edits, output, fmt, output_format, cancel):
+    from csv_workbench.wide import effective_rows, prepare_wide_result
+
+    if selection == Selection():
+        with closing(effective_rows(source, columns, edits, cancel=cancel, fmt=fmt)) as rows:
+            return write_csv_records(
+                columns, (row for _, row in rows), output, output_format, cancel,
+            )
+    result = prepare_wide_result(
+        source, columns, selection, edits, cancel=cancel, fmt=fmt,
+    )
+    try:
+        with closing(result.iter_rows(cancel=cancel)) as rows:
+            return write_csv_records(
+                result.headers, (row for _, _, row in rows), output, output_format, cancel,
+            )
+    finally:
+        result.scratch.cleanup()
 
 
 def export_csv(
@@ -576,22 +662,34 @@ def export_csv(
     destination = destination.absolute()
     if destination.resolve() == source or (destination.exists() and destination.samefile(source)):
         raise ValueError("Choose a destination other than the source CSV.")
+    revision = file_revision(source)
 
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "export.csv"
-        with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
-            sql, params = selection_query(connection, decoded, selection, fmt)
-            cancel.check()
-            if output_format == CsvFormat():
-                # Keep the native streaming writer for the default format.
-                count = connection.execute(
-                    f"COPY ({sql}) TO ? (FORMAT CSV, HEADER true, COMPRESSION none)",
-                    [str(output), *params],
-                ).fetchone()[0]
-            else:
-                count = write_csv_rows(
-                    connection.execute(sql, params), output, output_format, cancel
+        with utf8_source(source, cancel, fmt) as decoded:
+            columns = source_columns(decoded, cancel, fmt)
+            if len(columns) > WIDE_CSV_COLUMNS:
+                count = write_wide_view(
+                    decoded, columns, selection, {}, output, fmt, output_format, cancel,
                 )
+            else:
+                with cancel.connection() as connection:
+                    sql, params = selection_query(
+                        connection, decoded, selection, fmt, columns=columns,
+                    )
+                    cancel.check()
+                    if output_format == CsvFormat():
+                        # Keep the native streaming writer for the default format.
+                        count = connection.execute(
+                            f"COPY ({sql}) TO ? (FORMAT CSV, HEADER true, COMPRESSION none)",
+                            [str(output), *params],
+                        ).fetchone()[0]
+                    else:
+                        count = write_csv_rows(
+                            connection.execute(sql, params), output, output_format, cancel,
+                        )
+        if file_revision(source) != revision:
+            raise ValueError("The source CSV changed. Reopen it before exporting.")
         cancel.publish(output, destination)
     return count
 
@@ -618,33 +716,66 @@ def export_text(
             raise ValueError("The source CSV changed. Reopen it before exporting.")
 
     check_source()
-    count = 0
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "export"
-        with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
-            if edits or source != document.resolve():
-                sql, params = editable_query(connection, decoded, selection, edits or {}, fmt, cancel=cancel)
-                skip = 1
+        with utf8_source(source, cancel, fmt) as decoded:
+            columns = source_columns(decoded, cancel, fmt)
+            if len(columns) > WIDE_CSV_COLUMNS:
+                from csv_workbench.wide import prepare_wide_result
+
+                result = prepare_wide_result(
+                    decoded, columns, selection, edits or {}, cancel=cancel, fmt=fmt,
+                )
+                try:
+                    with closing(result.iter_rows(cancel=cancel)) as rows:
+                        count = write_text_records(
+                            result.headers, (row for _, _, row in rows),
+                            output, text_format, cancel,
+                        )
+                finally:
+                    result.scratch.cleanup()
             else:
-                sql, params = selection_query(connection, decoded, selection, fmt)
-                skip = 0
-            cursor = connection.execute(sql, params)
-            headers = [column[0] for column in cursor.description[skip:]]
+                with cancel.connection() as connection:
+                    if edits or source != document.resolve():
+                        sql, params = editable_query(
+                            connection, decoded, selection, edits or {}, fmt,
+                            cancel=cancel, columns=columns,
+                        )
+                        skip = 1
+                    else:
+                        sql, params = selection_query(
+                            connection, decoded, selection, fmt, columns=columns,
+                        )
+                        skip = 0
+                    cursor = connection.execute(sql, params)
+                    headers = [column[0] for column in cursor.description[skip:]]
 
-            def rows():
-                nonlocal count
-                while batch := cursor.fetchmany(1024):
-                    cancel.check()
-                    for row in batch:
-                        count += 1
-                        yield row[skip:]
+                    def rows():
+                        while batch := cursor.fetchmany(1024):
+                            cancel.check()
+                            yield from (row[skip:] for row in batch)
 
-            with output.open("w", encoding="utf-8", newline="") as handle:
-                for chunk in formatted_chunks(headers, rows(), text_format):
-                    cancel.check()
-                    handle.write(chunk)
+                    count = write_text_records(headers, rows(), output, text_format, cancel)
         check_source()
         cancel.publish(output, destination)
+    return count
+
+
+def write_text_records(headers, rows, output, text_format, cancel):
+    count = 0
+
+    def counted():
+        nonlocal count
+        for row in rows:
+            cancel.check()
+            count += 1
+            yield row
+
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        for chunk in formatted_chunks(headers, counted(), text_format):
+            cancel.check()
+            handle.write(chunk)
+    cancel.check()
     return count
 
 
@@ -684,11 +815,23 @@ def export_edited_csv(
     check_source()
     with TemporaryDirectory(dir=destination.parent) as scratch:
         output = Path(scratch) / "edited.csv"
-        with utf8_source(source, cancel, fmt) as decoded, cancel.connection() as connection:
-            sql, params = editable_query(connection, decoded, selection, edits, fmt, cancel=cancel)
-            count = write_csv_rows(
-                connection.execute(sql, params), output, fmt if save else output_format, cancel, skip=1
-            )
+        with utf8_source(source, cancel, fmt) as decoded:
+            columns = source_columns(decoded, cancel, fmt)
+            if len(columns) > WIDE_CSV_COLUMNS:
+                count = write_wide_view(
+                    decoded, columns, Selection() if save else selection, edits,
+                    output, fmt, fmt if save else output_format, cancel,
+                )
+            else:
+                with cancel.connection() as connection:
+                    sql, params = editable_query(
+                        connection, decoded, selection, edits, fmt,
+                        cancel=cancel, columns=columns,
+                    )
+                    count = write_csv_rows(
+                        connection.execute(sql, params), output,
+                        fmt if save else output_format, cancel, skip=1,
+                    )
         if save and destination.exists():
             output.chmod(destination.stat().st_mode & 0o777)
         check_source()
@@ -735,19 +878,65 @@ def find_csv_cell(
     cancel, fmt=CsvFormat(), result=None,
 ):
     """Return a zero-based (row, column) in the existing view, without storing matches."""
-    with cancel.connection() as connection:
-        if result is not None:
+    from csv_workbench.wide import WideResult, prepare_wide_result
+
+    if isinstance(result, WideResult):
+        return find_cell_in_wide_result(result, columns, needle, anchor, forward, cancel)
+    if result is not None:
+        with cancel.connection() as connection:
             return find_cell_in_query(
                 connection, "SELECT * FROM read_parquet(?)", [str(result.path)],
                 columns, needle, anchor, forward,
             )
-        with utf8_source(path, cancel, fmt) as source:
+    with utf8_source(path, cancel, fmt) as source:
+        source_headers = source_columns(source, cancel, fmt)
+        if len(source_headers) > WIDE_CSV_COLUMNS:
+            prepared = prepare_wide_result(
+                source, source_headers, selection, edits, cancel=cancel, fmt=fmt,
+            )
+            try:
+                return find_cell_in_wide_result(
+                    prepared, columns, needle, anchor, forward, cancel,
+                )
+            finally:
+                prepared.scratch.cleanup()
+        with cancel.connection() as connection:
             if edits or selection != Selection():
-                sql, params = editable_query(connection, source, selection, edits, fmt, cancel=cancel)
+                sql, params = editable_query(
+                    connection, source, selection, edits, fmt,
+                    cancel=cancel, columns=source_headers,
+                )
             else:
-                sql, params = selection_query(connection, source, selection, fmt)
+                sql, params = selection_query(
+                    connection, source, selection, fmt, columns=source_headers,
+                )
             cancel.check()
             return find_cell_in_query(connection, sql, params, columns, needle, anchor, forward)
+
+
+def find_cell_in_wide_result(result, columns, needle, anchor, forward, cancel):
+    if not needle or not columns:
+        return None
+    indices = [result.headers.index(column) for column in columns]
+    lowered = search_lower(needle)
+    anchor_row, anchor_column = anchor
+    order = range(len(indices)) if forward else range(len(indices) - 1, -1, -1)
+    with closing(result.iter_rows(
+        cancel=cancel, start=max(0, anchor_row) if forward else anchor_row,
+        reverse=not forward,
+    )) as rows:
+        for position, _, values in rows:
+            for column in order:
+                cancel.check()
+                if position == anchor_row and (
+                    column <= anchor_column if forward else column >= anchor_column
+                ):
+                    continue
+                value = values[indices[column]]
+                if value is not None and lowered in search_lower(value):
+                    return position, column
+    cancel.check()
+    return None
 
 
 def find_cell_in_query(connection, sql, params, columns, needle, anchor, forward):
@@ -807,7 +996,14 @@ CSV_BLOCK_BYTES = 8 * 2**20
 
 def read_wide_page(path, offset, columns, limit, cancel, fmt):
     """Avoid DuckDB's full-width vectors when only a preview page is needed."""
-    rows = []
+    with closing(iter_csv_rows(path, columns, cancel, fmt)) as records:
+        rows = list(islice(records, offset, offset + limit + 1))
+    cancel.check()
+    return columns, rows[:limit], len(rows) > limit
+
+
+def iter_csv_rows(path, columns, cancel, fmt):
+    """Yield canonical CSV values while retaining only the current input block."""
     header = fmt.header
     with path.open("rb") as source:
         for index, block in enumerate(csv_blocks(
@@ -830,15 +1026,8 @@ def read_wide_page(path, offset, columns, limit, cancel, fmt):
                 if header:
                     header = False
                     continue
-                if offset:
-                    offset -= 1
-                else:
-                    rows.append(tuple(record))
-                    if len(rows) > limit:
-                        cancel.check()
-                        return columns, rows[:limit], True
+                yield tuple(record)
     cancel.check()
-    return columns, rows[:limit], len(rows) > limit
 
 
 def last_line_end(data, start=0, end=None):
@@ -985,18 +1174,33 @@ def prepare_result(
     singletons: bool = False,
     cancel: Cancellation | None = None,
     fmt=CsvFormat(),
-) -> DiskResult:
+):
+    cancel = cancel or Cancellation()
+    with utf8_source(path, cancel, fmt) as source:
+        columns = source_columns(source, cancel, fmt)
+        if len(columns) > WIDE_CSV_COLUMNS:
+            from csv_workbench.wide import prepare_wide_result
+
+            return prepare_wide_result(
+                source, columns, selection, {}, cancel=cancel, fmt=fmt,
+                distinct=distinct, singletons=singletons,
+            )
+        return prepare_narrow_result(
+            source, selection, distinct=distinct, singletons=singletons,
+            cancel=cancel, fmt=fmt,
+        )
+
+
+def prepare_narrow_result(source, selection, *, distinct, singletons, cancel, fmt):
     import polars as pl
 
-    cancel = cancel or Cancellation()
     scratch = TemporaryDirectory(prefix="csv-result-")
     output = Path(scratch.name) / "result.parquet"
     try:
         with TemporaryDirectory(prefix="csv-stage-") as staging:
-            with utf8_source(path, cancel, fmt) as source:
-                columns, files = stage_selection(
-                    source, selection, distinct, Path(staging), cancel, fmt
-                )
+            columns, files = stage_selection(
+                source, selection, distinct, Path(staging), cancel, fmt
+            )
 
             projection = ", ".join(map(quote_identifier, columns))
             if distinct is not None:

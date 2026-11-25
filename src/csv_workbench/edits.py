@@ -4,7 +4,7 @@ import json
 import sqlite3
 from collections.abc import MutableMapping
 from contextlib import closing, contextmanager
-from itertools import islice
+from itertools import groupby, islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import RLock
@@ -63,22 +63,27 @@ class EditStore:
             source.backup(output, pages=256, progress=progress)
             check()
 
-    def rows(self, versions):
+    def rows(self, versions, *, cancel=None, ordered=False):
         if not versions:
             return
-        with self.connection() as db:
+        with self.connection(cancel) as db:
             if len(versions) == 1:
-                cursor = db.execute(
-                    "SELECT rid,col,val,missing FROM patches WHERE version=?", versions,
-                )
+                sql = "SELECT rid,col,val,missing FROM patches WHERE version=?"
+                params = versions
             else:
-                cursor = db.execute("""
+                sql = """
                     SELECT p.rid,p.col,p.val,p.missing FROM patches p
                     JOIN (SELECT rid,col,max(version) AS version FROM patches
                           WHERE version IN (SELECT value FROM json_each(?)) GROUP BY rid,col) latest
                     USING(version,rid,col)
-                """, (json.dumps(versions),))
+                """
+                params = (json.dumps(versions),)
+            if ordered:
+                sql += " ORDER BY rid,col"
+            cursor = db.execute(sql, params)
             while batch := cursor.fetchmany(2048):
+                if cancel is not None:
+                    cancel.check()
                 yield from batch
 
 
@@ -117,6 +122,22 @@ class DiskEdits(MutableMapping):
         for row, col, value, missing in self.store.rows(self.versions):
             if not missing:
                 yield (row, col), value
+
+    def iter_rows(self, *, cancel):
+        """Stream a frozen snapshot's active patches in source-row order."""
+        snapshot = self.copy()
+
+        def rows():
+            cancel.check()
+            with closing(snapshot.store.rows(snapshot.versions, cancel=cancel, ordered=True)) as patches:
+                for rid, group in groupby(patches, key=lambda patch: patch[0]):
+                    cancel.check()
+                    cells = {col: value for _, col, value, missing in group if not missing}
+                    cancel.check()
+                    if cells:
+                        yield rid, cells
+
+        return rows()
 
     def __eq__(self, other):
         if isinstance(other, DiskEdits):
