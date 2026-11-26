@@ -28,7 +28,7 @@ def compare_csv(left, right, key, *, left_format=None, right_format=None, cancel
             for index, (path, fmt) in enumerate(((left, left_format), (right, right_format))):
                 with utf8_source(path, cancel, fmt) as decoded:
                     pattern = csv_pattern(decoded)
-                    columns = csv_columns(connection, pattern, fmt)
+                    columns = csv_columns(connection, decoded, fmt, cancel=cancel)
                     schemas.append(columns)
                     if key not in columns:
                         raise ValueError(f"Key column {key!r} is missing in {path.name}.")

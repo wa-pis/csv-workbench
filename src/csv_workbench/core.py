@@ -22,6 +22,7 @@ csv.field_size_limit(2**31 - 1)
 
 PAGE_SIZE = 200
 WIDE_CSV_COLUMNS = 2048
+CSV_SCHEMA_BYTES = 8 * 2**20
 NEW_ROW = 1 << 62
 DELETED_COLUMN = -1
 CSV_ENCODINGS = {
@@ -327,7 +328,18 @@ def csv_pattern(path: Path) -> str:
 
 def count_rows(path: Path, *, fmt=CsvFormat(), cancel: Cancellation | None = None) -> int:
     cancel = cancel or Cancellation()
-    with utf8_source(path, cancel, fmt) as source, cancel.connection() as connection:
+    with utf8_source(path, cancel, fmt) as source:
+        columns = source_columns(source, cancel, fmt)
+        return count_source_rows(source, columns, cancel, fmt)
+
+
+def count_source_rows(source, columns, cancel, fmt):
+    if len(columns) > WIDE_CSV_COLUMNS:
+        with closing(iter_csv_rows(source, columns, cancel, fmt)) as rows:
+            count = sum(1 for _ in rows)
+        cancel.check()
+        return count
+    with cancel.connection() as connection:
         return connection.execute(
             f"SELECT count(*) FROM {fmt.source}", [csv_pattern(source)]
         ).fetchone()[0]
@@ -355,15 +367,42 @@ def filter_clause(selection, identifier):
     )
 
 
-def csv_columns(connection, pattern, fmt):
-    # A parameterized relation may materialize the full CSV just to get its schema.
-    cursor = connection.execute(f"SELECT * FROM {fmt.source} LIMIT 0", [pattern])
-    return [column[0] for column in cursor.description]
+def csv_columns(connection, source, fmt, *, cancel=None):
+    cancel = cancel or Cancellation()
+    cancel.check()
+
+    def columns(path):
+        # A parameterized relation may materialize the full CSV just to get its schema.
+        cursor = connection.execute(f"SELECT * FROM {fmt.source} LIMIT 0", [csv_pattern(path)])
+        cancel.check()
+        return [column[0] for column in cursor.description]
+
+    if source.stat().st_size <= CSV_SCHEMA_BYTES:
+        return columns(source)
+    # DuckDB's sniffer can retain thousands of very wide records even with sample_size=1.
+    with TemporaryDirectory(prefix="csv-schema-") as scratch:
+        sample = Path(scratch) / "sample.csv"
+        with source.open("rb") as handle, closing(csv_blocks(
+            handle, cancel, block_bytes=CSV_SCHEMA_BYTES,
+            quote=fmt.quote.encode("ascii"), delimiter=fmt.delimiter.encode("ascii"),
+        )) as blocks:
+            block = next(blocks, b"")
+            leading = b""
+            while block and not block.removeprefix(codecs.BOM_UTF8).strip(b"\r\n"):
+                if not leading:
+                    end = block.find(b"\n")
+                    if end < 0:
+                        end = block.find(b"\r")
+                    leading = block[:end + 1] if end >= 0 else block
+                block = next(blocks, b"")
+        cancel.check()
+        sample.write_bytes(leading + block)
+        return columns(sample)
 
 
 def source_columns(source, cancel, fmt):
     with cancel.connection() as connection:
-        return csv_columns(connection, csv_pattern(source), fmt)
+        return csv_columns(connection, source, fmt, cancel=cancel)
 
 
 def read_columns(path, *, cancel=None, fmt=CsvFormat()):
@@ -377,7 +416,7 @@ def selection_query(
 ) -> tuple[str, list[str | None]]:
     pattern = csv_pattern(path)
     if columns is None:
-        columns = csv_columns(connection, pattern, fmt) if selection != Selection() else []
+        columns = csv_columns(connection, path, fmt) if selection != Selection() else []
     sql, values = selection_sql(columns, selection, source=fmt.source)
     return sql, [pattern, *values]
 
@@ -422,7 +461,7 @@ def selection_sql(
 def editable_query(connection, source, selection, edits, fmt=CsvFormat(), *, cancel=None, ordered=True, columns=None):
     pattern = csv_pattern(source)
     if columns is None:
-        columns = csv_columns(connection, pattern, fmt)
+        columns = csv_columns(connection, source, fmt, cancel=cancel)
     name = "__csv_source_row"
     folded = {column.casefold() for column in columns}
     while name.casefold() in folded:
@@ -547,19 +586,12 @@ def read_page(
 ) -> tuple[list[str], list[tuple], bool]:
     cancel = cancel or Cancellation()
     with utf8_source(path, cancel, fmt) as source:
-        with cancel.connection() as connection:
-            columns = csv_columns(connection, csv_pattern(source), fmt)
-            if len(columns) <= WIDE_CSV_COLUMNS:
+        columns = source_columns(source, cancel, fmt)
+        if len(columns) <= WIDE_CSV_COLUMNS:
+            with cancel.connection() as connection:
                 sql, params = selection_query(connection, source, selection, fmt, columns=columns)
                 cancel.check()
                 return query_page(connection, sql, params, offset, limit)
-            tail = offset is None
-            if tail and selection == Selection():
-                count = connection.execute(
-                    f"SELECT count(*) FROM {fmt.source}", [csv_pattern(source)]
-                ).fetchone()[0]
-                limit = 2 * PAGE_SIZE
-                offset = max(0, ((count - 1) // PAGE_SIZE - 1) * PAGE_SIZE)
         if selection != Selection():
             from csv_workbench.wide import prepare_wide_result
 
@@ -570,6 +602,11 @@ def read_page(
                 return result.page(offset, cancel=cancel, limit=limit)
             finally:
                 result.scratch.cleanup()
+        tail = offset is None
+        if tail:
+            count = count_source_rows(source, columns, cancel, fmt)
+            limit = 2 * PAGE_SIZE
+            offset = max(0, ((count - 1) // PAGE_SIZE - 1) * PAGE_SIZE)
         # Release the schema scanner's buffers before allocating the page.
         page = read_wide_page(source, offset, columns, limit, cancel, fmt)
         return (*page, offset) if tail else page
