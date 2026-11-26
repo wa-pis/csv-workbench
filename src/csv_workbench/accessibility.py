@@ -5,7 +5,14 @@ from itertools import islice
 
 from PySide6.QtCore import QPersistentModelIndex, QPoint, QRect, Qt
 from PySide6.QtGui import QAccessible, QAccessibleEvent
-from PySide6.QtWidgets import QAccessibleWidget, QLineEdit, QTableView, QWidget
+from PySide6.QtWidgets import (
+    QAccessibleWidget,
+    QApplication,
+    QLineEdit,
+    QScrollBar,
+    QTableView,
+    QWidget,
+)
 
 MAX_CELLS = 512
 _installed = False
@@ -160,13 +167,37 @@ class ViewAccessible(QAccessibleWidget):
                      if child.rect().contains(QPoint(x, y))), None)
 
     def focusChild(self):
-        children = self.children()
-        pinned = getattr(self.widget(), 'pinned', None)
+        view = self.widget()
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QScrollBar)) and view.isAncestorOf(focused):
+            return QAccessible.queryAccessibleInterface(focused)
+        owner = view.parentWidget()
+        keyboard = owner if isinstance(owner, AccessibleTableView) else view
+        if not keyboard.hasFocus():
+            return None
+        pinned = getattr(view, 'pinned', None)
         if pinned is not None and pinned.isVisible():
             child = QAccessible.queryAccessibleInterface(pinned).focusChild()
             if child is not None:
                 return child
-        return next((child for child in reversed(children) if child.state().focused), None)
+        index = view.currentIndex()
+        key = (index.row(), index.column())
+        keys = set(visible_cells(view))
+        if not index.isValid() or key not in keys:
+            return None
+        # Cocoa asks for focus repeatedly during hierarchy queries. Resolve only
+        # the actual cell, rather than querying every visible cell's state/flags.
+        for old_key, token in list(self.cells.items()):
+            if old_key not in keys:
+                token.deleteLater()
+                del self.cells[old_key]
+        token = self.cells.get(key)
+        if token is not None and token.index != index:
+            token.deleteLater()
+            token = None
+        if token is None:
+            token = self.cells[key] = CellWidget(view, index)
+        return QAccessible.queryAccessibleInterface(token)
 
     def text(self, kind):
         if kind in (QAccessible.Text.Name, QAccessible.Text.Description):

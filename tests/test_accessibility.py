@@ -163,3 +163,45 @@ def test_cell_focus_follows_keyboard_owner_and_native_editor(grid, pinned):
     finally:
         toolbar.close()
         toolbar.deleteLater()
+
+
+@pytest.mark.parametrize('pinned', [False, True])
+def test_focus_query_does_not_inspect_unrelated_cell_states_or_flags(grid, monkeypatch, pinned):
+    app, view, model = grid
+    view.set_pins(('n0', 'n1'))
+    view.activateWindow()
+    index = model.index(3, 1 if pinned else 3)
+    view.setCurrentIndex(index)
+    view.setFocus()
+    app.processEvents()
+    root = QAccessible.queryAccessibleInterface(view)
+    target = QAccessible.queryAccessibleInterface(view.pinned if pinned else view)
+    # Populate both visible panes first: a focus request must remain local even
+    # when many unrelated cells already have accessible interfaces.
+    root.children()
+    QAccessible.queryAccessibleInterface(view.pinned).children()
+    cell = next(child for child in target.children()
+                if isinstance(child, CellAccessible) and child.widget().index == index)
+    assert len(root.cells) > 1
+    assert len(QAccessible.queryAccessibleInterface(view.pinned).cells) > 1
+    original_state = CellAccessible.state
+    original_flags = model.flags
+    inspected_states = []
+    inspected_flags = []
+
+    def focused_state(accessible):
+        queried = accessible.widget().index
+        assert queried == index, 'focus query inspected an unrelated cell state'
+        inspected_states.append(queried)
+        return original_state(accessible)
+
+    def focused_flags(queried):
+        assert queried == index, 'focus query inspected unrelated model flags'
+        inspected_flags.append(queried)
+        return original_flags(queried)
+
+    monkeypatch.setattr(CellAccessible, 'state', focused_state)
+    monkeypatch.setattr(model, 'flags', focused_flags)
+    assert root.focusChild() == cell
+    assert len(inspected_states) <= 1
+    assert len(inspected_flags) <= 1

@@ -1,14 +1,22 @@
 """Native Cocoa regression probe for QTBUG-149612, run in an isolated process."""
 
+import csv
 import ctypes
 import json
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextlib import closing
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import Event
 from time import monotonic
 
 from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtGui import QAccessible
 from PySide6.QtWidgets import QApplication, QLineEdit, QTableView
 
+from csv_workbench import core
 from csv_workbench.accessibility import MAX_CELLS
+from csv_workbench.core import Cancellation, Selection, prepare_result
 from csv_workbench.ui import CsvTable, PageModel
 
 
@@ -28,6 +36,10 @@ def check_tables():
         array = send(obj, name)
         return [send(array, 'objectAtIndex:', ctypes.c_void_p, i)
                 for i in range(send(array, 'count', ctypes.c_ulong))] if array else []
+
+    def supported(obj, name):
+        return send(obj, 'respondsToSelector:', ctypes.c_bool,
+                    objc.sel_registerName(name.encode()))
 
     def tables(obj, depth=0):
         if depth > 12:
@@ -87,6 +99,13 @@ def check_tables():
 
     def walk(obj, depth=0, roles=None):
         assert depth < 20, 'accessible hierarchy cycle'
+        for attribute in ('accessibilityFocusedUIElement', 'accessibilityTitle',
+                          'accessibilityValue', 'accessibilityParent'):
+            if supported(obj, attribute):
+                send(obj, attribute)
+        for attribute in ('isAccessibilityFocused', 'isAccessibilityEnabled'):
+            if supported(obj, attribute):
+                send(obj, attribute, ctypes.c_bool)
         if roles is not None:
             role = send(obj, 'accessibilityRole')
             roles.append(send(role, 'UTF8String', ctypes.c_char_p) if role else None)
@@ -108,6 +127,76 @@ def check_tables():
 
     counts = []
     started = monotonic()
+    # An external AX hierarchy query also asks for native focus/value/state while
+    # Python is scanning a CSV. Keep a real bounded workload active until cancel.
+    with TemporaryDirectory(prefix='csv-accessibility-') as directory:
+        source = Path(directory) / 'wide.csv'
+        with source.open('w', newline='', encoding='utf-8') as stream:
+            writer = csv.writer(stream)
+            writer.writerow([f'n{i}' for i in range(4000)])
+            row = ['value' * 20] * 4000
+            for index in range(128):
+                writer.writerow([str(index), *row[1:]])
+        cancellation = Cancellation()
+        worker_started = Event()
+        operations = []
+        original_rows = core.iter_csv_rows
+
+        def observed_rows(*args, **kwargs):
+            with closing(original_rows(*args, **kwargs)) as rows:
+                for row in rows:
+                    worker_started.set()
+                    yield row
+
+        def busy_worker():
+            try:
+                while True:
+                    cancellation.check()
+                    result = prepare_result(source, Selection(), distinct='n0', cancel=cancellation)
+                    try:
+                        assert result.page(0, limit=200)[1] == [(str(i), 1) for i in sorted(
+                            range(128), key=str)]
+                        operations.append(True)
+                    finally:
+                        result.scratch.cleanup()
+            except CancelledError:
+                return
+
+        core.iter_csv_rows = observed_rows
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                worker = executor.submit(busy_worker)
+                try:
+                    assert worker_started.wait(10), 'CSV worker did not enter its real scan'
+                    table.activateWindow()
+                    QApplication.setActiveWindow(table)
+                    for column, editing in ((1, False), (0, False), (1, True)):
+                        index = model.index(0, column)
+                        table.setCurrentIndex(index)
+                        table.setFocus()
+                        if editing:
+                            table.edit(index)
+                        app.processEvents()
+                        if editing:
+                            editor = QApplication.focusWidget()
+                            assert isinstance(editor, QLineEdit) and table.isAncestorOf(editor)
+                        else:
+                            assert table.hasFocus(), 'native busy query needs real keyboard focus'
+                        assert not worker.done(), 'CSV workload ended before native query'
+                        counts.append(timed_walk())
+                        assert not worker.done(), 'CSV workload ended during native query'
+                        assert 10 < counts[-1] < MAX_CELLS * 4
+                        print(json.dumps({'busy_native_column': column,
+                                          'busy_native_editor': editing}), flush=True)
+                    table.closePersistentEditor(model.index(0, 1))
+                    table.setFocus()
+                finally:
+                    cancellation.cancel()
+                worker.result(timeout=10)
+        finally:
+            core.iter_csv_rows = original_rows
+        print(json.dumps({'busy_native_worker_operations': len(operations),
+                          'busy_native_cancelled': cancellation.cancelled}), flush=True)
     for position in (0, 90000, 180000, 0):
         table.horizontalScrollBar().setValue(position)
         model.setData(model.index(0, 0), 'edited')

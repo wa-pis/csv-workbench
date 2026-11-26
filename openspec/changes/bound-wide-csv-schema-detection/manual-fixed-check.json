@@ -1,0 +1,83 @@
+{
+  "recorded_at": "2026-11-26T21:12:56.304824+00:00",
+  "python": "3.12.13",
+  "validation": "Read-only streaming verification of files written by manually tested autonomous Apple Silicon CI d507a63; no application UI controlled by this helper",
+  "files": {
+    "manual-fixed.csv": {
+      "bytes": 247005795,
+      "sha256": "c679ed0d963d96ce27fd64d182ace1c1651060a442188f37eaca768a07e1036d"
+    },
+    "manual-saved.csv": {
+      "bytes": 247005792,
+      "sha256": "104b33288574ce6ada56378a45324f90a7abb01e472f448466cdf2cc4a532bd6"
+    },
+    "manual-wide.csv": {
+      "bytes": 247005190,
+      "sha256": "ad6fd50de169e04f87f8dbcb28645a8ab6818fdf0d5de2363323d01f6738c37f"
+    },
+    "manual-wide-cancel.csv": {
+      "bytes": 2469773890,
+      "sha256": "653c3bb04087b66e5474a1d73e762e1c481c099b73869622c581a2d2fa68ac00"
+    }
+  },
+  "rows": 600,
+  "columns": 4000,
+  "mismatches": [],
+  "checks": {
+    "fixed_expected_600_by_4000": true,
+    "fixed_only_row1_n0_changed_from_saved": true,
+    "raw_other_bytes_including_null_empty_quoting_identical_to_saved": true,
+    "fixed_row1_n0": "fixed-ёж",
+    "fixed_row599_n0": "z-ёж",
+    "saved_content_matches_original_with_prior_two_edits": true,
+    "saved_bytes_unchanged_during_verification": true,
+    "saved_size_matches_prior_report_247005792": true,
+    "original_hash_matches_prior": true,
+    "cancel_fixture_hash_matches_prior": true
+  },
+  "prior_saved_hash_limitation": "No prior saved-file SHA was available to this helper; unchanged content is checked against original + known prior edits, raw fixed/saved comparison, prior byte size, and before/after hash in this check.",
+  "samples": {
+    "1": {
+      "fixed_first_four": [
+        "fixed-ёж",
+        "keep",
+        "row-000001",
+        ""
+      ],
+      "saved_first_four": [
+        "zz-ёж",
+        "keep",
+        "row-000001",
+        ""
+      ]
+    },
+    "599": {
+      "fixed_first_four": [
+        "z-ёж",
+        "keep",
+        "row-000599",
+        "Привет"
+      ],
+      "saved_first_four": [
+        "z-ёж",
+        "keep",
+        "row-000599",
+        "Привет"
+      ]
+    },
+    "600": {
+      "fixed_first_four": [
+        "000600",
+        "other",
+        "row-000600",
+        ""
+      ],
+      "saved_first_four": [
+        "000600",
+        "other",
+        "row-000600",
+        ""
+      ]
+    }
+  }
+}

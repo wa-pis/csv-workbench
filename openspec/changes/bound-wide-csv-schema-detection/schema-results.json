@@ -1,0 +1,112 @@
+{
+  "recorded_at": "2026-11-27T00:53:51.090398+04:00",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.12.13",
+  "duckdb": "1.5.6",
+  "validation": "CLI of working-tree schema fix, not a new autonomous bundle or GUI acceptance",
+  "duckdb_memory_limit": "512MiB",
+  "schema_block_target_bytes": 8388608,
+  "source": {
+    "path": "/private/tmp/csv-ci-3aaaa24/manual-wide-cancel.csv",
+    "rows": 6000,
+    "columns": 4000,
+    "bytes": 2469773890,
+    "sha256": "653c3bb04087b66e5474a1d73e762e1c481c099b73869622c581a2d2fa68ac00",
+    "unchanged": true
+  },
+  "method": {
+    "rss": "resource.getrusage(RUSAGE_SELF).ru_maxrss, bytes on macOS; process lifetime maximum, not a hard engine RSS limit",
+    "timing": "Wall time per CLI call; previous metadata and first-page calls share one process, so page peak is cumulative after metadata. Other production measurements use separate processes. No cold filesystem-cache reset.",
+    "temporary_disk": "Not sampled for these CLI checks. Cancel scenario checked its private TMPDIR was empty after completion.",
+    "schema_prefix_diagnostic_bytes": 8263372
+  },
+  "results": [
+    {
+      "operation": "baseline-metadata",
+      "ok": false,
+      "error": "OutOfMemoryException: could not allocate block of size 30.5 MiB (491.2 MiB/512.0 MiB used)",
+      "seconds": 0.8775198748335242,
+      "peak_rss_bytes": 633536512
+    },
+    {
+      "operation": "diagnostic-metadata-sample-size-1",
+      "ok": false,
+      "seconds": 0.8244173340499401,
+      "peak_rss_bytes": 633683968,
+      "result": "same 512MiB OOM"
+    },
+    {
+      "operation": "diagnostic-metadata-sample-size-1-buffer-1MiB",
+      "ok": false,
+      "seconds": 0.8996282913722098,
+      "peak_rss_bytes": 669417472,
+      "result": "OOM allocating 1.0MiB at 511.6/512.0MiB"
+    },
+    {
+      "operation": "bounded-metadata",
+      "ok": true,
+      "columns": 4000,
+      "first_header": "n0",
+      "last_header": "n3999",
+      "seconds": 0.09670070791617036,
+      "peak_rss_bytes": 158154752,
+      "process_group": "metadata-then-first-page"
+    },
+    {
+      "operation": "first-page",
+      "ok": true,
+      "columns": 4000,
+      "returned_rows": 200,
+      "has_more": true,
+      "seconds": 0.7002471671439707,
+      "peak_rss_bytes": 489472000,
+      "rss_scope": "Cumulative process peak after preceding metadata call",
+      "process_group": "metadata-then-first-page",
+      "null_empty_unicode_verified": true
+    },
+    {
+      "operation": "baseline-count",
+      "ok": false,
+      "error": "OutOfMemoryException: could not allocate block of size 30.5 MiB (491.2 MiB/512.0 MiB used)",
+      "seconds": 0.8814205420203507,
+      "peak_rss_bytes": 633372672
+    },
+    {
+      "operation": "stream-count",
+      "ok": true,
+      "rows": 6000,
+      "seconds": 18.10547733400017,
+      "peak_rss_bytes": 406405120
+    },
+    {
+      "ok": true,
+      "operation": "last-page",
+      "seconds": 35.538633208256215,
+      "peak_rss_bytes": 575881216,
+      "columns": 4000,
+      "returned_rows": 400,
+      "offset": 5600,
+      "has_more": false,
+      "last_source_row": 6000,
+      "last_values": {
+        "n0": "000600",
+        "n1": "other",
+        "n2": "row-000600",
+        "n3": null
+      },
+      "remaining_last_row_fields_match": true
+    },
+    {
+      "ok": true,
+      "operation": "cancel-stream-count",
+      "seconds": 0.661641915794462,
+      "cancellation_seconds": 0.00048229191452264786,
+      "peak_rss_bytes": 375242752,
+      "cancelled": true,
+      "cancel_after_checkpoints": 200,
+      "metadata_connection_inactive_at_request": true,
+      "temporary_files_retained": [],
+      "method": "Standard count_rows in a thread; a Cancellation.check observer signalled checkpoint 200; no worker replacement or artificial delay."
+    }
+  ]
+}
