@@ -143,6 +143,7 @@ class PageModel(QAbstractTableModel):
         self.filtered_columns: set[str] = set()
         self.edits = DiskEdits()
         self.editable = False
+        self.source_view = False
         self.row_ids = []
         self.source_columns = []
         self.find_text = ""
@@ -205,7 +206,9 @@ class PageModel(QAbstractTableModel):
         return "NULL" if value is None else ('""' if value == "" else str(value))
 
     def cell_value(self, index):
-        return self.edits.get(self.cell_key(index), self.rows[index.row()][index.column()])
+        value = self.rows[index.row()][index.column()]
+        # Source overlays remain visible while background work disables editing.
+        return self.edits.get(self.cell_key(index), value) if self.source_view or self.editable else value
 
     def flags(self, index):
         flags = super().flags(index)
@@ -2685,6 +2688,7 @@ class MainWindow(QMainWindow):
         self.model.column_types = ({name: (kind, nullable) for name, kind, nullable
                                     in selection.column_types} if distinct is None else {})
         self.model.source_columns = self.source_headers
+        self.model.source_view = distinct is None
         self.result, self.distinct = result, distinct
         self.has_more = False
         self.model.filtered_columns = (
