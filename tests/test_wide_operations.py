@@ -194,13 +194,14 @@ def test_save_all_rows_and_columns_is_separate_from_formatted_view_export(tmp_pa
     saved = tmp_path / 'saved.csv'
     saved.write_bytes(b'previous document')
     saved.chmod(0o640)
+    supported_mode = stat.S_IMODE(saved.stat().st_mode)
     assert save_csv(source, saved, edits, revision, fmt=fmt) == (
         saved.resolve(), file_revision(saved),
     )
     expected = [('1', 'keep', None, 'правка'), ('2', 'other', 'скрытая правка', 'строка\nещё'),
                 *rows[2:]]
     assert read_page(saved, 0, fmt=fmt) == (headers, expected, False)
-    assert stat.S_IMODE(saved.stat().st_mode) == 0o640
+    assert stat.S_IMODE(saved.stat().st_mode) == supported_mode
     assert source.read_bytes() == original
 
 
