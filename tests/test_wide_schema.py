@@ -2,6 +2,7 @@
 
 import codecs
 import csv
+import os
 from concurrent.futures import CancelledError
 from contextlib import closing
 
@@ -30,7 +31,7 @@ def write_csv(path, headers, rows, fmt, newline='\r\n', *, blank_lines=0):
 def test_bounded_metadata_keeps_canonical_names_format_and_wide_counts(
     tmp_path, monkeypatch, fmt, newline,
 ):
-    path = tmp_path / "schema[?]*'s.csv"
+    path = tmp_path / ("schema[]'s.csv" if os.name == 'nt' else "schema[?]*'s.csv")
     headers = ['dup', 'DUP', '', 'value']
     rows = [('0001', None, '', f"ёж{fmt.delimiter}{fmt.quote}чай\rстрока\nещё"),
             ('0002', '', None, 'plain'), ('0003', 'tail', '', None)]
