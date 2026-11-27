@@ -1,5 +1,7 @@
 # Проверка таймаута Accessibility macOS Intel — 2026-11-27
 
+Исправление `db01999ed2eb3be4b55ebbb7a691c4f67bf81b87` прошло [Desktop builds 45956278622](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622) на всех четырёх платформах с первой попытки. Source и frozen Cocoa smoke на Intel и Apple Silicon завершились успешно при прежнем внешнем лимите 60 с.
+
 ## Исходный CI
 
 Проверялся `2cc02d761dcdb3a7a2cad0c95b6962a50999ba06`, [Desktop builds 45952329831](https://github.com/wa-pis/csv-workbench/actions/runs/45952329831). Этот коммит меняет документы; runtime совпадает с `1b7832e`.
@@ -40,10 +42,33 @@
 
 Диагностика немедленно сбрасывает JSON-фазы до/после создания QApplication, legacy-части, выделения/смены текущей ячейки, native-обходов, fixture, worker/cancel и cleanup. При таймауте сохраняется последняя достигнутая фаза; ошибка не превращается в успех. Время фаз начинается после импорта модуля smoke и не включает весь холодный запуск frozen-процесса.
 
-Регрессия с активной Accessibility и счётчиком `flags` до исправления, при восстановленном старом callback, дала **2 failed**, каждый на 800 000 вызовов. После исправления **10 accessibility-тестов прошли за 1,16 с**, включая выделение, доступные состояния и Paint обеих областей. **3 диагностических теста прошли за 0,46 с**, проверив flush и сохранение результата/ошибки probe. Полный локальный pytest: **425 passed за 25,97 с**, включая настоящий Cocoa smoke; Ruff, `git diff --check` и строгая проверка OpenSpec прошли. Последняя добавленная проверка активности Accessibility проверяется отдельно; full-suite результат выше получен до этого дополнительного assertion.
+Регрессия с активной Accessibility и счётчиком `flags` до исправления, при восстановленном старом callback, дала **2 failed**, каждый на 800 000 вызовов. После исправления **10 accessibility-тестов прошли за 1,16 с**, включая выделение, доступные состояния и Paint обеих областей. **3 диагностических теста прошли за 0,46 с**, проверив flush и сохранение результата/ошибки probe. Полный локальный pytest: **425 passed за 25,97 с**, включая настоящий Cocoa smoke; Ruff, `git diff --check` и строгая проверка OpenSpec прошли. После добавления assertion `QAccessible.isActive()` в unit/native-проверки **14 targeted tests прошли за 3,45 с**, включая Cocoa; full-suite результат выше получен до этого assertion. После замены списка вызовов `flags` на счётчик с постоянной памятью **13 ненативных тестов прошли за 1,13 с**.
 
 Дополнительный source Cocoa-прогон ARM с проверкой `QAccessible.isActive()` завершил cleanup за 2,334 с по внутренним фазам: select-all — 0 `flags` / 0,0000507 с; смена текущей ячейки при worker — 5 `flags` / 0,001019 с; максимум native-обхода — 0,423614 с, число узлов 194/194/195/194/194/194/194. Wide-часть заняла 1,75969 с. Локальный журнал: `/private/tmp/csv-intel-selection-fix-arm-source.log`. Это source ARM, не исправленный frozen Intel и не новый CI.
 
-## Приёмка ещё открыта
+## Приёмка CI
 
-Исправленный source и автономный bundle на Intel CI пока не подтверждены. Успешный итоговый SHA на Windows, Linux, macOS Intel и Apple Silicon, ссылки на артефакты и реальные длительности обязательных frozen Cocoa smoke ещё предстоит записать. Этап не архивируется до этой проверки. Новая ручная GUI-приёмка, полный VoiceOver и benchmark 5/20 млн строк этим отчётом не заявляются.
+Все задания [run 45956278622](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622) проверены на одном SHA `db01999ed2eb3be4b55ebbb7a691c4f67bf81b87`, attempt 1. В каждом прошли source pytest, сборка PyInstaller, smoke executable и upload artifact. На обеих macOS дополнительно прошёл обязательный frozen Cocoa smoke; ошибка этого subprocess по-прежнему блокирует сборку.
+
+| Платформа | CI job | Автономная сборка |
+| --- | --- | --- |
+| Windows x64 | [140363371116](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622/job/140363371116) — success | [15178668740](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622/artifacts/15178668740) |
+| Linux x64 | [140363371125](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622/job/140363371125) — success | [15179560154](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622/artifacts/15179560154) |
+| macOS Intel | [140363371120](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622/job/140363371120) — success | [15178389570](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622/artifacts/15178389570) |
+| macOS Apple Silicon | [140363370685](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622/job/140363370685) — success | [15179590020](https://github.com/wa-pis/csv-workbench/actions/runs/45956278622/artifacts/15179590020) |
+
+GitHub API подтвердил все четыре артефакта и их принадлежность этому SHA; на момент проверки ни один не истёк. Новая ручная GUI-приёмка, полный VoiceOver и benchmark 5/20 млн строк этим отчётом не заявляются.
+
+Фазы frozen Cocoa smoke из полных журналов CI:
+
+| Метрика | macOS Intel | Apple Silicon |
+| --- | ---: | ---: |
+| Source pytest | 425 passed / 90,00 с | 425 passed / 62,25 с |
+| От первой фазы до table-cleanup-end | 8,72849 с | 5,58922 с |
+| Wide-часть | 6,45981 с | 4,06338 с |
+| Максимальный native-обход (12 обходов) | 1,43887 с | 0,76981 с |
+| selectAll: flags / время обработчика | 0 / 0,000201 с | 0 / 0,000087 с |
+| Переход к одной ячейке при worker: flags / время | 5 / 0,002867 с | 5 / 0,001855 с |
+| Worker cancel-start → cancel-end | 0,010110 с | 0,004459 с |
+
+В обоих frozen-прогонах `busy_native_cancelled=true`, по две завершённые реальные CSV-операции до отмены. Время до cleanup измерено внутренним monotonic clock фаз: оно исключает импорт модулей и запуск процесса и не подменяет внешний лимит 60 с. Native-обход и фокус/редактор выполнялись при живом worker. Локальная копия полных журналов и извлечённых записей: `/private/tmp/csv-db01999-ci/` (`intel-full.log`, `arm-full.log`, `report.json`).
