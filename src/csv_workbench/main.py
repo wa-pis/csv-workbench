@@ -13,9 +13,13 @@ from csv_workbench.ui import WorkspaceWindow
 
 def main() -> int:
     smoke = sys.argv[1:] == ["--smoke-test"]
+    accessibility = sys.argv[1:] == ["--accessibility-smoke-test"]
+    if accessibility:
+        from csv_workbench.accessibility_smoke import check_tables, phase
+        phase('application-create-start')
     app = QApplication([sys.argv[0], "-platform", "offscreen"] if smoke else sys.argv)
-    if sys.argv[1:] == ["--accessibility-smoke-test"]:
-        from csv_workbench.accessibility_smoke import check_tables
+    if accessibility:
+        phase('application-create-end')
         return check_tables()
     app.setApplicationName("CSV Workbench")
     if path := os.environ.get("CSV_WORKBENCH_KEY_LOG"):

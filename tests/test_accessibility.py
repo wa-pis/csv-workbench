@@ -1,14 +1,16 @@
 """Viewport bounds and real cell semantics, independently of Cocoa permissions."""
 
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, QObject
 from PySide6.QtGui import QAccessible
 from PySide6.QtWidgets import QApplication, QLineEdit
 
+from csv_workbench import accessibility
 from csv_workbench.accessibility import (
     MAX_CELLS,
     CellAccessible,
@@ -55,6 +57,72 @@ def test_wide_selection_does_not_enumerate_selected_or_offscreen_cells(grid, mon
     assert iface.child(-1) is None and iface.child(iface.childCount()) is None
     assert iface.child(2002) == iface.child(0)  # Qt's legacy first-cell notification
     assert model.rowCount() * model.columnCount() == 400000
+
+
+@pytest.mark.parametrize('column', [0, 1])
+def test_active_accessibility_selection_bounds_flags_and_repaints_both_panes(
+        grid, monkeypatch, column):
+    app, view, model = grid
+    # Exercise the macOS path on every CI platform, with Qt's AX notifications
+    # active. Patching selectedIndexes() alone misses Qt's C++ range.indexes().
+    monkeypatch.setattr(accessibility, 'sys', SimpleNamespace(platform='darwin'))
+    view.set_pins(('n0',))
+    app.processEvents()
+    root = QAccessible.queryAccessibleInterface(view)
+    pinned = QAccessible.queryAccessibleInterface(view.pinned)
+    was_active = QAccessible.isActive()
+    QAccessible.setActive(True)
+    flags_calls = 0
+    original_flags = model.flags
+
+    def counted_flags(index):
+        nonlocal flags_calls
+        flags_calls += 1
+        return original_flags(index)
+
+    class Paints(QObject):
+        def __init__(self):
+            super().__init__()
+            self.painted = set()
+
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.Paint:
+                self.painted.add(watched)
+            return False
+
+    paints = Paints()
+    panes = {view.viewport(), view.pinned.viewport()}
+    for pane in panes:
+        pane.installEventFilter(paints)
+    monkeypatch.setattr(model, 'flags', counted_flags)
+    try:
+        assert QAccessible.isActive(), 'regression requires active Qt accessibility'
+        view.selectAll()
+        assert flags_calls < MAX_CELLS * 4, 'Qt expanded the full selected range'
+        app.processEvents()
+        assert '400000 selected cells' in root.text(QAccessible.Text.Name)
+        assert all(cell.state().selected for iface in (root, pinned)
+                   for cell in iface.children() if isinstance(cell, CellAccessible))
+        assert paints.painted == panes
+
+        flags_calls = 0
+        paints.painted.clear()
+        current = model.index(0, column)
+        view.setCurrentIndex(current)
+        assert flags_calls < MAX_CELLS * 4, 'Qt expanded the full deselected range'
+        app.processEvents()
+        assert view.currentIndex() == view.pinned.currentIndex() == current
+        assert '1 selected cells' in root.text(QAccessible.Text.Name)
+        assert view.selectionModel().selection().contains(current)
+        assert paints.painted == panes
+        for iface in (root, pinned):
+            for cell in iface.children():
+                if isinstance(cell, CellAccessible):
+                    assert cell.state().selected == (cell.widget().index == current)
+    finally:
+        QAccessible.setActive(was_active)
+        for pane in panes:
+            pane.removeEventFilter(paints)
 
 
 def test_scroll_hidden_and_reordered_columns_bound_cache(grid):

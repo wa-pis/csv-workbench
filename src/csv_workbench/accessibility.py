@@ -6,6 +6,7 @@ from itertools import islice
 from PySide6.QtCore import QPersistentModelIndex, QPoint, QRect, Qt
 from PySide6.QtGui import QAccessible, QAccessibleEvent
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QAccessibleWidget,
     QApplication,
     QLineEdit,
@@ -232,6 +233,16 @@ class AccessibleTableView(QTableView):
         super().setSelectionModel(selection)
         selection.currentChanged.connect(self.notify_focus)
         selection.selectionChanged.connect(self.notify_viewport)
+
+    def selectionChanged(self, selected, deselected):
+        if sys.platform == 'darwin':
+            # Qt's table AX notifications expand selected.indexes() and
+            # deselected.indexes() just to get their first cell. Our Grouping
+            # interface publishes bounded viewport notifications instead.
+            # Keep the base repaint for both panes without that full-buffer scan.
+            QAbstractItemView.selectionChanged(self, selected, deselected)
+        else:
+            super().selectionChanged(selected, deselected)
 
     def notify_focus(self, *_):
         if sys.platform == 'darwin':
