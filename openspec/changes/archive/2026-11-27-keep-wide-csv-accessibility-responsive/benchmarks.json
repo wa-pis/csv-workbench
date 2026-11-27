@@ -1,0 +1,161 @@
+{
+  "purpose": "One-off native Cocoa accessibility latency comparison during a real wide-CSV unique operation; not an external CUA end-to-end test.",
+  "fixture": {
+    "path": "/private/tmp/csv-ci-3aaaa24/manual-wide-cancel.csv",
+    "data_rows": 6000,
+    "columns": 4000,
+    "bytes": 2469773890,
+    "sha256": "653c3bb04087b66e5474a1d73e762e1c481c099b73869622c581a2d2fa68ac00"
+  },
+  "method": {
+    "python": "3.12.13",
+    "platform": "macOS native Cocoa",
+    "worker": "One ThreadPoolExecutor worker runs the unmodified real core.prepare_result(source, Selection(), distinct=\"n0\", cancel=Cancellation()), then reads/verifies its result and cleans its scratch directory.",
+    "blocks": 296,
+    "block_bytes": 8388608,
+    "native_view": "Real CsvTable/PageModel, 200 buffered rows and 4000 columns, 900x500 window; table current cell (0, 0); no pinned columns.",
+    "activation": "Baseline had verified table.hasFocus()=True at initial idle/busy focus sample. Direct candidate explicitly set the Qt active window and asserted table.hasFocus() before starting; all three busy focus samples remained True.",
+    "gil": "A ctypes.CDLL call releases the Python GIL once around an entire compiled Objective-C recursive Cocoa walk; Qt/PySide callbacks then reacquire it normally while the real Python worker competes. No global switch interval or worker yield changes.",
+    "native_calls": [
+      "NSWindow.accessibilityFocusedUIElement once before the full walk",
+      "accessibilityRole",
+      "accessibilityTitle",
+      "accessibilityLabel",
+      "accessibilityValue",
+      "isAccessibilityFocused",
+      "isAccessibilityEnabled",
+      "accessibilityChildren"
+    ],
+    "recursion_depth_limit": 20,
+    "baseline_implementation": "ViewAccessible.focusChild resolves children() and inspects visible child states.",
+    "candidate_implementation": "Temporary monkeypatch resolves actual native editor or focused current visible cell directly, with bounded cell-token cache; no scan of every accessible cell state.",
+    "harness_python": "/private/tmp/csv-wide-focused-probe.py",
+    "harness_objective_c": "/private/tmp/csv-native-walk.m",
+    "harness_dylib": "/private/tmp/csv-native-walk.dylib",
+    "dependency_scope": "Compiled Objective-C helper is only a one-off local benchmark artifact, not a runtime or bundled dependency.",
+    "reproduction_note": "The baseline used pre-fix accessibility.py. Running baseline mode against the current fixed source will not recreate that old implementation. The final repository native smoke uses public objc_msgSend without clang/dylib."
+  },
+  "baseline_active_focus": {
+    "idle_walk_seconds": 0.30550645804032683,
+    "idle_focus_seconds": 0.0013888748362660408,
+    "busy_focus_samples": [
+      {
+        "seconds": 0.02322916593402624,
+        "table_has_focus": true
+      },
+      {
+        "seconds": 0.0351517922244966,
+        "table_has_focus": false
+      }
+    ],
+    "busy_walks": [
+      {
+        "seconds": 11.515571500174701,
+        "nodes": 193,
+        "worker_running_after_walk": true
+      },
+      {
+        "seconds": 5.231106082908809,
+        "nodes": 191,
+        "worker_running_after_walk": false
+      }
+    ],
+    "worker_elapsed_seconds": 19.154192457906902
+  },
+  "direct_active_focus": {
+    "idle_walk_seconds": 0.04275416675955057,
+    "idle_focus_seconds": 7.04997219145298e-05,
+    "busy_focus_samples": [
+      {
+        "seconds": 0.00019079074263572693,
+        "table_has_focus": true
+      },
+      {
+        "seconds": 0.021474250126630068,
+        "table_has_focus": true
+      },
+      {
+        "seconds": 0.020037374924868345,
+        "table_has_focus": true
+      }
+    ],
+    "busy_walks": [
+      {
+        "seconds": 2.8456217907369137,
+        "nodes": 193,
+        "worker_running_after_walk": true
+      },
+      {
+        "seconds": 2.8355356669053435,
+        "nodes": 191,
+        "worker_running_after_walk": true
+      },
+      {
+        "seconds": 2.653781249653548,
+        "nodes": 191,
+        "worker_running_after_walk": true
+      }
+    ],
+    "worker_elapsed_seconds": 18.362331457901746
+  },
+  "result_correctness_both": {
+    "rows_scanned": 6000,
+    "unique_values": 600,
+    "frequency_sum": 6000,
+    "first_three": [
+      [
+        "000001",
+        10
+      ],
+      [
+        "000002",
+        10
+      ],
+      [
+        "000003",
+        10
+      ]
+    ]
+  },
+  "rejected_sleep_zero_experiment": {
+    "decision": "No demonstrated native latency improvement, so no production yielding change was made.",
+    "limitation": "These preliminary runs used a non-activated table; do not mix them with the active-focus comparison.",
+    "baseline": {
+      "busy_walk_seconds": [
+        0.859227209,
+        0.650961958,
+        0.780824667
+      ],
+      "worker_elapsed_seconds": 18.648125917
+    },
+    "sleep_zero_per_block": {
+      "busy_walk_seconds": [
+        1.336483292,
+        1.111461166,
+        1.068012334
+      ],
+      "worker_elapsed_seconds": 18.40290275
+    },
+    "sleep_zero_per_row": {
+      "busy_walk_seconds": [
+        1.277162375,
+        1.007032875,
+        1.053539042
+      ],
+      "worker_elapsed_seconds": 18.509496166
+    }
+  },
+  "limits": {
+    "timing_scope": "Worker elapsed timings include simultaneous AX traversal and scheduling contention. They are not a pure compute overhead benchmark.",
+    "baseline_second_walk": "Worker completed during that walk and table focus was no longer held; the first active baseline walk is the relevant busy comparison.",
+    "peak_ram_bytes": null,
+    "temporary_disk_bytes": null,
+    "memory_and_disk_note": "Not measured in this focused latency probe.",
+    "external_cua": "Pending separate manual bundled-app validation by the root agent."
+  },
+  "repository_validation_reported_by_root": {
+    "source_fix_commit": "1b7832e",
+    "pytest_passed": 420,
+    "pytest_elapsed_seconds": 27.61
+  }
+}
